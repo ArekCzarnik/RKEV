@@ -206,6 +206,33 @@ cargo run --features candle --example parity -- \
     --request request.json --server server.json
 ```
 
+Without a server — and without Python — two things are still checkable, and
+`examples/sanity.rs` runs both against a real checkpoint:
+
+```bash
+cargo run --features candle --example sanity -- \
+    --base <the base model directory> --checkpoint <the kev checkpoint>
+```
+
+It answers the same request along different paths — every question at once
+against one at a time, the state prefilled once against per question, and on a
+hybrid base the delta rule in chunks against token by token — and the numbers
+have to match. That compares the implementation with itself, but the paths walk
+different code, so a mistake in the layout, the mask or the recurrence shows up
+as a disagreement. Then it answers a handful of tickets whose answer is not in
+doubt. A checkpoint that scores 0.87 on held-out data should get nearly all of
+them; an implementation that loads the weights but gets the prompt, the rotary
+convention or the readout wrong sits near chance with distributions flat to two
+decimals, which is exactly what it looks like on untrained weights:
+
+```text
+My parcel never arrived and the tracking has not moved in a…   billing (0.33, confidence 0.00)  department = shipping MISSED
+```
+
+The exit code is non-zero if a path disagrees or more than one ticket is missed.
+This is not parity: it cannot tell you that the answers match the server, only
+that they are self-consistent and mean something.
+
 To put another engine underneath instead, implement `Forward` yourself:
 
 ```rust

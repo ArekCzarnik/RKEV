@@ -58,3 +58,7 @@ required-features = ["http"]
 [[example]]
 name = "parity"
 required-features = ["candle"]
+
+[[example]]
+name = "sanity"
+required-features = ["candle"]

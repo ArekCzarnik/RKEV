@@ -308,6 +308,16 @@ which makes the recording reusable as an offline fixture later. Nothing else in
 this repo compares the engine with the reference *running*, so this is the check
 that decides whether the local numbers mean anything.
 
+`examples/sanity.rs` (feature `candle`) is what can be checked without a server
+and without Python: it answers one request along every path the engine has —
+packed against separate, prefilled against not, chunked recurrence against
+sequential — and requires them to agree, then answers seven tickets whose answer
+is not in doubt. The first half is a real test of the layout, the mask and the
+recurrence on real weights; the second is the signal that separates "loads the
+checkpoint" from "understands it", because untrained weights score near chance
+with distributions flat to two decimals. Non-zero exit if a path disagrees or
+more than one ticket is missed. It is not parity and does not replace it.
+
 ## Documentation
 
 The crate is documented in three places that must stay in sync when the public

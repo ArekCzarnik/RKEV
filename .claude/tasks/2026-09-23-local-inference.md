@@ -455,9 +455,47 @@ wrong layout is a silently different prompt, not an error.
 `std::iter::repeat_n` had to go back to `repeat().take()`: it is stable since
 1.82 and the crate says 1.75.
 
+## Done: checking it without a server, or Python
+
+Commit "Add a sanity example for a real checkpoint". The question that prompted
+it was how to test the engine with no server and no Python at all. Two answers,
+in order of what they are worth:
+
+- The whole suite already runs that way: 79 tests with `--features candle`,
+  47 with `--features local`, 14 with neither, no weights and no network.
+- With a real checkpoint but still no server, `examples/sanity.rs`:
+
+  ```bash
+  cargo run --features candle --example sanity -- --base <base> --checkpoint <kev>
+  ```
+
+  It asks the two questions that can be answered without reference numbers.
+  *Does it hang together* — the same request answered all-questions-at-once
+  against one-at-a-time, prefilled-once against per-question, and on a hybrid
+  base the delta rule chunked against sequential; those are different code paths
+  over the same weights, so the layout, the mask and the recurrence are under
+  test even though the comparison is with itself. *Does it mean anything* — seven
+  tickets whose answer is not in doubt (a lost parcel is shipping, a double
+  charge is billing, "THIRD time writing" escalates, "no rush at all" does not).
+  A checkpoint that scores 0.87 held out should take nearly all of them. Non-zero
+  exit if a path disagrees or more than one ticket is missed.
+
+Smoke-tested on the synthetic fixtures, where it behaves as designed: all three
+consistency checks agree to 0.00000 on the hybrid fixture, and the noise weights
+score 2 of 7 with every distribution flat to two decimals — which is what a
+broken implementation on real weights would also look like, and is the reason the
+plausibility half is there at all.
+
+It also prints the README's worked example next to the numbers published for
+Kev-4B (0.47/0.28/0.25, p(yes) 0.93, score 1.44). Those were measured in bf16 on
+an M5, so they are a sanity range and not a tolerance — the ordering is the part
+worth reading. A checkpoint can be downloaded without Python too: the files are
+plain `curl -L https://huggingface.co/<repo>/resolve/main/<file>`.
+
 ## Left to do
 
-1. **Parity — the tool is there, it has not been run.** `examples/parity.rs`
+1. **Parity — the tool is there, it has not been run.** (`examples/sanity.rs`
+   is the half of it that needs no server; this is the other half.) `examples/parity.rs`
    answers a recorded request in process and compares every probability with a
    recorded server response (`--tolerance`, non-zero exit past it). What is left
    is running it on a machine that can hold `jaredpalmer/kev-4b` (or
