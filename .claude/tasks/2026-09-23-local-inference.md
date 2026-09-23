@@ -492,6 +492,41 @@ an M5, so they are a sanity range and not a tolerance — the ordering is the pa
 worth reading. A checkpoint can be downloaded without Python too: the files are
 plain `curl -L https://huggingface.co/<repo>/resolve/main/<file>`.
 
+## Done: a front end, so it can be used and not only tested
+
+Commit "Add a decide example: the server's job in process". Asked what we had
+built and how to *use* kev and qwen without Python or a server, the honest answer
+was that every example so far either needed the server (`triage`) or was a check
+(`parity`, `sanity`) — the library was usable, the repo had no tool.
+`examples/decide.rs` is that tool:
+
+```bash
+cargo run --release --features candle --example decide -- \
+    --base <base> --checkpoint <kev> --state "..."          # or --request r.json
+cat tickets.txt | cargo run --release --features candle --example decide -- \
+    --base <base> --checkpoint <kev> --questions q.json --lines --json
+```
+
+- `--request` repeats into a batch (one prefill pass over the states),
+  `--state`/`--questions` covers the ad-hoc case, and `--lines` answers a state
+  per line with the model loaded once and the prefix cache at 16 — verified that
+  a `--lines` run gives the same answers as separate single runs, distinct states
+  included, which is the property that makes the cache safe to leave on.
+- `--json` prints the server's envelope around `answers_json`, which had to
+  become public for it (it was `pub(crate)` for `usage.output_tokens`). The
+  answers are byte-compatible with the Python; the envelope is assembled in the
+  example, and says so.
+- `--separate`, `--permute`, `--rounds`/`--seed`, `--dtype`, and an option-layout
+  override. Diagnostics on stderr, answers on stdout, so `--json | jq` works.
+- Smoke-tested on both synthetic fixtures, every mode: the batched and the
+  separate path agree on the probabilities and differ on `input_tokens` (36 vs
+  41, the state counted once per question), which is exactly the documented
+  behaviour.
+
+On the way: `temperature()` and `option_isolation()` answered "that is not a
+torch archive" for a head exported as safetensors, which `pointer_head` reads
+happily. They now answer `None`, decided by the extension, with a test.
+
 ## Left to do
 
 1. **Parity — the tool is there, it has not been run.** (`examples/sanity.rs`

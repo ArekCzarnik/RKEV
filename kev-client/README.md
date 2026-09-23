@@ -139,6 +139,38 @@ let head = pointer_head(&checkpoint_dir.join("head.pt"))?;
 let response = LocalEngine::new(backend, head).system_one_blocking(&request)?;
 ```
 
+There is a command-line front end for it too, which is the whole server's job
+done in process — no HTTP, no Python:
+
+```bash
+cargo run --release --features candle --example decide -- \
+    --base ~/models/qwen3-4b-base --checkpoint ~/models/kev-4b \
+    --state "Shoes arrived two weeks late and in the wrong size. \
+             Also I see two charges on my card."
+```
+
+which prints a line per question and the rest of each distribution under it:
+
+```text
+department     shipping     0.47   confidence 0.21
+               returns      0.28
+               billing      0.25
+escalate       yes          0.93
+frustration    Frustrated   level 1.44   confidence 0.78
+```
+
+The numbers there are the ones the Kev README publishes for Kev-4B, not a run of
+this code: what has been run here is the shape.
+
+`--request request.json` answers a System One request exactly as you would POST
+it (repeat it for a batch); `--questions questions.json` asks your own questions
+about a `--state`; `--lines` reads a state per line from stdin and answers each as
+it arrives, so the model loads once and the state cache stays warm; `--json`
+prints what the server would have replied, answers serialised the way the Python
+serialises them. `--dtype`, `--separate` and `--permute` are there as well, and
+the option layout comes from `head.pt` unless you override it. Diagnostics go to
+stderr, answers to stdout.
+
 The Qwen3 bases (`jaredpalmer/kev-4b@qwen3`, `kev-8b`, `kev-0.6b`) are attention
 only, so a whole request runs as one masked pass. The current bases (Qwen3.5) mix
 attention with Gated DeltaNet layers, which are recurrent: a recurrence carries

@@ -238,13 +238,16 @@ pub(crate) fn answer(probabilities: &[f32], plan: &Plan) -> Result<Answer> {
     })
 }
 
-/// The answers as the Python server serialises them, for `usage.output_tokens`.
+/// The answers as the Python server serialises them.
+///
+/// This is what `usage.output_tokens` counts, which is why it exists and why it
+/// is exact; it is also what a caller replacing the server has to emit.
 ///
 /// `output_tokens` is a billing-style figure: the tokens of the serialised
 /// answers, since Kev generates none. Matching it means matching `json.dumps`
 /// exactly — its `", "` and `": "` separators, its `\uXXXX` escaping of
 /// non-ASCII, its key order, and `repr` for floats.
-pub(crate) fn answers_json(answers: &IndexMap<String, Answer>) -> String {
+pub fn answers_json(answers: &IndexMap<String, Answer>) -> String {
     let mut out = String::from("{");
     for (index, (id, answer)) in answers.iter().enumerate() {
         if index > 0 {

@@ -318,6 +318,22 @@ checkpoint" from "understands it", because untrained weights score near chance
 with distributions flat to two decimals. Non-zero exit if a path disagrees or
 more than one ticket is missed. It is not parity and does not replace it.
 
+### Using it without a server
+
+`examples/decide.rs` (feature `candle`) is the front end: it loads a base and a
+checkpoint and answers requests in process — `--request` (repeatable, which
+batches), `--state` with `--questions`, or `--lines` for a state per line on
+stdin, which keeps one loaded model and a warm prefix cache. `--json` prints the
+server's envelope with `answers_json()` inside it, so a caller can drop the HTTP
+server without changing what it parses; everything else goes to stderr. It is the
+only example that is a tool rather than a check, and the reason `answers_json` is
+public.
+
+`--permute`, `--separate`, `--dtype` and the option-isolation override exist so
+the things the server can do are reachable from the command line too; the layout
+otherwise comes from `head.pt`, which for a safetensors head answers "unknown"
+rather than failing.
+
 ## Documentation
 
 The crate is documented in three places that must stay in sync when the public

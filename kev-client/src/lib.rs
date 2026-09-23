@@ -92,7 +92,7 @@ pub use local::{Forward, LocalEngine, OwnedPass, Pass};
 pub use prompt::render;
 #[cfg(feature = "local")]
 #[cfg(feature = "local")]
-pub use readout::{softmax, Linear, PointerHead};
+pub use readout::{answers_json, softmax, Linear, PointerHead};
 pub use system_one::SystemOne;
 pub use types::{
     Answer, Choice, Noul, NoulCriteria, Question, Score, SystemOneRequest, SystemOneResponse, Usage,
