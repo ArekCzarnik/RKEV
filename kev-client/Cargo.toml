@@ -14,12 +14,20 @@ indexmap = { version = "2", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Only for spawn_blocking: a forward pass is CPU-bound and must not sit on an
+# async runtime thread. Optional, pulled in by the `local` feature.
+tokio = { version = "1", features = ["rt"], optional = true }
 
 [features]
 default = ["http"]
 # Talking to a Kev server over HTTP. Turn it off for a build that only uses a
 # local inference engine; `SystemOne`, the types and the errors stay available.
 http = ["dep:reqwest"]
+# A local inference engine instead of an HTTP server. The engine is mistral.rs;
+# its dependency lands with the `Forward` impl, once it is known whether it can
+# hand back raw logits (see .claude/tasks/2026-09-23-local-inference.md). For
+# now this brings in only the runtime support the blocking call needs.
+local = ["dep:tokio"]
 
 [dev-dependencies]
 serde_json = "1"

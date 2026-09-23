@@ -54,12 +54,16 @@
 #[cfg(feature = "http")]
 mod client;
 mod error;
+#[cfg(feature = "local")]
+mod local;
 mod system_one;
 mod types;
 
 #[cfg(feature = "http")]
 pub use client::{Client, DEFAULT_BASE_URL, DEFAULT_MODEL};
 pub use error::{Error, Result};
+#[cfg(feature = "local")]
+pub use local::{Forward, LocalEngine};
 pub use system_one::SystemOne;
 pub use types::{
     Answer, Choice, Noul, NoulCriteria, Question, Score, SystemOneRequest, SystemOneResponse, Usage,

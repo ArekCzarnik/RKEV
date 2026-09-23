@@ -17,6 +17,10 @@ pub enum Error {
         request_id: Option<String>,
         body: String,
     },
+    /// The local engine failed: loading the model, tokenising, or the
+    /// forward pass itself.
+    #[cfg(feature = "local")]
+    Engine(String),
     /// The response was 2xx but did not match the expected shape.
     Decode {
         source: serde_json::Error,
@@ -63,6 +67,8 @@ impl fmt::Display for Error {
                 }
                 write!(f, ": {body}")
             }
+            #[cfg(feature = "local")]
+            Error::Engine(message) => write!(f, "the local kev engine failed: {message}"),
             Error::Decode { source, body } => {
                 write!(f, "could not decode the kev response ({source}): {body}")
             }
