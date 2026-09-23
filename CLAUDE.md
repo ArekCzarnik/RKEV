@@ -30,9 +30,14 @@ cargo run --example triage -- "custom ticket text"
 cargo doc --open                             # the crate is documented in rustdoc
 ```
 
-**The container has no Rust toolchain installed** (`cargo` is not on `PATH`).
-Either install one (`rustup`) before claiming tests pass, or say plainly that
-the change is unverified — never report a `cargo test` result you did not run.
+**Never report a `cargo test` result you did not run** — say plainly that a
+change is unverified instead.
+
+This container has no C toolchain (no `cc`, no glibc `crt1.o`), so a plain
+`cargo test` cannot link, and `--features http` cannot be built here at all
+(`ring` needs a C compiler). A Rust toolchain installs with `rustup`, and the
+non-HTTP features do run here through the musl target; the recipe is at the end
+of `.claude/tasks/2026-09-23-local-inference.md`.
 
 `scripts/triage.sh` runs the example; it probes the server first and passes
 `KEV_*` through:
@@ -74,13 +79,24 @@ Three modules behind a flat re-export surface in `src/lib.rs`:
   into `Error::Api`, and reads the body as text before decoding so a failed
   parse can report what actually arrived. `with_model_filled_in` injects the
   client's default model only when the request did not pin one.
-- `src/local.rs` — `LocalEngine` (feature `local`) and the `Forward` trait.
-  Skeleton only: blocking inside, the `SystemOne` seam outside, every call an
-  `Error::Engine` until the readout lands. Two load-bearing details: `Clone` is
-  cheap because `spawn_blocking` needs `'static`, and the backend lives in an
-  `Arc<Mutex<dyn Forward>>` so clones share one loaded model. mistral.rs is the
-  chosen engine and implements `Forward` — keeping it to that one impl is what
-  makes the engine swappable.
+- `src/prompt.rs`, `src/encode.rs`, `src/readout.rs` (feature `local`) — the
+  Kev-specific half of a local forward pass, mirroring `kev/api.py` and
+  `kev/model.py`: the text the model sees, the token layout (`<state>`, then
+  `<q> instructions <opt> option </opt> ... <decide>` per question) with its
+  block-causal mask and per-branch positions, and the pointer head that scores
+  each `</opt>` hidden state against its question's `<decide>` and turns the
+  softmax into an `Answer`. Every rule here is copied from the Python rather
+  than invented; when one changes, the answers change.
+- `src/local.rs` — `LocalEngine` (feature `local`), the `Forward` trait and
+  `Pass`. The engine owns everything Kev-specific and leaves a backend one job:
+  run the backbone, return hidden states at the readout positions. **Not**
+  logits — a checkpoint's output layer is the pointer head, which is why a
+  text-generation API such as mistral.rs cannot serve as the backend at all; the
+  task file has the evidence. Three load-bearing details: `Clone` is cheap
+  because `spawn_blocking` needs `'static`, the backend lives in an
+  `Arc<Mutex<dyn Forward>>` so clones share one loaded model, and `Pass::rows`
+  exists because backbones with recurrent layers (Qwen3.5, so every current
+  checkpoint) cannot honour `Pass::attends`. No backend ships yet.
 - `src/error.rs` — `Error` with predicates (`is_validation` for Kev's 422,
   `is_unauthorized` for 401/403) instead of making callers match on status
   codes.
@@ -88,7 +104,7 @@ Three modules behind a flat re-export surface in `src/lib.rs`:
 ### Features
 
 `http` (on by default) pulls in `reqwest`; `local` pulls in tokio for
-`spawn_blocking` and will carry the inference engine once one is chosen. The
+`spawn_blocking` and will carry the inference backend once one is written. The
 types, the errors and the `SystemOne` trait build with neither, so a
 local-inference build carries no HTTP stack. Consequences to keep in mind when editing:
 `Error::Transport` and `From<reqwest::Error>` are `#[cfg]`-gated, the crate-level
@@ -113,12 +129,24 @@ so the split cannot rot.
 - **Optional response fields.** Only `model` and `answers` are guaranteed;
   `usage` and `latency_ms` use `#[serde(default)]`. `request_id` is
   `#[serde(skip)]` — it comes from a header, not the body.
+- **`serde_json` keeps `preserve_order` on.** A JSON state is rendered into the
+  prompt field by field, so sorted keys would build a different prompt — and a
+  different answer — than the server does. It is not there for convenience.
+- **The local engine is a port, not a design.** `prompt.rs`, `encode.rs` and
+  `readout.rs` reproduce the Python kev, down to `True` for a boolean and
+  `json.dumps`' spacing in `usage.output_tokens`. Change them only to follow the
+  Python, and name the function upstream when you do.
 
 ### Tests
 
-`tests/wire_format.rs` is the whole suite and runs offline. It pins serialised
-requests and deserialised responses against the worked example in the Kev
-README, so a refactor cannot silently change what goes on the wire. Tests
+Three files, all offline. `tests/wire_format.rs` pins serialised requests and
+deserialised responses against the worked example in the Kev README, so a
+refactor cannot silently change what goes on the wire. `tests/seam.rs` proves
+the `SystemOne` trait is implementable without reqwest. `tests/local_engine.rs`
+drives the engine over a backend with no model in it, whose hidden states are
+built to produce a chosen distribution — that is what makes the prompt, the
+question isolation and the readout testable without weights, and it is where the
+Kev README's published numbers are asserted. Tests
 assert on JSON shape and public accessor behaviour, never on internals — keep
 new tests in that style, and update the README example and these fixtures
 together whenever the wire format legitimately changes.

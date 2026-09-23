@@ -103,6 +103,44 @@ server runs with one — Kev then requires `Authorization: Bearer <key>` on
 | `POST` | `/v1/systemone/permute` | `permute` — raw JSON, the shape is not documented |
 | `GET` | `/v1/models` | `models` — raw JSON, same reason |
 
+## Without a server (feature `local`)
+
+`LocalEngine` answers the same requests in this process: it builds Kev's prompt,
+runs one forward pass and reads the answers off the pointer head. What it still
+needs is an inference backend, which this crate does not ship:
+
+```rust
+use kev_client::{Forward, Pass, Result};
+
+impl Forward for MyBackbone {
+    // Token ids for caller text, and the ids of Kev's five delimiters.
+    fn tokenise(&mut self, text: &str) -> Result<Vec<u32>> { .. }
+    fn delimiter(&mut self, token: &str) -> Result<u32> { .. }
+
+    // The backbone's last hidden states at `pass.readout`.
+    fn hidden(&mut self, pass: &Pass<'_>) -> Result<Vec<Vec<f32>>> { .. }
+}
+```
+
+That is the backbone — the base model with the checkpoint's LoRA adapter and no
+vocabulary head — run with `pass.attends` as the attention mask and
+`pass.positions` as the position ids. Kev generates nothing and its answers do
+not come from logits: a checkpoint's output layer is a small pointer head that
+scores each option's `</opt>` hidden state against its question's `<decide>`.
+That head is the second half of a checkpoint, and it goes in alongside:
+
+```rust
+let head = PointerHead::new(query, key)?.with_temperature(2.3)?;
+let engine = LocalEngine::new(backbone, head);
+let response = engine.system_one_blocking(&request)?;
+```
+
+A local-only build carries no HTTP stack:
+
+```toml
+kev-client = { path = "../kev-client", default-features = false, features = ["local"] }
+```
+
 ## Tests
 
 ```bash
