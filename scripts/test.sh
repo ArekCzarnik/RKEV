@@ -98,7 +98,7 @@ step "cargo test" cargo test ${cargo_test_args[@]+"${cargo_test_args[@]}"}
 if [ "$skip_features" -eq 0 ] && [ ${#cargo_test_args[@]} -eq 0 ]; then
     for combo in "--no-default-features" \
                  "--no-default-features --features local" \
-                 "--no-default-features --features qwen3" \
+                 "--no-default-features --features candle" \
                  "--all-features"; do
         # shellcheck disable=SC2086
         step "cargo test $combo" cargo test $combo

@@ -1,28 +1,51 @@
-//! A [`Forward`] backend over the candle Qwen3 backbone.
+//! A [`Forward`] backend over the candle backbones.
 //!
 //! This is the half a checkpoint ships as weights: the base model with the
-//! adapter merged ([`Backbone`]), its tokenizer, and the pointer head. Put them
-//! together and [`LocalEngine`](crate::LocalEngine) answers System One requests
-//! with no server in sight.
+//! adapter merged, its tokenizer, and the pointer head. Put them together and
+//! [`LocalEngine`](crate::LocalEngine) answers System One requests with no server
+//! in sight.
+//!
+//! Which backbone a checkpoint needs is in its `config.json`, so [`Backend`]
+//! picks: [`crate::qwen3`] for the attention-only bases, [`crate::qwen3_5`] for
+//! the hybrid ones. The difference is not only the layers — a hybrid base runs
+//! one causal row per question, because its recurrent layers cannot be masked.
 
 use std::path::{Path, PathBuf};
 
 use candle_core::{Device, Tensor};
+use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::error::{Error, Result};
 use crate::local::{Forward, Pass};
-use crate::qwen3::{attention_mask, Backbone};
 use crate::readout::{Linear, PointerHead};
+use crate::weights::attention_mask;
+use crate::{qwen3, qwen3_5};
 
-/// A loaded Qwen3 checkpoint, ready to answer [`Forward`] calls.
-pub struct Qwen3Backend {
-    model: Backbone,
+/// A loaded Kev checkpoint, ready to answer [`Forward`] calls.
+pub struct Backend {
+    model: Model,
     tokenizer: Tokenizer,
     device: Device,
 }
 
-impl Qwen3Backend {
+enum Model {
+    /// Qwen3 bases: every layer is attention, so a whole request can run as one
+    /// masked pass.
+    Attention(qwen3::Backbone),
+    /// Qwen3.5 bases: three quarters of the layers are a recurrence, which
+    /// leaves one row per question as the only exact form.
+    Hybrid(qwen3_5::Backbone),
+}
+
+/// Just enough of a `config.json` to tell the two apart.
+#[derive(Deserialize)]
+struct Architecture {
+    #[serde(default)]
+    layer_types: Option<Vec<String>>,
+}
+
+impl Backend {
     /// Load a base model and, optionally, the Kev adapter over it.
     ///
     /// `base` holds `config.json` and the base weights; `adapter` is the
@@ -34,7 +57,7 @@ impl Qwen3Backend {
         Self::open_on(base, adapter, Device::Cpu)
     }
 
-    /// As [`Qwen3Backend::open`], on a device of your choosing.
+    /// As [`Backend::open`], on a device of your choosing.
     pub fn open_on(base: &Path, adapter: Option<&Path>, device: Device) -> Result<Self> {
         let path = tokenizer_path(base, adapter)?;
         let mut tokenizer = Tokenizer::from_file(&path)
@@ -52,8 +75,20 @@ impl Qwen3Backend {
             .map_err(|e| Error::Engine(format!("cannot disable truncation: {e}")))?;
         tokenizer.with_padding(None);
         tokenizer.set_encode_special_tokens(false);
+
+        let architecture: Architecture = qwen3::read_config(base)?;
+        let hybrid = architecture
+            .layer_types
+            .as_ref()
+            .is_some_and(|types| types.iter().any(|kind| kind == "linear_attention"));
+        let model = if hybrid {
+            Model::Hybrid(qwen3_5::Backbone::load(base, adapter, &device)?)
+        } else {
+            Model::Attention(qwen3::Backbone::load(base, adapter, &device)?)
+        };
+
         Ok(Self {
-            model: Backbone::load(base, adapter, &device)?,
+            model,
             tokenizer,
             device,
         })
@@ -62,15 +97,32 @@ impl Qwen3Backend {
     /// The width of the hidden states this backbone produces; the pointer head
     /// has to expect the same.
     pub fn hidden_size(&self) -> usize {
-        self.model.hidden_size()
+        match &self.model {
+            Model::Attention(model) => model.hidden_size(),
+            Model::Hybrid(model) => model.hidden_size(),
+        }
+    }
+
+    /// Whether this checkpoint's base carries recurrent layers, and so answers
+    /// one question per row.
+    pub fn is_hybrid(&self) -> bool {
+        matches!(self.model, Model::Hybrid(_))
+    }
+
+    /// The hidden states at `readout`, as the trait wants them.
+    fn pick(&self, hidden: &Tensor, readout: &[usize]) -> Result<Vec<Vec<f32>>> {
+        let wanted: Vec<u32> = readout.iter().map(|index| *index as u32).collect();
+        let wanted = Tensor::from_vec(wanted, readout.len(), &self.device)?;
+        Ok(hidden.index_select(&wanted, 0)?.to_vec2::<f32>()?)
     }
 }
 
-impl std::fmt::Debug for Qwen3Backend {
+impl std::fmt::Debug for Backend {
     // A loaded model is an opaque handle; its width is the only useful fact.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Qwen3Backend")
-            .field("hidden_size", &self.model.hidden_size())
+        f.debug_struct("Backend")
+            .field("hidden_size", &self.hidden_size())
+            .field("hybrid", &self.is_hybrid())
             .finish_non_exhaustive()
     }
 }
@@ -91,7 +143,7 @@ fn tokenizer_path(base: &Path, adapter: Option<&Path>) -> Result<PathBuf> {
     )))
 }
 
-impl Forward for Qwen3Backend {
+impl Forward for Backend {
     fn tokenise(&mut self, text: &str) -> Result<Vec<u32>> {
         // Never with special tokens: the delimiters are added by the layout,
         // and caller text has been escaped so it cannot produce one.
@@ -111,16 +163,37 @@ impl Forward for Qwen3Backend {
     }
 
     fn hidden(&mut self, pass: &Pass<'_>) -> Result<Vec<Vec<f32>>> {
-        let mask = attention_mask(
-            pass.ids.len(),
-            |query, key| pass.attends(query, key),
-            &self.device,
-        )?;
-        let hidden = self.model.forward(pass.ids, pass.positions, &mask)?;
-
-        let wanted: Vec<u32> = pass.readout.iter().map(|index| *index as u32).collect();
-        let wanted = Tensor::from_vec(wanted, pass.readout.len(), &self.device)?;
-        Ok(hidden.index_select(&wanted, 0)?.to_vec2::<f32>()?)
+        match &self.model {
+            Model::Attention(model) => {
+                let mask = attention_mask(
+                    pass.ids.len(),
+                    |query, key| pass.attends(query, key),
+                    &self.device,
+                )?;
+                let hidden = model.forward(pass.ids, pass.positions, &mask)?;
+                self.pick(&hidden, pass.readout)
+            }
+            // A recurrence carries state forward token by token and cannot be
+            // told to skip another question's tokens, so every question gets a
+            // row of its own: the state, then its branch, nothing else. The rows
+            // are independent, which makes the isolation exact rather than
+            // masked, and their readouts come back in the same order the packed
+            // pass asked for.
+            Model::Hybrid(model) => {
+                let mut states = Vec::with_capacity(pass.readout.len());
+                for row in pass.rows() {
+                    let row = row.as_pass();
+                    let mask = attention_mask(
+                        row.ids.len(),
+                        |query, key| row.attends(query, key),
+                        &self.device,
+                    )?;
+                    let hidden = model.forward(row.ids, row.positions, &mask)?;
+                    states.extend(self.pick(&hidden, row.readout)?);
+                }
+                Ok(states)
+            }
+        }
     }
 }
 

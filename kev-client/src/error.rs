@@ -27,7 +27,7 @@ pub enum Error {
     #[cfg(feature = "local")]
     ContextOverflow(String),
     /// The backbone failed: loading weights, or the forward pass itself.
-    #[cfg(feature = "qwen3")]
+    #[cfg(feature = "candle")]
     Model(candle_core::Error),
     /// The response was 2xx but did not match the expected shape.
     Decode {
@@ -94,7 +94,7 @@ impl fmt::Display for Error {
             Error::ContextOverflow(message) => {
                 write!(f, "the request does not fit the model context: {message}")
             }
-            #[cfg(feature = "qwen3")]
+            #[cfg(feature = "candle")]
             Error::Model(e) => write!(f, "the model failed: {e}"),
             Error::Decode { source, body } => {
                 write!(f, "could not decode the kev response ({source}): {body}")
@@ -108,7 +108,7 @@ impl std::error::Error for Error {
         match self {
             #[cfg(feature = "http")]
             Error::Transport(e) => Some(e),
-            #[cfg(feature = "qwen3")]
+            #[cfg(feature = "candle")]
             Error::Model(e) => Some(e),
             Error::Decode { source, .. } => Some(source),
             _ => None,
@@ -123,7 +123,7 @@ impl From<reqwest::Error> for Error {
     }
 }
 
-#[cfg(feature = "qwen3")]
+#[cfg(feature = "candle")]
 impl From<candle_core::Error> for Error {
     fn from(e: candle_core::Error) -> Self {
         Error::Model(e)

@@ -16,7 +16,7 @@
 //!     -d @request.json > server.json
 //!
 //! # 3. the same request, in process
-//! cargo run --features qwen3 --example parity -- \
+//! cargo run --features candle --example parity -- \
 //!     --base   ~/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Base/snapshots/<rev> \
 //!     --checkpoint ~/.cache/huggingface/hub/models--jaredpalmer--kev-4b/snapshots/<rev> \
 //!     --request request.json --server server.json
@@ -28,9 +28,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use kev_client::{
-    pointer_head, Answer, LocalEngine, Qwen3Backend, SystemOneRequest, SystemOneResponse,
-};
+use kev_client::{pointer_head, Answer, Backend, LocalEngine, SystemOneRequest, SystemOneResponse};
 
 struct Options {
     base: PathBuf,
@@ -83,7 +81,7 @@ fn run(options: &Options) -> Result<f64, Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| checkpoint.unwrap_or(&options.base).join("head.pt"));
     let engine = LocalEngine::new(
-        Qwen3Backend::open(&options.base, checkpoint)?,
+        Backend::open(&options.base, checkpoint)?,
         pointer_head(&head)?,
     );
 

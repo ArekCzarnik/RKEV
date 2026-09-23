@@ -102,7 +102,7 @@ checkpoints do not serve with), the state-prefix cache, and `permute`.
 ## Done: the Qwen3 backbone, in candle
 
 Commit "Run the attention-only Qwen3 bases in candle" — `src/qwen3.rs`,
-`src/backend.rs`, feature `qwen3`:
+`src/backend.rs`, feature `candle`:
 
 - The attention-only Qwen3 forward pass: embeddings, RMSNorm, GQA with Qwen3's
   per-head query/key norms, rotary embeddings at **the position ids we hand it**,
@@ -111,7 +111,7 @@ Commit "Run the attention-only Qwen3 bases in candle" — `src/qwen3.rs`,
 - The LoRA adapter is merged as the weights are read, `W + (B @ A) * alpha / r`
   in f32, exactly as `LoadOptions.merge` does it. `use_rslora` is honoured;
   adapters with trained token embeddings are refused.
-- `Qwen3Backend` adds the tokenizer (`tokenizers`, the checkpoint's
+- `Backend` adds the tokenizer (`tokenizers`, the checkpoint's
   `tokenizer.json`) and implements `Forward`. `pointer_head()` reads the head
   from `head.pt` or a safetensors file.
 - Configs this backbone would answer wrongly are refused: hybrid layer types,
@@ -194,31 +194,71 @@ one's divided by the temperature. Drop the `head` key and that test fails with
 **Still not verified against real weights.** Nothing here has opened a Qwen3
 checkpoint, so what remains open is the loading rather than the arithmetic: the
 tensor names and shapes of a published base (a mismatch fails loudly, at least),
-a real `tokenizer.json` (`KEV_TOKENIZER=<path> cargo test --features qwen3` runs
+a real `tokenizer.json` (`KEV_TOKENIZER=<path> cargo test --features candle` runs
 the delimiter and forgery checks against one; huggingface.co is not reachable
 from this container, so it was exercised against a file in Qwen's shape instead),
 and the probabilities end to end.
+
+## Done: the Qwen3.5 backbone, Gated DeltaNet and all
+
+Commit "Run the Qwen3.5 bases: attention mixed with Gated DeltaNet" —
+`src/qwen3_5.rs`, with the shared loading moved to `src/weights.rs` and `Backend`
+picking the backbone from `config.json`. This is the generation the *current*
+checkpoints use, so it is the one that matters.
+
+What it is, from `modeling_qwen3_5.py`:
+
+- Three quarters of the layers are a **gated delta rule**: a short depthwise
+  convolution over time, then a recurrence with one state per value head —
+  `S <- S exp(g_t)`, `delta <- (v_t - k_t S) beta_t`, `S <- S + k_t^T delta`,
+  `out_t <- q_t S` — where `beta = sigmoid(b)` is the write strength and
+  `g = -exp(A_log) softplus(a + dt_bias)` the decay. Queries and keys are
+  **L2-normalised** (not RMS), the query is scaled by the *key* width, key heads
+  are shared by several value heads (repeat_interleave, so value head `h` reads
+  key head `h / group`), and the output goes through a **ones-centred gated** RMS
+  norm multiplied by `silu(z)`.
+- The attention layers are Qwen3's plus two twists: `q_proj` is twice as wide and
+  its second half is a **sigmoid output gate** applied before `o_proj`, and only
+  `partial_rotary_factor` of each head is rotated (0.25 by default, the rest
+  passes through unchanged).
+- Every norm is **zero-centred** (`x * (1 + w)`, from a parameter initialised to
+  zeros), which the loader folds into a single multiplication. The recurrence's
+  gated norm is the one exception.
+- The recurrence runs sequentially, one token at a time: exact, and slow. The
+  chunked form in the reference computes the same thing faster.
+
+Because a recurrence cannot honour an attention mask, a hybrid checkpoint answers
+**one causal row per question** (`Pass::rows`), which is what the Python does
+there too. Isolation is then exact by construction, and `tests/qwen3_5.rs`
+asserts it as equality rather than within a tolerance.
+
+That test carries a transcription of the whole layer stack, recurrence included,
+and compares every hidden unit of every token. Five deliberate mistakes were
+tried against it, all caught: an RMS norm where the L2 norm belongs, key heads
+tiled instead of repeated in place, the attention gate dropped, the whole head
+rotated instead of a quarter, and the query scaled by the value width. It also
+checks that the adapter is merged into the recurrence's projections, which is
+where `kev.train` puts it on these bases.
 
 ## Left to do
 
 1. **Parity — the tool is there, it has not been run.** `examples/parity.rs`
    answers a recorded request in process and compares every probability with a
    recorded server response (`--tolerance`, non-zero exit past it). What is left
-   is running it on a machine that can hold `jaredpalmer/kev-4b@qwen3` (or
-   `kev-0.6b`, which is small) with `KEV_DTYPE=fp32` on the server side, and
+   is running it on a machine that can hold `jaredpalmer/kev-4b` (or
+   `kev-0.8b`, which is small) with `KEV_DTYPE=fp32` on the server side, and
    turning the recordings into offline fixtures afterwards. The arithmetic and the
    tokenizer call are now checked against Hugging Face's definitions of them;
    this is what checks the loading and the real vocabulary against the real
    thing. Run it with `KEV_TOKENIZER` set too, so the opt-in tokenizer checks
    come along. A real `head.pt` is part of what it exercises: the fixture here is
    in torch's shape, but only torch writes the real thing.
-2. **The Qwen3.5 bases** (the current checkpoints): Gated DeltaNet layers, which
-   means a second backbone and the row form only. mistral.rs has a candle
-   implementation of that architecture in `models/qwen3_next.rs` (MIT), which is
-   worth reading before writing one.
-3. **Performance.** No KV cache, no state-prefix reuse, CPU by default, f32. A
-   repeated state pays for itself every time; the Python caches it.
-4. `permute`, and `option_isolation` if a checkpoint ever serves with it.
+2. **Performance.** No KV cache, no state-prefix reuse, CPU by default, f32, and
+   on a hybrid base the recurrence runs one token at a time while the state is
+   recomputed per question. A repeated state pays for itself every time; the
+   Python caches it. Nothing here is fast, and the gap is widest exactly where the
+   current checkpoints are.
+3. `permute`, and `option_isolation` if a checkpoint ever serves with it.
 
 ## Design decisions
 
@@ -275,14 +315,14 @@ mkdir -p ~/lib-shim && cd /usr/lib/aarch64-linux-gnu \
 #     before main, and nothing says why)
 
 RUSTFLAGS=-Ctarget-feature=+fp16 RUSTC_WRAPPER=~/bin/rustc-shim \
-    cargo test --no-default-features --features qwen3
+    cargo test --no-default-features --features candle
 ```
 
 `+fp16` is for `gemm-f16`, whose inline assembly does not build on this
 aarch64 target without it; a Mac has it in the base feature set.
 
 Verified this way on 2026-09-23 (cargo 1.98.1): `--no-default-features`,
-`--features local` and `--features qwen3` all green — 6 backbone tests, 15
+`--features local` and `--features candle` all green — 6 backbone tests, 15
 engine tests, 2 seam tests, 10 wire-format tests, 1 doctest — with
 `cargo fmt --check` and `cargo clippy --all-targets` clean.
 

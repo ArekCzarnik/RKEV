@@ -23,7 +23,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt"], optional = true }
 # The backbone. 0.9 is the last candle-core that does not drag in tokenizers
 # with oniguruma, i.e. a C toolchain, for a crate we only want tensors from; we
-# bring our own tokenizer. Both are optional, pulled in by the `qwen3` feature.
+# bring our own tokenizer. Both are optional, pulled in by the `candle` feature.
 candle-core = { version = "0.9.2", default-features = false, optional = true }
 candle-nn = { version = "0.9.2", default-features = false, optional = true }
 # fancy-regex rather than the default onig, for the same reason.
@@ -43,10 +43,9 @@ http = ["dep:reqwest"]
 # (hidden states, not logits - see .claude/tasks/2026-09-23-local-inference.md),
 # so this still brings in only the runtime support the blocking call needs.
 local = ["dep:tokio"]
-# The attention-only Qwen3 backbone (the `@qwen3` checkpoints) in candle, as a
-# `Forward` backend. The hybrid Qwen3.5 bases need Gated DeltaNet layers and are
-# not implemented. Raises the MSRV to whatever candle needs.
-qwen3 = ["local", "dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:zip"]
+# The model itself, in candle: both generations of Kev's bases, as a `Forward`
+# backend. Raises the MSRV to whatever candle needs.
+candle = ["local", "dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:zip"]
 
 [dev-dependencies]
 serde_json = "1"
@@ -58,4 +57,4 @@ required-features = ["http"]
 
 [[example]]
 name = "parity"
-required-features = ["qwen3"]
+required-features = ["candle"]

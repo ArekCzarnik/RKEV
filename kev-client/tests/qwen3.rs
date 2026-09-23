@@ -5,20 +5,25 @@
 //! *any* weights — that a question cannot read another question, that the
 //! packed pass and the row form agree, that an adapter is merged the way peft
 //! merges it — and those are exactly the properties the Python checks
-//! (`tests/test_model.py::test_rows_match_packed`).
+//! (`tests/test_model.py::test_rows_match_packed`). The rest is a transcription
+//! of `modeling_qwen3.py` to compare against.
 //!
 //! Real weights can only be checked against a running Kev server; see
 //! `.claude/tasks/2026-09-23-local-inference.md`.
 
-#![cfg(feature = "qwen3")]
+#![cfg(feature = "candle")]
 
-use std::collections::BTreeMap;
+mod fixtures;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use fixtures::{
+    fresh_dir, tokenizer_json, vocab_size, write_head, write_safetensors, Noise, Tensors,
+};
 use kev_client::{
-    pointer_head, Choice, Forward, LocalEngine, Noul, Pass, Qwen3Backend, SystemOneRequest, DECIDE,
+    pointer_head, Backend, Choice, Forward, LocalEngine, Noul, Pass, SystemOneRequest, DECIDE,
     OPTION, OPTION_END, QUESTION, STATE,
 };
 
@@ -30,124 +35,17 @@ const KV_HEADS: usize = 2;
 const HEAD_DIM: usize = 8;
 const POINTER_DIM: usize = 16;
 
-/// Words the toy tokenizer knows; everything else becomes `[UNK]`.
-const WORDS: [&str; 16] = [
-    "a", "ticket", "about", "money", "late", "shoes", "no", "yes", "returns", "billing", "calm",
-    "angry", "is", "this", "?", "the",
-];
-
-// ---------------------------------------------------------------------------
-// A checkpoint on disk
-// ---------------------------------------------------------------------------
-
-/// Deterministic small values, so a test failure is always the code's fault.
-struct Noise(u64);
-
-impl Noise {
-    fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-        ((self.0 >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 0.2
-    }
-
-    fn values(&mut self, n: usize) -> Vec<f32> {
-        (0..n).map(|_| self.next()).collect()
-    }
-}
-
-/// The minimum a safetensors reader needs: a u64 header length, a JSON header,
-/// then the f32s. Written by hand so the tests need no extra dependency.
-fn write_safetensors(path: &Path, tensors: &BTreeMap<String, (Vec<usize>, Vec<f32>)>) {
-    let mut header = String::from("{");
-    let mut offset = 0;
-    for (index, (name, (shape, values))) in tensors.iter().enumerate() {
-        let end = offset + values.len() * 4;
-        if index > 0 {
-            header.push(',');
-        }
-        let shape = shape
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        header.push_str(&format!(
-            "\"{name}\":{{\"dtype\":\"F32\",\"shape\":[{shape}],\"data_offsets\":[{offset},{end}]}}"
-        ));
-        offset = end;
-    }
-    header.push('}');
-    while (8 + header.len()) % 8 != 0 {
-        header.push(' ');
-    }
-
-    let mut bytes = Vec::new();
-    bytes.extend((header.len() as u64).to_le_bytes());
-    bytes.extend(header.as_bytes());
-    for (_, values) in tensors.values() {
-        for value in values {
-            bytes.extend(value.to_le_bytes());
-        }
-    }
-    fs::write(path, bytes).unwrap();
-}
-
-fn tokenizer_json() -> String {
-    let mut vocab = vec![(String::from("[UNK]"), 0)];
-    for (index, token) in [STATE, QUESTION, OPTION, OPTION_END, DECIDE]
-        .iter()
-        .enumerate()
-    {
-        vocab.push((token.to_string(), index + 1));
-    }
-    for (index, word) in WORDS.iter().enumerate() {
-        vocab.push((word.to_string(), index + 6));
-    }
-    let entries: Vec<String> = vocab
-        .iter()
-        .map(|(token, id)| format!("\"{token}\":{id}"))
-        .collect();
-    // Qwen's tokenizer.json lists the specials as added tokens as well as in the
-    // vocabulary, and an added token is matched inside ordinary text. That is
-    // the whole reason caller text is escaped before it gets here.
-    let added: Vec<String> = [STATE, QUESTION, OPTION, OPTION_END, DECIDE]
-        .iter()
-        .enumerate()
-        .map(|(index, token)| {
-            format!(
-                r#"{{"id":{},"content":"{token}","single_word":false,"lstrip":false,
-                     "rstrip":false,"normalized":false,"special":true}}"#,
-                index + 1
-            )
-        })
-        .collect();
-    format!(
-        r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{}],
-            "normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":null,
-            "decoder":null,
-            "model":{{"type":"WordLevel","vocab":{{{}}},"unk_token":"[UNK]"}}}}"#,
-        added.join(","),
-        entries.join(",")
-    )
-}
-
-fn vocab_size() -> usize {
-    1 + 5 + WORDS.len()
-}
-
 /// A checkpoint directory, and the weights that went into it.
 struct Fixture {
     dir: PathBuf,
-    tensors: BTreeMap<String, (Vec<usize>, Vec<f32>)>,
+    tensors: Tensors,
 }
 
 /// A checkpoint directory: config, weights, tokenizer, pointer head. With
 /// `adapter`, the LoRA tensors are written alongside; with `merge`, the same
 /// delta is folded into the base weights instead.
 fn checkpoint(name: &str, adapter: bool, merge: bool) -> Fixture {
-    // One fixed directory per test, rebuilt on every run rather than piling up
-    // in the temp directory.
-    let dir = std::env::temp_dir().join(format!("kev-qwen3-{name}"));
-    fs::remove_dir_all(&dir).ok();
-    fs::create_dir_all(&dir).unwrap();
+    let dir = fresh_dir(&format!("qwen3-{name}"));
 
     fs::write(
         dir.join("config.json"),
@@ -163,7 +61,7 @@ fn checkpoint(name: &str, adapter: bool, merge: bool) -> Fixture {
     fs::write(dir.join("tokenizer.json"), tokenizer_json()).unwrap();
 
     let mut noise = Noise(42);
-    let mut tensors = BTreeMap::new();
+    let mut tensors = Tensors::new();
     tensors.insert(
         String::from("model.embed_tokens.weight"),
         (
@@ -173,29 +71,21 @@ fn checkpoint(name: &str, adapter: bool, merge: bool) -> Fixture {
     );
     for layer in 0..LAYERS {
         let prefix = format!("model.layers.{layer}");
-        // Norm weights sit around 1.0, as trained ones do.
-        let ones = |noise: &mut Noise, n: usize| {
-            noise
-                .values(n)
-                .into_iter()
-                .map(|v| 1.0 + v)
-                .collect::<Vec<_>>()
-        };
         tensors.insert(
             format!("{prefix}.input_layernorm.weight"),
-            (vec![HIDDEN], ones(&mut noise, HIDDEN)),
+            (vec![HIDDEN], noise.around_one(HIDDEN)),
         );
         tensors.insert(
             format!("{prefix}.post_attention_layernorm.weight"),
-            (vec![HIDDEN], ones(&mut noise, HIDDEN)),
+            (vec![HIDDEN], noise.around_one(HIDDEN)),
         );
         tensors.insert(
             format!("{prefix}.self_attn.q_norm.weight"),
-            (vec![HEAD_DIM], ones(&mut noise, HEAD_DIM)),
+            (vec![HEAD_DIM], noise.around_one(HEAD_DIM)),
         );
         tensors.insert(
             format!("{prefix}.self_attn.k_norm.weight"),
-            (vec![HEAD_DIM], ones(&mut noise, HEAD_DIM)),
+            (vec![HEAD_DIM], noise.around_one(HEAD_DIM)),
         );
         for (name, out) in [
             ("self_attn.q_proj", HEADS * HEAD_DIM),
@@ -214,20 +104,15 @@ fn checkpoint(name: &str, adapter: bool, merge: bool) -> Fixture {
                 noise.values(HIDDEN * HEADS * HEAD_DIM),
             ),
         );
-        tensors.insert(
-            format!("{prefix}.mlp.gate_proj.weight"),
-            (
-                vec![INTERMEDIATE, HIDDEN],
-                noise.values(INTERMEDIATE * HIDDEN),
-            ),
-        );
-        tensors.insert(
-            format!("{prefix}.mlp.up_proj.weight"),
-            (
-                vec![INTERMEDIATE, HIDDEN],
-                noise.values(INTERMEDIATE * HIDDEN),
-            ),
-        );
+        for name in ["mlp.gate_proj", "mlp.up_proj"] {
+            tensors.insert(
+                format!("{prefix}.{name}.weight"),
+                (
+                    vec![INTERMEDIATE, HIDDEN],
+                    noise.values(INTERMEDIATE * HIDDEN),
+                ),
+            );
+        }
         tensors.insert(
             format!("{prefix}.mlp.down_proj.weight"),
             (
@@ -238,10 +123,7 @@ fn checkpoint(name: &str, adapter: bool, merge: bool) -> Fixture {
     }
     tensors.insert(
         String::from("model.norm.weight"),
-        (
-            vec![HIDDEN],
-            noise.values(HIDDEN).into_iter().map(|v| 1.0 + v).collect(),
-        ),
+        (vec![HIDDEN], noise.around_one(HIDDEN)),
     );
 
     // One rank-2 LoRA on the first layer's query projection, either shipped as
@@ -265,7 +147,7 @@ fn checkpoint(name: &str, adapter: bool, merge: bool) -> Fixture {
                 }
             }
         } else {
-            let mut adapter_tensors = BTreeMap::new();
+            let mut adapter_tensors = Tensors::new();
             adapter_tensors.insert(
                 String::from("base_model.model.layers.0.self_attn.q_proj.lora_A.weight"),
                 (vec![rank, HIDDEN], a),
@@ -289,26 +171,13 @@ fn checkpoint(name: &str, adapter: bool, merge: bool) -> Fixture {
     }
 
     write_safetensors(&dir.join("model.safetensors"), &tensors);
-
-    let mut head = Noise(99);
-    let mut head_tensors = BTreeMap::new();
-    for name in ["q", "k"] {
-        head_tensors.insert(
-            format!("head.{name}.weight"),
-            (vec![POINTER_DIM, HIDDEN], head.values(POINTER_DIM * HIDDEN)),
-        );
-        head_tensors.insert(
-            format!("head.{name}.bias"),
-            (vec![POINTER_DIM], head.values(POINTER_DIM)),
-        );
-    }
-    write_safetensors(&dir.join("head.safetensors"), &head_tensors);
+    write_head(&dir, HIDDEN, POINTER_DIM);
 
     Fixture { dir, tensors }
 }
 
 fn engine(dir: &Path, adapter: Option<&Path>) -> LocalEngine {
-    let backend = Qwen3Backend::open(dir, adapter).unwrap();
+    let backend = Backend::open(dir, adapter).unwrap();
     let head = pointer_head(&dir.join("head.safetensors")).unwrap();
     LocalEngine::new(backend, head)
 }
@@ -417,7 +286,7 @@ fn the_packed_pass_and_the_row_form_agree() {
     // What a backbone with recurrent layers is limited to has to give the same
     // hidden states as the packed pass on a backbone that can do both.
     let dir = checkpoint("rows", false, false).dir;
-    let mut backend = Qwen3Backend::open(&dir, None).unwrap();
+    let mut backend = Backend::open(&dir, None).unwrap();
     let ids: Vec<u32> = vec![1, 6, 7, 2, 12, 3, 14, 4, 5, 2, 13, 3, 11, 4, 5];
     let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2];
     let positions: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 3, 4, 5, 6, 7, 8];
@@ -478,28 +347,23 @@ fn an_adapter_is_merged_the_way_peft_merges_it() {
 }
 
 #[test]
-fn a_hybrid_base_is_refused_rather_than_answered_wrongly() {
-    let dir = checkpoint("hybrid", false, false).dir;
-    let config = fs::read_to_string(dir.join("config.json")).unwrap();
-    fs::write(
-        dir.join("config.json"),
-        config.replace(
-            "\"rms_norm_eps\"",
-            "\"layer_types\":[\"full_attention\",\"linear_attention\"],\"rms_norm_eps\"",
-        ),
-    )
-    .unwrap();
+fn an_attention_only_config_gets_the_attention_only_backbone() {
+    // Which backbone a checkpoint needs is in its config: no `layer_types`, or
+    // none of them recurrent, means every layer is attention and a whole request
+    // can run as one masked pass. The hybrid side of this is in tests/qwen3_5.rs.
+    let fixture = checkpoint("dispatch", false, false);
 
-    let error = Qwen3Backend::open(&dir, None).unwrap_err();
+    let backend = Backend::open(&fixture.dir, None).unwrap();
 
-    assert!(error.to_string().contains("attention-only"), "{error}");
+    assert!(!backend.is_hybrid());
+    assert_eq!(backend.hidden_size(), HIDDEN);
 }
 
 // ---------------------------------------------------------------------------
 // A second implementation, to check the first one's conventions
 // ---------------------------------------------------------------------------
 
-fn weights<'a>(tensors: &'a BTreeMap<String, (Vec<usize>, Vec<f32>)>, name: &str) -> &'a [f32] {
+fn weights<'a>(tensors: &'a Tensors, name: &str) -> &'a [f32] {
     &tensors
         .get(name)
         .unwrap_or_else(|| panic!("no tensor {name}"))
@@ -548,7 +412,7 @@ fn silu(x: f32) -> f32 {
 /// Nothing here shares code with the backbone, which is the point: if the two
 /// agree on random weights, they agree on the conventions.
 fn reference_hidden(
-    tensors: &BTreeMap<String, (Vec<usize>, Vec<f32>)>,
+    tensors: &Tensors,
     ids: &[u32],
     positions: &[u32],
     attends: &dyn Fn(usize, usize) -> bool,
@@ -680,7 +544,7 @@ fn the_forward_pass_matches_a_transcription_of_modeling_qwen3() {
     // come before the rotation, which key/value head a query head reads, the
     // attention scaling, and the residual and normalisation order.
     let fixture = checkpoint("reference", false, false);
-    let mut backend = Qwen3Backend::open(&fixture.dir, None).unwrap();
+    let mut backend = Backend::open(&fixture.dir, None).unwrap();
 
     let ids: Vec<u32> = vec![1, 6, 7, 2, 12, 3, 14, 4, 5, 2, 13, 3, 11, 4, 5];
     let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2];
@@ -748,7 +612,7 @@ fn caller_text_cannot_forge_a_delimiter() {
     // it by rewriting `<|name|>` to `<\u{a6}name\u{a6}>` before tokenising, so a
     // state cannot open a question or close an option.
     let fixture = checkpoint("forgery", false, false);
-    let mut backend = Qwen3Backend::open(&fixture.dir, None).unwrap();
+    let mut backend = Backend::open(&fixture.dir, None).unwrap();
     let question = backend.delimiter(QUESTION).unwrap();
     let option_end = backend.delimiter(OPTION_END).unwrap();
 
@@ -791,7 +655,7 @@ fn caller_text_cannot_forge_a_delimiter() {
 #[test]
 fn a_real_qwen_tokenizer_carries_the_five_delimiters() {
     // Opt in with a real checkpoint's tokenizer, which cannot be vendored here:
-    //   KEV_TOKENIZER=/path/to/tokenizer.json cargo test --features qwen3
+    //   KEV_TOKENIZER=/path/to/tokenizer.json cargo test --features candle
     // Only the tokenizer is real; the weights stay the toy ones, and nothing
     // here asks anything of them.
     let Ok(real) = std::env::var("KEV_TOKENIZER") else {
@@ -800,7 +664,7 @@ fn a_real_qwen_tokenizer_carries_the_five_delimiters() {
     };
     let fixture = checkpoint("real-tokenizer", false, false);
     fs::copy(&real, fixture.dir.join("tokenizer.json")).unwrap();
-    let mut backend = Qwen3Backend::open(&fixture.dir, None).unwrap();
+    let mut backend = Backend::open(&fixture.dir, None).unwrap();
 
     let delimiters: Vec<u32> = [STATE, QUESTION, OPTION, OPTION_END, DECIDE]
         .iter()

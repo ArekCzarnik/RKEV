@@ -20,6 +20,7 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::weights::{linear, repeat_kv, rms_norm, rope, rotary_tables, Weights};
 
 /// The parts of a Qwen3 `config.json` this backbone needs.
 #[derive(Debug, Clone, Deserialize)]
@@ -54,15 +55,16 @@ pub struct Config {
 
 /// The rope block of a config, in either of the two places it appears.
 #[derive(Debug, Clone, Deserialize)]
-struct RopeParameters {
+pub(crate) struct RopeParameters {
     rope_type: Option<String>,
     #[serde(rename = "type")]
     kind: Option<String>,
-    rope_theta: Option<f64>,
+    pub rope_theta: Option<f64>,
+    pub partial_rotary_factor: Option<f64>,
 }
 
 impl RopeParameters {
-    fn kind(&self) -> &str {
+    pub fn kind(&self) -> &str {
         self.rope_type
             .as_deref()
             .or(self.kind.as_deref())
@@ -70,14 +72,32 @@ impl RopeParameters {
     }
 }
 
+/// Read a `config.json` into whichever config type is asked for.
+pub(crate) fn read_config<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<T> {
+    let path = dir.join("config.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| Error::Engine(format!("cannot read {}: {e}", path.display())))?;
+    serde_json::from_str(&text)
+        .map_err(|e| Error::Engine(format!("cannot parse {}: {e}", path.display())))
+}
+
+/// Refuse a rope this backbone would compute differently from the reference.
+pub(crate) fn supported_rope(rope: Option<&RopeParameters>) -> Result<()> {
+    if let Some(rope) = rope {
+        if rope.kind() != "default" {
+            return Err(Error::Engine(format!(
+                "this backbone implements the original rotary embedding, the config asks for {:?}",
+                rope.kind()
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     /// Read `config.json` from a model directory.
     pub fn read(dir: &Path) -> Result<Self> {
-        let path = dir.join("config.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Engine(format!("cannot read {}: {e}", path.display())))?;
-        let config: Self = serde_json::from_str(&text)
-            .map_err(|e| Error::Engine(format!("cannot parse {}: {e}", path.display())))?;
+        let config: Self = read_config(dir)?;
         config.supported()?;
         Ok(config)
     }
@@ -104,7 +124,7 @@ impl Config {
             if types.iter().any(|kind| kind != "full_attention") {
                 return Err(Error::Engine(String::from(
                     "this backbone is attention-only; the hybrid Qwen3.5 bases \
-                     (Gated DeltaNet layers) are not implemented",
+                     (Gated DeltaNet layers) need the qwen3_5 backbone",
                 )));
             }
         }
@@ -115,17 +135,8 @@ impl Config {
         }
         // Anything but the original RoPE changes the frequencies, and this
         // backbone computes them one way only.
-        for rope in [&self.rope_parameters, &self.rope_scaling]
-            .into_iter()
-            .flatten()
-        {
-            if rope.kind() != "default" {
-                return Err(Error::Engine(format!(
-                    "this backbone implements the original rotary embedding, the config asks for {:?}",
-                    rope.kind()
-                )));
-            }
-        }
+        supported_rope(self.rope_parameters.as_ref())?;
+        supported_rope(self.rope_scaling.as_ref())?;
         if self.attention_bias {
             return Err(Error::Engine(String::from(
                 "this backbone reads no attention bias, and the config asks for one",
@@ -140,7 +151,7 @@ impl Config {
     }
 }
 
-/// A Qwen3 backbone with the checkpoint's LoRA adapter already merged in.
+/// A Qwen3 backbone with the checkpoint's LoRA adapter already merged.
 pub struct Backbone {
     config: Config,
     embed_tokens: Tensor,
@@ -177,17 +188,17 @@ impl Backbone {
             .map(|index| {
                 let layer = format!("layers.{index}");
                 Ok(Layer {
-                    input_norm: weights.plain(&format!("{layer}.input_layernorm"))?,
+                    input_norm: weights.plain(&format!("{layer}.input_layernorm.weight"))?,
                     q_proj: weights.adapted(&format!("{layer}.self_attn.q_proj"))?,
                     k_proj: weights.adapted(&format!("{layer}.self_attn.k_proj"))?,
                     v_proj: weights.adapted(&format!("{layer}.self_attn.v_proj"))?,
                     o_proj: weights.adapted(&format!("{layer}.self_attn.o_proj"))?,
                     // Qwen3 normalises every head's query and key before the
                     // rotary embedding; Qwen2 did not.
-                    q_norm: weights.plain(&format!("{layer}.self_attn.q_norm"))?,
-                    k_norm: weights.plain(&format!("{layer}.self_attn.k_norm"))?,
+                    q_norm: weights.plain(&format!("{layer}.self_attn.q_norm.weight"))?,
+                    k_norm: weights.plain(&format!("{layer}.self_attn.k_norm.weight"))?,
                     post_attention_norm: weights
-                        .plain(&format!("{layer}.post_attention_layernorm"))?,
+                        .plain(&format!("{layer}.post_attention_layernorm.weight"))?,
                     gate_proj: weights.adapted(&format!("{layer}.mlp.gate_proj"))?,
                     up_proj: weights.adapted(&format!("{layer}.mlp.up_proj"))?,
                     down_proj: weights.adapted(&format!("{layer}.mlp.down_proj"))?,
@@ -196,8 +207,8 @@ impl Backbone {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
-            embed_tokens: weights.plain("embed_tokens")?,
-            norm: weights.plain("norm")?,
+            embed_tokens: weights.plain("embed_tokens.weight")?,
+            norm: weights.plain("norm.weight")?,
             layers,
             config,
             device: device.clone(),
@@ -273,8 +284,8 @@ impl Backbone {
         // Per-head normalisation, then the rotary embedding, in that order.
         let q = rms_norm(&q, &layer.q_norm, self.config.rms_norm_eps)?;
         let k = rms_norm(&k, &layer.k_norm, self.config.rms_norm_eps)?;
-        let q = candle_nn::rotary_emb::rope(&q.transpose(1, 2)?.contiguous()?, cos, sin)?;
-        let k = candle_nn::rotary_emb::rope(&k.transpose(1, 2)?.contiguous()?, cos, sin)?;
+        let q = rope(&q.transpose(1, 2)?, cos, sin)?;
+        let k = rope(&k.transpose(1, 2)?, cos, sin)?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
         let k = repeat_kv(&k, heads / kv_heads)?;
@@ -297,255 +308,5 @@ impl Backbone {
         let gate = candle_nn::ops::silu(&linear(xs, &layer.gate_proj)?)?;
         let up = linear(xs, &layer.up_proj)?;
         Ok(linear(&(gate * up)?, &layer.down_proj)?)
-    }
-}
-
-/// Cosine and sine tables for exactly the positions asked for, rather than for
-/// `0..n` — the branches do not sit at consecutive positions.
-///
-/// `inv_freq[i] = theta^(-2i/dim)`, as in Hugging Face's
-/// `compute_default_rope_parameters`. The tables are `[len, dim/2]`, which is
-/// what candle's non-interleaved `rope` wants, and the halves it pairs are the
-/// same ones `rotate_half` pairs.
-fn rotary_tables(
-    positions: &[u32],
-    dim: usize,
-    theta: f64,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let inverse: Vec<f32> = (0..dim / 2)
-        .map(|i| (1.0 / theta.powf(2.0 * i as f64 / dim as f64)) as f32)
-        .collect();
-    let inverse = Tensor::from_vec(inverse, (1, dim / 2), device)?;
-    let angles: Vec<f32> = positions.iter().map(|p| *p as f32).collect();
-    let angles = Tensor::from_vec(angles, (positions.len(), 1), device)?;
-    let angles = angles.matmul(&inverse)?;
-    Ok((angles.cos()?, angles.sin()?))
-}
-
-/// `y = x W^T`. Qwen3's projections carry no bias.
-fn linear(xs: &Tensor, weight: &Tensor) -> candle_core::Result<Tensor> {
-    xs.broadcast_matmul(&weight.t()?)
-}
-
-fn rms_norm(xs: &Tensor, weight: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
-    candle_nn::ops::rms_norm(&xs.contiguous()?, weight, eps as f32)
-}
-
-/// Grouped-query attention: every key/value head serves `n` query heads.
-fn repeat_kv(xs: &Tensor, n: usize) -> candle_core::Result<Tensor> {
-    if n == 1 {
-        return Ok(xs.clone());
-    }
-    let (batch, heads, len, dim) = xs.dims4()?;
-    xs.unsqueeze(2)?
-        .expand((batch, heads, n, len, dim))?
-        .reshape((batch, heads * n, len, dim))
-}
-
-/// The checkpoint on disk: base weights, and the LoRA adapter merged into them
-/// as they are read.
-struct Weights {
-    base: candle_core::safetensors::MmapedSafetensors,
-    adapter: Option<Adapter>,
-    device: Device,
-}
-
-struct Adapter {
-    tensors: candle_core::safetensors::MmapedSafetensors,
-    /// `lora_alpha / r`, the scale PEFT folds into the delta.
-    scale: f64,
-}
-
-#[derive(Deserialize)]
-struct AdapterConfig {
-    r: f64,
-    lora_alpha: f64,
-    #[serde(default)]
-    use_rslora: bool,
-    #[serde(default)]
-    trainable_token_indices: Option<serde_json::Value>,
-}
-
-impl Weights {
-    fn open(base: &Path, adapter: Option<&Path>, device: &Device) -> Result<Self> {
-        let files = safetensors_in(base)?;
-        // Safety: the files must not change while they are mapped, which is
-        // the same contract every safetensors reader takes.
-        let base = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&files)? };
-
-        let adapter = match adapter {
-            None => None,
-            Some(dir) => {
-                let path = dir.join("adapter_config.json");
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| Error::Engine(format!("cannot read {}: {e}", path.display())))?;
-                let config: AdapterConfig = serde_json::from_str(&text)
-                    .map_err(|e| Error::Engine(format!("cannot parse {}: {e}", path.display())))?;
-                if config.trainable_token_indices.is_some() {
-                    return Err(Error::Engine(String::from(
-                        "this adapter carries trained token embeddings, which are not merged here",
-                    )));
-                }
-                let divisor = if config.use_rslora {
-                    config.r.sqrt()
-                } else {
-                    config.r
-                };
-                Some(Adapter {
-                    tensors: unsafe {
-                        candle_core::safetensors::MmapedSafetensors::new(
-                            dir.join("adapter_model.safetensors"),
-                        )?
-                    },
-                    scale: config.lora_alpha / divisor,
-                })
-            }
-        };
-
-        Ok(Self {
-            base,
-            adapter,
-            device: device.clone(),
-        })
-    }
-
-    /// A weight the adapter never touches (the embeddings and the norms).
-    fn plain(&self, path: &str) -> Result<Tensor> {
-        let name = format!("model.{path}.weight");
-        Ok(self.base.load(&name, &self.device)?.to_dtype(DType::F32)?)
-    }
-
-    /// A projection, with the adapter's `B @ A` delta merged in.
-    ///
-    /// Merging in f32 before anything else is what the Python does
-    /// (`LoadOptions.merge`), and it is exact there.
-    fn adapted(&self, path: &str) -> Result<Tensor> {
-        let weight = self.plain(path)?;
-        let Some(adapter) = &self.adapter else {
-            return Ok(weight);
-        };
-        // peft names the module it wrapped `base_model.model.<path>`; kev wraps
-        // the text model, so `<path>` is what the base file calls `model.<path>`.
-        let Some((a, b)) = self.lora(adapter, path)? else {
-            return Ok(weight);
-        };
-        let delta = (b.matmul(&a)? * adapter.scale)?;
-        if delta.dims() != weight.dims() {
-            return Err(Error::Engine(format!(
-                "the adapter's delta for {path} is {:?}, the weight is {:?}",
-                delta.dims(),
-                weight.dims()
-            )));
-        }
-        Ok((weight + delta)?)
-    }
-
-    fn lora(&self, adapter: &Adapter, path: &str) -> Result<Option<(Tensor, Tensor)>> {
-        for prefix in ["base_model.model", "base_model.model.model"] {
-            let a = format!("{prefix}.{path}.lora_A.weight");
-            let b = format!("{prefix}.{path}.lora_B.weight");
-            if let Ok(a) = adapter.tensors.load(&a, &self.device) {
-                let b = adapter.tensors.load(&b, &self.device)?;
-                return Ok(Some((a.to_dtype(DType::F32)?, b.to_dtype(DType::F32)?)));
-            }
-        }
-        Ok(None)
-    }
-}
-
-fn safetensors_in(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| Error::Engine(format!("cannot read {}: {e}", dir.display())))?;
-    let mut files: Vec<_> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|e| e == "safetensors"))
-        .collect();
-    if files.is_empty() {
-        return Err(Error::Engine(format!(
-            "no .safetensors in {}",
-            dir.display()
-        )));
-    }
-    // Shards are named model-00001-of-00002.safetensors; read them in order.
-    files.sort();
-    Ok(files)
-}
-
-/// The additive attention mask for one pass, `[1, 1, n, n]`.
-///
-/// `allowed(query, key)` is [`Pass::attends`](crate::Pass): causal, and blind
-/// across questions.
-pub(crate) fn attention_mask<F>(len: usize, allowed: F, device: &Device) -> Result<Tensor>
-where
-    F: Fn(usize, usize) -> bool,
-{
-    let mut values = Vec::with_capacity(len * len);
-    for query in 0..len {
-        for key in 0..len {
-            // The same "very negative" the Python uses (torch.finfo.min), not
-            // -inf: a fully masked row would otherwise be NaN rather than flat.
-            values.push(if allowed(query, key) { 0.0 } else { f32::MIN });
-        }
-    }
-    Ok(Tensor::from_vec(values, (1, 1, len, len), device)?)
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The rotary embedding, against the formula in
-    /// `transformers/models/qwen3/modeling_qwen3.py`:
-    ///
-    /// ```text
-    /// inv_freq[i] = theta ** (-2i/dim)            (compute_default_rope_parameters)
-    /// cos = cat(freqs, freqs).cos()               (Qwen3RotaryEmbedding.forward)
-    /// rotate_half(x) = cat(-x[d/2:], x[:d/2])
-    /// q' = q * cos + rotate_half(q) * sin         (apply_rotary_pos_emb)
-    /// ```
-    ///
-    /// Which comes out as, for `i < dim/2`:
-    ///   `q'[i] = q[i] cos - q[i + dim/2] sin`
-    ///   `q'[i + dim/2] = q[i + dim/2] cos + q[i] sin`
-    ///
-    /// The point of testing it: candle offers both this and the *interleaved*
-    /// convention (`rope_i`), which pairs `(0,1), (2,3), ...` instead. Both run,
-    /// only one is Qwen3, and the difference is invisible without real weights.
-    #[test]
-    fn the_rotary_embedding_matches_the_hugging_face_formula() {
-        let device = Device::Cpu;
-        let (heads, len, dim, theta) = (2usize, 3usize, 8usize, 10_000f64);
-        let positions = [0u32, 5, 9];
-        let values: Vec<f32> = (0..heads * len * dim)
-            .map(|i| ((i * 37 % 19) as f32 - 9.0) / 7.0)
-            .collect();
-        let q = Tensor::from_vec(values.clone(), (1, heads, len, dim), &device).unwrap();
-
-        let (cos, sin) = rotary_tables(&positions, dim, theta, &device).unwrap();
-        let ours = candle_nn::rotary_emb::rope(&q, &cos, &sin)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-
-        for head in 0..heads {
-            for (step, position) in positions.iter().enumerate() {
-                let row = (head * len + step) * dim;
-                for i in 0..dim / 2 {
-                    let angle = *position as f64 * theta.powf(-2.0 * i as f64 / dim as f64);
-                    let (cos, sin) = (angle.cos() as f32, angle.sin() as f32);
-                    let (low, high) = (values[row + i], values[row + i + dim / 2]);
-                    let expected = [low * cos - high * sin, high * cos + low * sin];
-                    for (offset, expected) in [(i, expected[0]), (i + dim / 2, expected[1])] {
-                        let got = ours[row + offset];
-                        assert!(
-                            (got - expected).abs() < 1e-6,
-                            "position {position}, element {offset}: {got} vs {expected}"
-                        );
-                    }
-                }
-            }
-        }
     }
 }

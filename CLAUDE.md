@@ -101,14 +101,20 @@ Three modules behind a flat re-export surface in `src/lib.rs`:
   `Arc<Mutex<dyn Forward>>` so clones share one loaded model, and `Pass::rows`
   exists because backbones with recurrent layers (Qwen3.5) cannot honour
   `Pass::attends`.
-- `src/qwen3.rs`, `src/backend.rs` (feature `qwen3`) — the backbone itself, in
-  candle: the attention-only Qwen3 bases (the `@qwen3` checkpoints), with the
-  checkpoint's LoRA merged in f32 as the weights are read, and `Qwen3Backend`
-  putting it together with the tokenizer as a `Forward`. It exists separately
-  from candle's and mistral.rs' Qwen3 because it has to take an arbitrary
-  additive mask and explicit position ids, and has to stop at the hidden states
-  — no vocabulary head, no KV cache, one prefill pass per request. The hybrid
-  Qwen3.5 bases (Gated DeltaNet) are refused rather than answered wrongly.
+- `src/qwen3.rs`, `src/qwen3_5.rs`, `src/weights.rs`, `src/backend.rs` (feature
+  `candle`) — the model itself, in candle. Both backbones exist separately from
+  candle's and mistral.rs' Qwen3 because they have to take an arbitrary additive
+  mask and explicit position ids, and have to stop at the hidden states: no
+  vocabulary head, no KV cache, one prefill pass. `weights.rs` reads a checkpoint
+  and merges its LoRA in f32 as it goes; `backend.rs` puts a backbone and the
+  tokenizer together as `Backend`, and picks the backbone from `config.json`.
+  `qwen3_5.rs` is the current generation and the harder one: three quarters of its
+  layers are a gated delta rule (a recurrence, not attention), the rest is
+  attention with an output gate and only a quarter of each head rotated, and
+  every norm is zero-centred (`x * (1 + w)`) except the recurrence's gated one.
+  **A recurrent layer cannot honour `Pass::attends`**, so a hybrid checkpoint
+  answers one causal row per question — exact isolation instead of masked, and the
+  same thing the Python does there.
 - `src/error.rs` — `Error` with predicates (`is_validation` for Kev's 422,
   `is_unauthorized` for 401/403) instead of making callers match on status
   codes.
@@ -154,7 +160,7 @@ so the split cannot rot.
   `<|name|>` rewritten to `<¦name¦>` before tokenising, because a tokenizer
   matches its own special tokens inside ordinary text (`encode_special_tokens`
   is false in transformers and here). Without it a state could open a question.
-  `Qwen3Backend` also switches truncation and padding off explicitly, as
+  `Backend` also switches truncation and padding off explicitly, as
   transformers does on every call — inheriting them from `tokenizer.json` would
   change the token ids.
 
@@ -174,17 +180,22 @@ properties under test hold for any weights — question isolation, packed agains
 row form, and that merging an adapter equals a pre-merged checkpoint. It also
 carries a plain-f32 transcription of `modeling_qwen3.py` and asserts the candle
 path matches it everywhere, which is what pins the conventions Hugging Face and
-candle disagree about (the rotary halves above all); keep that test honest by
-breaking the implementation on purpose when you touch it. It also holds the
+candle disagree about (the rotary halves above all); keep those tests honest by
+breaking the implementation on purpose when you touch them. It also holds the
 tokenizer checks, one of which runs only with `KEV_TOKENIZER=<tokenizer.json>`
-set, since a real Qwen tokenizer cannot be vendored. Tests
+set, since a real Qwen tokenizer cannot be vendored. `tests/qwen3_5.rs` does the
+same for the hybrid backbone, transcription included — the delta rule has a decay,
+a write strength, an L2 norm (not an RMS norm), a short convolution and a gated
+output norm, and every one of them is a place to be quietly wrong.
+`tests/fixtures/mod.rs` is shared by both: the safetensors and tokenizer writers,
+so no test needs a dev-dependency to build a checkpoint. Tests
 assert on JSON shape and public accessor behaviour, never on internals — keep
 new tests in that style, and update the README example and these fixtures
 together whenever the wire format legitimately changes.
 
 ### Checking the engine against the server
 
-`examples/parity.rs` (feature `qwen3`) answers a recorded request in process and
+`examples/parity.rs` (feature `candle`) answers a recorded request in process and
 compares every probability with the server's recorded response, exiting non-zero
 past a tolerance. It needs no HTTP stack on purpose: the server side is a file,
 which makes the recording reusable as an offline fixture later. Nothing else in

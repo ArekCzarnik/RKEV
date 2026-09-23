@@ -103,19 +103,19 @@ server runs with one — Kev then requires `Authorization: Bearer <key>` on
 | `POST` | `/v1/systemone/permute` | `permute` — raw JSON, the shape is not documented |
 | `GET` | `/v1/models` | `models` — raw JSON, same reason |
 
-## Without a server (features `local`, `qwen3`)
+## Without a server (features `local`, `candle`)
 
 `LocalEngine` answers the same requests in this process: it builds Kev's prompt,
 runs one forward pass and reads the answers off the pointer head.
 
-With the `qwen3` feature it comes with a backbone — candle, CPU by default, for
-the attention-only Qwen3 bases, which is the generation `jaredpalmer/kev-4b@qwen3`
-and `kev-8b` are built on:
+With the `candle` feature it comes with the model: candle, CPU by default, for
+both generations of Kev's bases. Which one a checkpoint needs is in its
+`config.json`, so there is nothing to choose:
 
 ```rust
-use kev_client::{pointer_head, LocalEngine, Qwen3Backend};
+use kev_client::{pointer_head, LocalEngine, Backend};
 
-let backend = Qwen3Backend::open(base_model_dir, Some(checkpoint_dir))?;
+let backend = Backend::open(base_model_dir, Some(checkpoint_dir))?;
 // The other half of a checkpoint: head.pt's two projections, and the
 // temperature it was calibrated with.
 let head = pointer_head(&checkpoint_dir.join("head.pt"))?;
@@ -123,12 +123,18 @@ let head = pointer_head(&checkpoint_dir.join("head.pt"))?;
 let response = LocalEngine::new(backend, head).system_one_blocking(&request)?;
 ```
 
-The current Qwen3.5 checkpoints are **not** supported: their bases mix attention
-with Gated DeltaNet layers, which this backbone does not implement and refuses
-to pretend it does.
+The Qwen3 bases (`jaredpalmer/kev-4b@qwen3`, `kev-8b`, `kev-0.6b`) are attention
+only, so a whole request runs as one masked pass. The current bases (Qwen3.5) mix
+attention with Gated DeltaNet layers, which are recurrent: a recurrence carries
+state forward token by token and cannot be told to skip another question's
+tokens, so every question runs as its own row — the state, then its branch. That
+is exact rather than masked, and it is what the Python does there too; it also
+means the state is recomputed per question, and the recurrence runs one token at
+a time here, so expect it to be slow.
 
-The forward pass is checked against a transcription of Hugging Face's
-`modeling_qwen3.py`, so the arithmetic is the arithmetic transformers defines.
+Both forward passes are checked against transcriptions of Hugging Face's
+`modeling_qwen3.py` and `modeling_qwen3_5.py`, so the arithmetic is the
+arithmetic transformers defines.
 What has not happened yet is a run against a published checkpoint and a live Kev
 server, so treat the probabilities as unverified end to end until it has.
 `examples/parity.rs` is that run: it answers a request in process and compares
@@ -138,7 +144,7 @@ every probability with a recorded server response.
 KEV_DTYPE=fp32 uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b@qwen3 --port 8009
 curl -s localhost:8009/v1/systemone -H 'content-type: application/json' -d @request.json > server.json
 
-cargo run --features qwen3 --example parity -- \
+cargo run --features candle --example parity -- \
     --base <the base model directory> --checkpoint <the kev checkpoint> \
     --request request.json --server server.json
 ```
@@ -173,7 +179,7 @@ let engine = LocalEngine::new(backbone, head);
 A local-only build carries no HTTP stack:
 
 ```toml
-kev-client = { path = "../kev-client", default-features = false, features = ["qwen3"] }
+kev-client = { path = "../kev-client", default-features = false, features = ["candle"] }
 ```
 
 ## Tests
@@ -183,10 +189,10 @@ cargo test
 ```
 
 The tests check the request and response shapes against the worked example in
-the Kev README; they need no server. With the `qwen3` feature they also run the
+the Kev README; they need no server. With the `candle` feature they also run the
 backbone over a checkpoint they write themselves. Two checks want a real Qwen
 tokenizer, which is not vendored here:
 
 ```bash
-KEV_TOKENIZER=/path/to/tokenizer.json cargo test --features qwen3
+KEV_TOKENIZER=/path/to/tokenizer.json cargo test --features candle
 ```

@@ -66,7 +66,10 @@ impl Pass<'_> {
     /// DeltaNet layers, and so every current Kev checkpoint — this is the only
     /// exact form, and it is what the Python model runs there. Concatenating
     /// the rows' hidden states in order yields exactly what [`Forward::hidden`]
-    /// must return.
+    /// must return — as long as the readout stays inside the branches, which is
+    /// where `<decide>` and `</opt>` always are. A readout position in the state
+    /// belongs to no row and is dropped, which the engine notices as a count
+    /// mismatch rather than a wrong answer.
     pub fn rows(&self) -> Vec<OwnedPass> {
         let state: Vec<usize> = (0..self.ids.len())
             .filter(|index| self.segments[*index] == 0)
