@@ -1,0 +1,23 @@
+[package]
+name = "kev-client"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust client for Kev, the small decision models that speak TypeSafe's System One API"
+repository = "https://github.com/jaredpalmer/kev"
+license = "Apache-2.0"
+
+[dependencies]
+# Question and option order is part of the request and can move the answer,
+# so maps have to keep insertion order.
+indexmap = { version = "2", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "triage"
