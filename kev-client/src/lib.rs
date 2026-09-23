@@ -51,6 +51,8 @@
 //! # }
 //! ```
 
+#[cfg(feature = "qwen3")]
+mod backend;
 #[cfg(feature = "http")]
 mod client;
 #[cfg(feature = "local")]
@@ -60,6 +62,8 @@ mod error;
 mod local;
 #[cfg(feature = "local")]
 mod prompt;
+#[cfg(feature = "qwen3")]
+mod qwen3;
 #[cfg(feature = "local")]
 mod readout;
 mod system_one;
@@ -69,6 +73,8 @@ mod types;
 /// name a local engine reports when a request does not pin one.
 pub const DEFAULT_MODEL: &str = "kev-latest";
 
+#[cfg(feature = "qwen3")]
+pub use backend::{pointer_head, Qwen3Backend};
 #[cfg(feature = "http")]
 pub use client::{Client, DEFAULT_BASE_URL};
 #[cfg(feature = "local")]
@@ -78,6 +84,9 @@ pub use error::{Error, Result};
 pub use local::{Forward, LocalEngine, OwnedPass, Pass};
 #[cfg(feature = "local")]
 pub use prompt::render;
+#[cfg(feature = "local")]
+#[cfg(feature = "qwen3")]
+pub use qwen3::{Backbone, Config};
 #[cfg(feature = "local")]
 pub use readout::{softmax, Linear, PointerHead};
 pub use system_one::SystemOne;

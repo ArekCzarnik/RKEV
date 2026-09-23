@@ -26,6 +26,9 @@ pub enum Error {
     /// [`Error::is_validation`] is true here too.
     #[cfg(feature = "local")]
     ContextOverflow(String),
+    /// The backbone failed: loading weights, or the forward pass itself.
+    #[cfg(feature = "qwen3")]
+    Model(candle_core::Error),
     /// The response was 2xx but did not match the expected shape.
     Decode {
         source: serde_json::Error,
@@ -91,6 +94,8 @@ impl fmt::Display for Error {
             Error::ContextOverflow(message) => {
                 write!(f, "the request does not fit the model context: {message}")
             }
+            #[cfg(feature = "qwen3")]
+            Error::Model(e) => write!(f, "the model failed: {e}"),
             Error::Decode { source, body } => {
                 write!(f, "could not decode the kev response ({source}): {body}")
             }
@@ -103,6 +108,8 @@ impl std::error::Error for Error {
         match self {
             #[cfg(feature = "http")]
             Error::Transport(e) => Some(e),
+            #[cfg(feature = "qwen3")]
+            Error::Model(e) => Some(e),
             Error::Decode { source, .. } => Some(source),
             _ => None,
         }
@@ -113,6 +120,13 @@ impl std::error::Error for Error {
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {
         Error::Transport(e)
+    }
+}
+
+#[cfg(feature = "qwen3")]
+impl From<candle_core::Error> for Error {
+    fn from(e: candle_core::Error) -> Self {
+        Error::Model(e)
     }
 }
 
