@@ -143,19 +143,54 @@ moves a hidden unit by 9e-2, and rotating before the per-head norm rather than
 after moves one by 5e-3. Neither is caught by any other test in the suite, which
 is the argument for having this one.
 
+**The tokenizer is verified against transformers**, at the source and by test.
+On the Python side `kev.model.user_tokens` is
+`tok(re.sub(r"<\|([A-Za-z0-9_]+)\|>", r"<¦\1¦>", text), add_special_tokens=False)`,
+and in transformers 5 (`tokenization_utils_tokenizers.py`,
+`TokenizersBackend._encode_plus`) that call reduces to the Rust `tokenizers`
+crate — the same library this crate uses — as
+`encode_batch(texts, add_special_tokens=False, is_pretokenized=False)`, with
+`no_truncation()` and `no_padding()` applied on every call and
+`encode_special_tokens` left false. So:
+
+- Truncation and padding are now switched off explicitly when a tokenizer is
+  loaded. They would otherwise be inherited from `tokenizer.json`, and that is
+  a difference in the token ids. This was a real gap, not a formality.
+- `encode_special_tokens = false` matches the Python default, which means a
+  special token written out in the text is *matched*, not split — the hazard the
+  escaping exists for. It is set explicitly too, so a future default cannot move
+  it quietly.
+- The escaping is pinned against the regex's semantics, including the cases that
+  must **not** match (`<||>`, `<|a-b|>`, `<|Ünicode|>`, `<|abc|def|>`). The
+  scanner does not backtrack and does not need to: a name is a maximal run of
+  `[A-Za-z0-9_]`, which cannot contain `|`, so no shorter name can be followed
+  by one either.
+- `tests/qwen3.rs` proves the forgery is prevented where it matters, with the
+  delimiters as added tokens exactly as Qwen ships them: a state containing
+  `<|fim_middle|>` tokenises to the delimiter id on its own, and cannot produce
+  it through the engine.
+
+Checked for sensitivity the same way as the backbone: with the escaping removed,
+those tests fail and say which delimiter was forged.
+
 **Still not verified against real weights.** Nothing here has opened a Qwen3
 checkpoint, so what remains open is the loading rather than the arithmetic: the
 tensor names and shapes of a published base (a mismatch fails loudly, at least),
-the tokenizer agreeing with the Python's, and the probabilities end to end.
+a real `tokenizer.json` (`KEV_TOKENIZER=<path> cargo test --features qwen3` runs
+the delimiter and forgery checks against one; huggingface.co is not reachable
+from this container, so it was exercised against a file in Qwen's shape instead),
+and the probabilities end to end.
 
 ## Left to do
 
 1. **Parity.** Load `jaredpalmer/kev-4b@qwen3` (or `kev-0.6b`, which is small),
    run the same requests against a live `kev.serve` and against the engine, and
    assert every probability matches within a tolerance. Record the server's
-   answers as fixtures afterwards so it runs offline. The arithmetic is now
-   checked against Hugging Face's definition of it; this is what checks the
-   loading, the tokenizer and the readout against the real thing.
+   answers as fixtures afterwards so it runs offline. The arithmetic and the
+   tokenizer call are now checked against Hugging Face's definitions of them;
+   this is what checks the loading and the real vocabulary against the real
+   thing. Run it with `KEV_TOKENIZER` set too, so the opt-in tokenizer checks
+   come along.
 2. **The temperature.** `pointer_head()` takes it as an argument because the
    tensor readers only return tensors; reading it out of `head.pt` itself needs
    a little pickle work. Until then a caller has to pass the checkpoint's value

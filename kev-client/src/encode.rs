@@ -236,3 +236,44 @@ where
         options,
     })
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The escaping, against `kev.model.user_tokens`:
+    /// `re.sub(r"<\|([A-Za-z0-9_]+)\|>", r"<¦\1¦>", text)`.
+    ///
+    /// The scanner here does not backtrack, and does not need to: a name is a
+    /// maximal run of `[A-Za-z0-9_]`, which cannot contain `|`, so if the
+    /// character after that run is not `|` then no shorter name can be followed
+    /// by one either. Python's backtracking has nothing to find, which is what
+    /// the `<|abc|def|>` and `<|a|b|>` cases below are for.
+    ///
+    /// In-module because `escape_specials` is private and this is a comparison
+    /// with another implementation, not behaviour of the crate.
+    #[test]
+    fn escaping_matches_the_python_regex() {
+        for (input, expected) in [
+            ("a plain ticket", "a plain ticket"),
+            ("<|fim_prefix|>", "<\u{a6}fim_prefix\u{a6}>"),
+            ("a <|box_end|> b", "a <\u{a6}box_end\u{a6}> b"),
+            ("<|a|><|b_2|>", "<\u{a6}a\u{a6}><\u{a6}b_2\u{a6}>"),
+            // A name is one or more of [A-Za-z0-9_], so these are not names.
+            ("<||>", "<||>"),
+            ("<|a-b|>", "<|a-b|>"),
+            ("<|Ünicode|>", "<|Ünicode|>"),
+            // Unterminated, and one that ends where the regex cannot.
+            ("<|a|", "<|a|"),
+            ("<|abc|def|>", "<|abc|def|>"),
+            ("<|a|b|>", "<|a|b|>"),
+            // Leftmost match wins, and scanning resumes after it.
+            ("<|a|>|>", "<\u{a6}a\u{a6}>|>"),
+            ("<<|a|>", "<<\u{a6}a\u{a6}>"),
+            ("<|<|a|>|>", "<|<\u{a6}a\u{a6}>|>"),
+            // Multi-byte text passes through untouched.
+            ("grüße 😀 <|a|>", "grüße 😀 <\u{a6}a\u{a6}>"),
+        ] {
+            assert_eq!(escape_specials(input), expected, "input {input:?}");
+        }
+    }
+}

@@ -146,6 +146,13 @@ so the split cannot rot.
   `readout.rs` reproduce the Python kev, down to `True` for a boolean and
   `json.dumps`' spacing in `usage.output_tokens`. Change them only to follow the
   Python, and name the function upstream when you do.
+- **Delimiters are unforgeable, and that is load-bearing.** Caller text has
+  `<|name|>` rewritten to `<¦name¦>` before tokenising, because a tokenizer
+  matches its own special tokens inside ordinary text (`encode_special_tokens`
+  is false in transformers and here). Without it a state could open a question.
+  `Qwen3Backend` also switches truncation and padding off explicitly, as
+  transformers does on every call — inheriting them from `tokenizer.json` would
+  change the token ids.
 
 ### Tests
 
@@ -164,7 +171,9 @@ row form, and that merging an adapter equals a pre-merged checkpoint. It also
 carries a plain-f32 transcription of `modeling_qwen3.py` and asserts the candle
 path matches it everywhere, which is what pins the conventions Hugging Face and
 candle disagree about (the rotary halves above all); keep that test honest by
-breaking the implementation on purpose when you touch it. Tests
+breaking the implementation on purpose when you touch it. It also holds the
+tokenizer checks, one of which runs only with `KEV_TOKENIZER=<tokenizer.json>`
+set, since a real Qwen tokenizer cannot be vendored. Tests
 assert on JSON shape and public accessor behaviour, never on internals — keep
 new tests in that style, and update the README example and these fixtures
 together whenever the wire format legitimately changes.

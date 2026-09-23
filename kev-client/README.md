@@ -172,4 +172,10 @@ cargo test
 ```
 
 The tests check the request and response shapes against the worked example in
-the Kev README; they need no server.
+the Kev README; they need no server. With the `qwen3` feature they also run the
+backbone over a checkpoint they write themselves. Two checks want a real Qwen
+tokenizer, which is not vendored here:
+
+```bash
+KEV_TOKENIZER=/path/to/tokenizer.json cargo test --features qwen3
+```

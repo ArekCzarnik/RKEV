@@ -36,9 +36,22 @@ impl Qwen3Backend {
 
     /// As [`Qwen3Backend::open`], on a device of your choosing.
     pub fn open_on(base: &Path, adapter: Option<&Path>, device: Device) -> Result<Self> {
-        let tokenizer = tokenizer_path(base, adapter)?;
-        let tokenizer = Tokenizer::from_file(&tokenizer)
-            .map_err(|e| Error::Engine(format!("cannot read {}: {e}", tokenizer.display())))?;
+        let path = tokenizer_path(base, adapter)?;
+        let mut tokenizer = Tokenizer::from_file(&path)
+            .map_err(|e| Error::Engine(format!("cannot read {}: {e}", path.display())))?;
+
+        // What `tok(text, add_special_tokens=False)` amounts to on the Python
+        // side (transformers' `TokenizersBackend._encode_plus`): truncation and
+        // padding are turned off on every call, and `encode_special_tokens`
+        // stays false, so a special token appearing in the text is matched
+        // rather than split. Two of those we would otherwise inherit from
+        // `tokenizer.json`, which is a difference in the token ids, so say all
+        // three out loud.
+        tokenizer
+            .with_truncation(None)
+            .map_err(|e| Error::Engine(format!("cannot disable truncation: {e}")))?;
+        tokenizer.with_padding(None);
+        tokenizer.set_encode_special_tokens(false);
         Ok(Self {
             model: Backbone::load(base, adapter, &device)?,
             tokenizer,
