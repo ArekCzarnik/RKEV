@@ -201,10 +201,12 @@ and the probabilities end to end.
 
 ## Left to do
 
-1. **Parity.** Load `jaredpalmer/kev-4b@qwen3` (or `kev-0.6b`, which is small),
-   run the same requests against a live `kev.serve` and against the engine, and
-   assert every probability matches within a tolerance. Record the server's
-   answers as fixtures afterwards so it runs offline. The arithmetic and the
+1. **Parity — the tool is there, it has not been run.** `examples/parity.rs`
+   answers a recorded request in process and compares every probability with a
+   recorded server response (`--tolerance`, non-zero exit past it). What is left
+   is running it on a machine that can hold `jaredpalmer/kev-4b@qwen3` (or
+   `kev-0.6b`, which is small) with `KEV_DTYPE=fp32` on the server side, and
+   turning the recordings into offline fixtures afterwards. The arithmetic and the
    tokenizer call are now checked against Hugging Face's definitions of them;
    this is what checks the loading and the real vocabulary against the real
    thing. Run it with `KEV_TOKENIZER` set too, so the opt-in tokenizer checks

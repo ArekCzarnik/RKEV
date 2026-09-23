@@ -12,7 +12,7 @@ use serde_json::Value;
 
 /// One System One call: a `state` to evaluate plus the questions to ask about
 /// it. Questions share the state but cannot read each other.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemOneRequest {
     /// The content to evaluate. A string, or any JSON object/array — Kev
     /// converts objects and arrays to labelled text.
@@ -54,7 +54,7 @@ impl SystemOneRequest {
 }
 
 /// A single question. Build one with [`Noul`], [`Choice`] or [`Score`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Question {
     /// Yes/no. Answered with the probability of yes.
@@ -66,7 +66,7 @@ pub enum Question {
 }
 
 /// A yes/no question.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Noul {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Value>,
@@ -75,7 +75,7 @@ pub struct Noul {
 }
 
 /// Optional descriptions of what yes and no mean.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NoulCriteria {
     #[serde(rename = "true", skip_serializing_if = "Option::is_none")]
     pub yes: Option<String>,
@@ -109,7 +109,7 @@ impl Noul {
 ///
 /// Option order is part of the request and can change the answer, so the
 /// options keep the order you add them in.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Choice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Value>,
@@ -152,7 +152,7 @@ impl Choice {
 }
 
 /// A rating question over an ordered scale.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Score {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Value>,

@@ -182,6 +182,15 @@ assert on JSON shape and public accessor behaviour, never on internals — keep
 new tests in that style, and update the README example and these fixtures
 together whenever the wire format legitimately changes.
 
+### Checking the engine against the server
+
+`examples/parity.rs` (feature `qwen3`) answers a recorded request in process and
+compares every probability with the server's recorded response, exiting non-zero
+past a tolerance. It needs no HTTP stack on purpose: the server side is a file,
+which makes the recording reusable as an offline fixture later. Nothing else in
+this repo compares the engine with the reference *running*, so this is the check
+that decides whether the local numbers mean anything.
+
 ## Documentation
 
 The crate is documented in three places that must stay in sync when the public

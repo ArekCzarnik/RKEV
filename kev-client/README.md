@@ -131,6 +131,17 @@ The forward pass is checked against a transcription of Hugging Face's
 `modeling_qwen3.py`, so the arithmetic is the arithmetic transformers defines.
 What has not happened yet is a run against a published checkpoint and a live Kev
 server, so treat the probabilities as unverified end to end until it has.
+`examples/parity.rs` is that run: it answers a request in process and compares
+every probability with a recorded server response.
+
+```bash
+KEV_DTYPE=fp32 uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b@qwen3 --port 8009
+curl -s localhost:8009/v1/systemone -H 'content-type: application/json' -d @request.json > server.json
+
+cargo run --features qwen3 --example parity -- \
+    --base <the base model directory> --checkpoint <the kev checkpoint> \
+    --request request.json --server server.json
+```
 
 To put another engine underneath instead, implement `Forward` yourself:
 

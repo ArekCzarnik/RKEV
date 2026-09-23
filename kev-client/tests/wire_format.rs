@@ -196,3 +196,21 @@ fn optional_response_fields_may_be_missing() {
         Answer::Noul { noul } if *noul == 0.5
     ));
 }
+
+#[test]
+fn a_request_survives_a_round_trip_through_json() {
+    // The request types deserialise as well as serialise, so a recorded request
+    // can be replayed - which is what examples/parity.rs does with the body the
+    // server was sent.
+    let original = readme_request();
+    let json = serde_json::to_string(&original).unwrap();
+
+    let parsed: SystemOneRequest = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    assert_eq!(
+        parsed.questions.keys().collect::<Vec<_>>(),
+        original.questions.keys().collect::<Vec<_>>(),
+        "question order is part of the request"
+    );
+}
