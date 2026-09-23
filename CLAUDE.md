@@ -160,7 +160,11 @@ Kev README's published numbers are asserted. `tests/qwen3.rs` writes a
 two-layer checkpoint (config, safetensors, tokenizer, head) into the temp
 directory and runs the real backbone over it: made-up weights, but the
 properties under test hold for any weights — question isolation, packed against
-row form, and that merging an adapter equals a pre-merged checkpoint. Tests
+row form, and that merging an adapter equals a pre-merged checkpoint. It also
+carries a plain-f32 transcription of `modeling_qwen3.py` and asserts the candle
+path matches it everywhere, which is what pins the conventions Hugging Face and
+candle disagree about (the rotary halves above all); keep that test honest by
+breaking the implementation on purpose when you touch it. Tests
 assert on JSON shape and public accessor behaviour, never on internals — keep
 new tests in that style, and update the README example and these fixtures
 together whenever the wire format legitimately changes.

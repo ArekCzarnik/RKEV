@@ -125,9 +125,12 @@ let response = LocalEngine::new(backend, head).system_one_blocking(&request)?;
 
 The current Qwen3.5 checkpoints are **not** supported: their bases mix attention
 with Gated DeltaNet layers, which this backbone does not implement and refuses
-to pretend it does. And while the backbone is tested, it has not been checked
-against a running Kev server yet, so treat its numbers as unverified until it
-has.
+to pretend it does.
+
+The forward pass is checked against a transcription of Hugging Face's
+`modeling_qwen3.py`, so the arithmetic is the arithmetic transformers defines.
+What has not happened yet is a run against a published checkpoint and a live Kev
+server, so treat the probabilities as unverified end to end until it has.
 
 To put another engine underneath instead, implement `Forward` yourself:
 

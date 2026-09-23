@@ -32,7 +32,11 @@ pub struct Config {
     /// Qwen3 states it rather than deriving it from the hidden size.
     pub head_dim: Option<usize>,
     pub rms_norm_eps: f64,
-    pub rope_theta: f64,
+    /// Older configs put it at the top level, newer ones under
+    /// `rope_parameters`; [`Config::rope_theta`] reads whichever is there.
+    rope_theta: Option<f64>,
+    rope_parameters: Option<RopeParameters>,
+    rope_scaling: Option<RopeParameters>,
     pub vocab_size: usize,
     /// Present on the hybrid Qwen3.5 bases, whose Gated DeltaNet layers this
     /// backbone does not implement.
@@ -48,6 +52,24 @@ pub struct Config {
     pub attention_bias: bool,
 }
 
+/// The rope block of a config, in either of the two places it appears.
+#[derive(Debug, Clone, Deserialize)]
+struct RopeParameters {
+    rope_type: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    rope_theta: Option<f64>,
+}
+
+impl RopeParameters {
+    fn kind(&self) -> &str {
+        self.rope_type
+            .as_deref()
+            .or(self.kind.as_deref())
+            .unwrap_or("default")
+    }
+}
+
 impl Config {
     /// Read `config.json` from a model directory.
     pub fn read(dir: &Path) -> Result<Self> {
@@ -58,6 +80,14 @@ impl Config {
             .map_err(|e| Error::Engine(format!("cannot parse {}: {e}", path.display())))?;
         config.supported()?;
         Ok(config)
+    }
+
+    /// The rotary base. Hugging Face reads it from `rope_parameters` now and
+    /// from the top level before that.
+    pub fn rope_theta(&self) -> Result<f64> {
+        self.rope_theta
+            .or_else(|| self.rope_parameters.as_ref().and_then(|r| r.rope_theta))
+            .ok_or_else(|| Error::Engine(String::from("the config states no rope_theta")))
     }
 
     pub fn head_dim(&self) -> usize {
@@ -82,6 +112,19 @@ impl Config {
             return Err(Error::Engine(String::from(
                 "sliding-window attention is not implemented",
             )));
+        }
+        // Anything but the original RoPE changes the frequencies, and this
+        // backbone computes them one way only.
+        for rope in [&self.rope_parameters, &self.rope_scaling]
+            .into_iter()
+            .flatten()
+        {
+            if rope.kind() != "default" {
+                return Err(Error::Engine(format!(
+                    "this backbone implements the original rotary embedding, the config asks for {:?}",
+                    rope.kind()
+                )));
+            }
         }
         if self.attention_bias {
             return Err(Error::Engine(String::from(
@@ -191,7 +234,12 @@ impl Backbone {
             .unsqueeze(0)?
             .to_dtype(DType::F32)?;
 
-        let (cos, sin) = self.rotary(positions)?;
+        let (cos, sin) = rotary_tables(
+            positions,
+            self.config.head_dim(),
+            self.config.rope_theta()?,
+            &self.device,
+        )?;
         for layer in &self.layers {
             let residual = xs.clone();
             let normed = rms_norm(&xs, &layer.input_norm, self.config.rms_norm_eps)?;
@@ -250,20 +298,29 @@ impl Backbone {
         let up = linear(xs, &layer.up_proj)?;
         Ok(linear(&(gate * up)?, &layer.down_proj)?)
     }
+}
 
-    /// Rotary tables for exactly the positions asked for, rather than for
-    /// `0..n` — the branches do not sit at consecutive positions.
-    fn rotary(&self, positions: &[u32]) -> Result<(Tensor, Tensor)> {
-        let dim = self.config.head_dim();
-        let inverse: Vec<f32> = (0..dim / 2)
-            .map(|i| (1.0 / self.config.rope_theta.powf(2.0 * i as f64 / dim as f64)) as f32)
-            .collect();
-        let inverse = Tensor::from_vec(inverse, (1, dim / 2), &self.device)?;
-        let positions: Vec<f32> = positions.iter().map(|p| *p as f32).collect();
-        let positions = Tensor::from_vec(positions.clone(), (positions.len(), 1), &self.device)?;
-        let angles = positions.matmul(&inverse)?;
-        Ok((angles.cos()?, angles.sin()?))
-    }
+/// Cosine and sine tables for exactly the positions asked for, rather than for
+/// `0..n` — the branches do not sit at consecutive positions.
+///
+/// `inv_freq[i] = theta^(-2i/dim)`, as in Hugging Face's
+/// `compute_default_rope_parameters`. The tables are `[len, dim/2]`, which is
+/// what candle's non-interleaved `rope` wants, and the halves it pairs are the
+/// same ones `rotate_half` pairs.
+fn rotary_tables(
+    positions: &[u32],
+    dim: usize,
+    theta: f64,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let inverse: Vec<f32> = (0..dim / 2)
+        .map(|i| (1.0 / theta.powf(2.0 * i as f64 / dim as f64)) as f32)
+        .collect();
+    let inverse = Tensor::from_vec(inverse, (1, dim / 2), device)?;
+    let angles: Vec<f32> = positions.iter().map(|p| *p as f32).collect();
+    let angles = Tensor::from_vec(angles, (positions.len(), 1), device)?;
+    let angles = angles.matmul(&inverse)?;
+    Ok((angles.cos()?, angles.sin()?))
 }
 
 /// `y = x W^T`. Qwen3's projections carry no bias.
@@ -432,4 +489,63 @@ where
         }
     }
     Ok(Tensor::from_vec(values, (1, 1, len, len), device)?)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rotary embedding, against the formula in
+    /// `transformers/models/qwen3/modeling_qwen3.py`:
+    ///
+    /// ```text
+    /// inv_freq[i] = theta ** (-2i/dim)            (compute_default_rope_parameters)
+    /// cos = cat(freqs, freqs).cos()               (Qwen3RotaryEmbedding.forward)
+    /// rotate_half(x) = cat(-x[d/2:], x[:d/2])
+    /// q' = q * cos + rotate_half(q) * sin         (apply_rotary_pos_emb)
+    /// ```
+    ///
+    /// Which comes out as, for `i < dim/2`:
+    ///   `q'[i] = q[i] cos - q[i + dim/2] sin`
+    ///   `q'[i + dim/2] = q[i + dim/2] cos + q[i] sin`
+    ///
+    /// The point of testing it: candle offers both this and the *interleaved*
+    /// convention (`rope_i`), which pairs `(0,1), (2,3), ...` instead. Both run,
+    /// only one is Qwen3, and the difference is invisible without real weights.
+    #[test]
+    fn the_rotary_embedding_matches_the_hugging_face_formula() {
+        let device = Device::Cpu;
+        let (heads, len, dim, theta) = (2usize, 3usize, 8usize, 10_000f64);
+        let positions = [0u32, 5, 9];
+        let values: Vec<f32> = (0..heads * len * dim)
+            .map(|i| ((i * 37 % 19) as f32 - 9.0) / 7.0)
+            .collect();
+        let q = Tensor::from_vec(values.clone(), (1, heads, len, dim), &device).unwrap();
+
+        let (cos, sin) = rotary_tables(&positions, dim, theta, &device).unwrap();
+        let ours = candle_nn::rotary_emb::rope(&q, &cos, &sin)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        for head in 0..heads {
+            for (step, position) in positions.iter().enumerate() {
+                let row = (head * len + step) * dim;
+                for i in 0..dim / 2 {
+                    let angle = *position as f64 * theta.powf(-2.0 * i as f64 / dim as f64);
+                    let (cos, sin) = (angle.cos() as f32, angle.sin() as f32);
+                    let (low, high) = (values[row + i], values[row + i + dim / 2]);
+                    let expected = [low * cos - high * sin, high * cos + low * sin];
+                    for (offset, expected) in [(i, expected[0]), (i + dim / 2, expected[1])] {
+                        let got = ours[row + offset];
+                        assert!(
+                            (got - expected).abs() < 1e-6,
+                            "position {position}, element {offset}: {got} vs {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

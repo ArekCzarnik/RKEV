@@ -128,17 +128,34 @@ what holds for any weights, which is also what the Python asserts:
 - an adapter merged at load time equals a checkpoint that ships it pre-merged,
 - a hybrid config is refused.
 
-**Not verified against real weights.** Nothing here has seen a Qwen3 checkpoint,
-so the numerics against HF transformers are still open — the likely places for a
-mistake are the rotary convention and the order of the per-head norms.
+**The conventions are verified against Hugging Face**, which was the open
+question: `tests/qwen3.rs` carries a plain-f32 transcription of
+`transformers/models/qwen3/modeling_qwen3.py` (RMSNorm, the per-head query and
+key norms before the rotary embedding, `rotate_half` with
+`inv_freq[i] = theta^(-2i/d)`, grouped-query head mapping, `head_dim ** -0.5`,
+SwiGLU, residual order) and asserts every hidden unit of every token agrees with
+the candle path to 1e-5. They agree to about 1e-6, which is f32 accumulation
+order. There is a second, narrower test on the rotary tables alone.
+
+Both were checked for sensitivity by breaking the implementation on purpose: the
+interleaved rotary convention (candle's `rope_i`, which runs and looks fine)
+moves a hidden unit by 9e-2, and rotating before the per-head norm rather than
+after moves one by 5e-3. Neither is caught by any other test in the suite, which
+is the argument for having this one.
+
+**Still not verified against real weights.** Nothing here has opened a Qwen3
+checkpoint, so what remains open is the loading rather than the arithmetic: the
+tensor names and shapes of a published base (a mismatch fails loudly, at least),
+the tokenizer agreeing with the Python's, and the probabilities end to end.
 
 ## Left to do
 
 1. **Parity.** Load `jaredpalmer/kev-4b@qwen3` (or `kev-0.6b`, which is small),
    run the same requests against a live `kev.serve` and against the engine, and
    assert every probability matches within a tolerance. Record the server's
-   answers as fixtures afterwards so it runs offline. This is the step that
-   turns the backbone from plausible into correct.
+   answers as fixtures afterwards so it runs offline. The arithmetic is now
+   checked against Hugging Face's definition of it; this is what checks the
+   loading, the tokenizer and the readout against the real thing.
 2. **The temperature.** `pointer_head()` takes it as an argument because the
    tensor readers only return tensors; reading it out of `head.pt` itself needs
    a little pickle work. Until then a caller has to pass the checkpoint's value

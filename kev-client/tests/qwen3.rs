@@ -117,10 +117,16 @@ fn vocab_size() -> usize {
     1 + 5 + WORDS.len()
 }
 
+/// A checkpoint directory, and the weights that went into it.
+struct Fixture {
+    dir: PathBuf,
+    tensors: BTreeMap<String, (Vec<usize>, Vec<f32>)>,
+}
+
 /// A checkpoint directory: config, weights, tokenizer, pointer head. With
 /// `adapter`, the LoRA tensors are written alongside; with `merge`, the same
 /// delta is folded into the base weights instead.
-fn checkpoint(name: &str, adapter: bool, merge: bool) -> PathBuf {
+fn checkpoint(name: &str, adapter: bool, merge: bool) -> Fixture {
     // One fixed directory per test, rebuilt on every run rather than piling up
     // in the temp directory.
     let dir = std::env::temp_dir().join(format!("kev-qwen3-{name}"));
@@ -282,7 +288,7 @@ fn checkpoint(name: &str, adapter: bool, merge: bool) -> PathBuf {
     }
     write_safetensors(&dir.join("head.safetensors"), &head_tensors);
 
-    dir
+    Fixture { dir, tensors }
 }
 
 fn engine(dir: &Path, adapter: Option<&Path>) -> LocalEngine {
@@ -327,7 +333,7 @@ fn assert_close(left: &[f64], right: &[f64], tolerance: f64, what: &str) {
 
 #[test]
 fn the_backbone_answers_a_request() {
-    let dir = checkpoint("answers", false, false);
+    let dir = checkpoint("answers", false, false).dir;
     let engine = engine(&dir, None);
 
     let response = engine
@@ -348,7 +354,7 @@ fn a_question_is_not_moved_by_another_question() {
     // The block-causal mask, end to end: question 2 changes, question 1 does
     // not. This is what `/v1/systemone/separate` exists to check, and it holds
     // for any weights.
-    let dir = checkpoint("isolation", false, false);
+    let dir = checkpoint("isolation", false, false).dir;
     let engine = engine(&dir, None);
 
     let one = engine
@@ -373,7 +379,7 @@ fn a_question_is_not_moved_by_another_question() {
 
 #[test]
 fn asking_together_and_asking_separately_agree() {
-    let dir = checkpoint("separate", false, false);
+    let dir = checkpoint("separate", false, false).dir;
     let engine = engine(&dir, None);
     let request = a_request(("calm", "angry"));
 
@@ -394,7 +400,7 @@ fn asking_together_and_asking_separately_agree() {
 fn the_packed_pass_and_the_row_form_agree() {
     // What a backbone with recurrent layers is limited to has to give the same
     // hidden states as the packed pass on a backbone that can do both.
-    let dir = checkpoint("rows", false, false);
+    let dir = checkpoint("rows", false, false).dir;
     let mut backend = Qwen3Backend::open(&dir, None).unwrap();
     let ids: Vec<u32> = vec![1, 6, 7, 2, 12, 3, 14, 4, 5, 2, 13, 3, 11, 4, 5];
     let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2];
@@ -429,8 +435,8 @@ fn the_packed_pass_and_the_row_form_agree() {
 fn an_adapter_is_merged_the_way_peft_merges_it() {
     // A checkpoint that ships base weights plus a LoRA must answer exactly like
     // one whose weights already carry the same delta.
-    let with_adapter = checkpoint("adapter", true, false);
-    let premerged = checkpoint("premerged", false, true);
+    let with_adapter = checkpoint("adapter", true, false).dir;
+    let premerged = checkpoint("premerged", false, true).dir;
 
     let adapted = engine(&with_adapter, Some(&with_adapter.join("adapter")))
         .system_one_blocking(&a_request(("calm", "angry")))
@@ -457,7 +463,7 @@ fn an_adapter_is_merged_the_way_peft_merges_it() {
 
 #[test]
 fn a_hybrid_base_is_refused_rather_than_answered_wrongly() {
-    let dir = checkpoint("hybrid", false, false);
+    let dir = checkpoint("hybrid", false, false).dir;
     let config = fs::read_to_string(dir.join("config.json")).unwrap();
     fs::write(
         dir.join("config.json"),
@@ -471,4 +477,224 @@ fn a_hybrid_base_is_refused_rather_than_answered_wrongly() {
     let error = Qwen3Backend::open(&dir, None).unwrap_err();
 
     assert!(error.to_string().contains("attention-only"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// A second implementation, to check the first one's conventions
+// ---------------------------------------------------------------------------
+
+fn weights<'a>(tensors: &'a BTreeMap<String, (Vec<usize>, Vec<f32>)>, name: &str) -> &'a [f32] {
+    &tensors
+        .get(name)
+        .unwrap_or_else(|| panic!("no tensor {name}"))
+        .1
+}
+
+/// `y = W x`, with `W` row-major `[outputs, inputs]` as the checkpoint stores it.
+fn matvec(weight: &[f32], outputs: usize, inputs: usize, x: &[f32]) -> Vec<f32> {
+    (0..outputs)
+        .map(|row| {
+            (0..inputs)
+                .map(|column| weight[row * inputs + column] * x[column])
+                .sum()
+        })
+        .collect()
+}
+
+/// `Qwen3RMSNorm`: `weight * x / sqrt(mean(x^2) + eps)`.
+fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    let mean: f32 = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let scale = 1.0 / (mean + eps).sqrt();
+    x.iter().zip(weight).map(|(x, w)| x * scale * w).collect()
+}
+
+/// `apply_rotary_pos_emb` with `rotate_half`, on one head's vector.
+fn rotate(head: &mut [f32], position: u32, theta: f64) {
+    let dim = head.len();
+    for i in 0..dim / 2 {
+        let angle = position as f64 * theta.powf(-2.0 * i as f64 / dim as f64);
+        let (cos, sin) = (angle.cos() as f32, angle.sin() as f32);
+        let (low, high) = (head[i], head[i + dim / 2]);
+        head[i] = low * cos - high * sin;
+        head[i + dim / 2] = high * cos + low * sin;
+    }
+}
+
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// `Qwen3Model.forward` in plain f32, transcribed from
+/// `transformers/models/qwen3/modeling_qwen3.py`: RMSNorm, the per-head query
+/// and key norms *before* the rotary embedding, grouped-query attention with
+/// `scaling = head_dim ** -0.5`, SwiGLU, and where the residuals go.
+///
+/// Nothing here shares code with the backbone, which is the point: if the two
+/// agree on random weights, they agree on the conventions.
+fn reference_hidden(
+    tensors: &BTreeMap<String, (Vec<usize>, Vec<f32>)>,
+    ids: &[u32],
+    positions: &[u32],
+    attends: &dyn Fn(usize, usize) -> bool,
+) -> Vec<Vec<f32>> {
+    const EPS: f32 = 1e-6;
+    const THETA: f64 = 10_000.0;
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let groups = HEADS / KV_HEADS;
+
+    let embed = weights(tensors, "model.embed_tokens.weight");
+    let mut xs: Vec<Vec<f32>> = ids
+        .iter()
+        .map(|id| embed[*id as usize * HIDDEN..(*id as usize + 1) * HIDDEN].to_vec())
+        .collect();
+
+    for layer in 0..LAYERS {
+        let prefix = format!("model.layers.{layer}");
+        let of = |name: &str| weights(tensors, &format!("{prefix}.{name}"));
+
+        // Per token: the query, key and value heads, normalised and rotated.
+        let mut queries = Vec::new();
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        for (token, x) in xs.iter().enumerate() {
+            let normed = rms_norm(x, of("input_layernorm.weight"), EPS);
+            let mut heads = Vec::new();
+            for (projection, count, norm) in [
+                (
+                    "self_attn.q_proj.weight",
+                    HEADS,
+                    Some("self_attn.q_norm.weight"),
+                ),
+                (
+                    "self_attn.k_proj.weight",
+                    KV_HEADS,
+                    Some("self_attn.k_norm.weight"),
+                ),
+                ("self_attn.v_proj.weight", KV_HEADS, None),
+            ] {
+                let projected = matvec(of(projection), count * HEAD_DIM, HIDDEN, &normed);
+                let mut split: Vec<Vec<f32>> = projected
+                    .chunks(HEAD_DIM)
+                    .map(|head| match norm {
+                        Some(norm) => rms_norm(head, of(norm), EPS),
+                        None => head.to_vec(),
+                    })
+                    .collect();
+                if norm.is_some() {
+                    for head in &mut split {
+                        rotate(head, positions[token], THETA);
+                    }
+                }
+                heads.push(split);
+            }
+            values.push(heads.pop().unwrap());
+            keys.push(heads.pop().unwrap());
+            queries.push(heads.pop().unwrap());
+        }
+
+        let attended: Vec<Vec<f32>> = (0..ids.len())
+            .map(|token| {
+                let mut out = vec![0.0; HEADS * HEAD_DIM];
+                for head in 0..HEADS {
+                    // repeat_kv: query head h reads key/value head h / groups.
+                    let kv = head / groups;
+                    let visible: Vec<usize> =
+                        (0..ids.len()).filter(|key| attends(token, *key)).collect();
+                    let scores: Vec<f32> = visible
+                        .iter()
+                        .map(|key| {
+                            let dot: f32 = queries[token][head]
+                                .iter()
+                                .zip(&keys[*key][kv])
+                                .map(|(q, k)| q * k)
+                                .sum();
+                            dot * scale
+                        })
+                        .collect();
+                    let top = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let exponentials: Vec<f32> = scores.iter().map(|s| (s - top).exp()).collect();
+                    let total: f32 = exponentials.iter().sum();
+                    for (key, weight) in visible.iter().zip(&exponentials) {
+                        for i in 0..HEAD_DIM {
+                            out[head * HEAD_DIM + i] += weight / total * values[*key][kv][i];
+                        }
+                    }
+                }
+                matvec(
+                    of("self_attn.o_proj.weight"),
+                    HIDDEN,
+                    HEADS * HEAD_DIM,
+                    &out,
+                )
+            })
+            .collect();
+
+        for (x, attended) in xs.iter_mut().zip(attended) {
+            for (x, attended) in x.iter_mut().zip(attended) {
+                *x += attended;
+            }
+        }
+
+        for x in xs.iter_mut() {
+            let normed = rms_norm(x, of("post_attention_layernorm.weight"), EPS);
+            let gate = matvec(of("mlp.gate_proj.weight"), INTERMEDIATE, HIDDEN, &normed);
+            let up = matvec(of("mlp.up_proj.weight"), INTERMEDIATE, HIDDEN, &normed);
+            let activated: Vec<f32> = gate
+                .iter()
+                .zip(&up)
+                .map(|(gate, up)| silu(*gate) * up)
+                .collect();
+            let down = matvec(of("mlp.down_proj.weight"), HIDDEN, INTERMEDIATE, &activated);
+            for (x, down) in x.iter_mut().zip(down) {
+                *x += down;
+            }
+        }
+    }
+
+    xs.iter()
+        .map(|x| rms_norm(x, weights(tensors, "model.norm.weight"), EPS))
+        .collect()
+}
+
+#[test]
+fn the_forward_pass_matches_a_transcription_of_modeling_qwen3() {
+    // The conventions this settles, all of which are invisible without real
+    // weights or a second implementation: which halves the rotary embedding
+    // pairs (candle offers the interleaved one too), that the per-head norms
+    // come before the rotation, which key/value head a query head reads, the
+    // attention scaling, and the residual and normalisation order.
+    let fixture = checkpoint("reference", false, false);
+    let mut backend = Qwen3Backend::open(&fixture.dir, None).unwrap();
+
+    let ids: Vec<u32> = vec![1, 6, 7, 2, 12, 3, 14, 4, 5, 2, 13, 3, 11, 4, 5];
+    let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2];
+    let positions: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 3, 4, 5, 6, 7, 8];
+    // Every position, not just the readout ones: nothing gets to be wrong
+    // somewhere the answers happen not to look.
+    let readout: Vec<usize> = (0..ids.len()).collect();
+    let pass = Pass {
+        ids: &ids,
+        positions: &positions,
+        segments: &segments,
+        readout: &readout,
+    };
+
+    let ours = backend.hidden(&pass).unwrap();
+    let reference = reference_hidden(&fixture.tensors, &ids, &positions, &|query, key| {
+        pass.attends(query, key)
+    });
+
+    // The two agree to about 1e-6, which is f32 accumulation order; 1e-5 leaves
+    // room for another CPU without letting a wrong convention through - the
+    // smallest mutation tried here (rotating before the per-head norm rather
+    // than after) moves a hidden unit by 5e-3.
+    assert_eq!(ours.len(), reference.len());
+    for (token, (ours, reference)) in ours.iter().zip(&reference).enumerate() {
+        for (i, (ours, reference)) in ours.iter().zip(reference).enumerate() {
+            assert!(
+                (ours - reference).abs() <= 1e-5,
+                "token {token}, hidden unit {i}: {ours} vs {reference}"
+            );
+        }
+    }
 }
