@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use indexmap::IndexMap;
 
-use crate::encode::{self, Delimiters, Encoding, Limits, SPECIAL};
+use crate::encode::{self, Delimiters, Encoding, Limits, OptionSlot, SPECIAL};
 use crate::error::{Error, Result};
 use crate::prompt::{self, Plan, Record};
 use crate::readout::{self, PointerHead};
@@ -41,6 +41,40 @@ pub struct Pass<'a> {
     pub segments: &'a [u32],
     /// The positions whose hidden states to return, in order.
     pub readout: &'a [usize],
+    /// Which option span each token belongs to, for a checkpoint trained with
+    /// option isolation. Empty otherwise, which is the usual case.
+    pub options: &'a [OptionSlot],
+}
+
+impl<'a> Pass<'a> {
+    /// A pass with no option isolation, which is what a checkpoint normally
+    /// wants.
+    pub fn new(
+        ids: &'a [u32],
+        positions: &'a [u32],
+        segments: &'a [u32],
+        readout: &'a [usize],
+    ) -> Self {
+        Self {
+            ids,
+            positions,
+            segments,
+            readout,
+            options: &[],
+        }
+    }
+
+    /// The same pass, with each token's option span named — the layout an
+    /// option-isolated checkpoint was trained on.
+    pub fn with_options(mut self, options: &'a [OptionSlot]) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Whether this pass carries option isolation.
+    pub fn is_isolated(&self) -> bool {
+        !self.options.is_empty()
+    }
 }
 
 impl Pass<'_> {
@@ -49,8 +83,22 @@ impl Pass<'_> {
     /// Causal *and* blind across questions. Questions sharing one pass must not
     /// see each other, so this is not a plain causal mask: a backend that
     /// cannot express it must run [`Pass::rows`] instead.
+    ///
+    /// Under option isolation there is one more rule: an option's tokens are
+    /// read by that option and by `<decide>`, and by nothing else. That is what
+    /// keeps one option from conditioning another.
     pub fn attends(&self, query: usize, key: usize) -> bool {
-        key <= query && (self.segments[key] == 0 || self.segments[key] == self.segments[query])
+        if key > query || (self.segments[key] != 0 && self.segments[key] != self.segments[query]) {
+            return false;
+        }
+        match self.options.get(key) {
+            Some(OptionSlot::Option(span)) => {
+                query == key
+                    || matches!(self.options[query], OptionSlot::Decide)
+                    || self.options[query] == OptionSlot::Option(*span)
+            }
+            _ => true,
+        }
     }
 
     /// `true` when a plain causal mask is enough — one question, or none.
@@ -84,6 +132,8 @@ impl Pass<'_> {
             positions: state.iter().map(|i| self.positions[*i]).collect(),
             segments: vec![0; state.len()],
             readout: Vec::new(),
+            // The state holds no options, isolated or not.
+            options: Vec::new(),
         }
     }
 
@@ -112,6 +162,10 @@ impl Pass<'_> {
                     .iter()
                     .filter(|position| self.segments[**position] == segment)
                     .map(|position| moved[*position])
+                    .collect(),
+                options: indices
+                    .iter()
+                    .filter_map(|i| self.options.get(*i).copied())
                     .collect(),
             });
             segment += 1;
@@ -147,6 +201,10 @@ impl Pass<'_> {
                     .filter(|position| self.segments[**position] == segment)
                     .map(|position| moved[*position])
                     .collect(),
+                options: indices
+                    .iter()
+                    .filter_map(|i| self.options.get(*i).copied())
+                    .collect(),
             });
             segment += 1;
         }
@@ -161,17 +219,14 @@ pub struct OwnedPass {
     pub positions: Vec<u32>,
     pub segments: Vec<u32>,
     pub readout: Vec<usize>,
+    pub options: Vec<OptionSlot>,
 }
 
 impl OwnedPass {
     /// Borrow it as a [`Pass`], to run it like any other.
     pub fn as_pass(&self) -> Pass<'_> {
-        Pass {
-            ids: &self.ids,
-            positions: &self.positions,
-            segments: &self.segments,
-            readout: &self.readout,
-        }
+        Pass::new(&self.ids, &self.positions, &self.segments, &self.readout)
+            .with_options(&self.options)
     }
 }
 
@@ -221,6 +276,7 @@ pub struct LocalEngine {
     head: Arc<PointerHead>,
     model: String,
     limits: Limits,
+    isolation: bool,
 }
 
 impl LocalEngine {
@@ -231,12 +287,25 @@ impl LocalEngine {
             head: Arc::new(head),
             model: String::from(crate::DEFAULT_MODEL),
             limits: Limits::serving(),
+            isolation: false,
         }
     }
 
     /// The name reported in responses that do not pin a model themselves.
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
+        self
+    }
+
+    /// Lay every option out as a sub-branch of its own, which is what a
+    /// checkpoint trained with option isolation expects.
+    ///
+    /// Off by default, because the released checkpoints were trained without it —
+    /// `head.pt` says which ([`option_isolation`](crate::option_isolation)), and
+    /// getting it wrong is a silently different prompt rather than an error. It
+    /// needs the packed mask, so a recurrent base refuses it.
+    pub fn with_option_isolation(mut self, isolation: bool) -> Self {
+        self.isolation = isolation;
         self
     }
 
@@ -290,11 +359,14 @@ impl LocalEngine {
         let passes: Vec<Pass<'_>> = encodings
             .iter()
             .zip(&readouts)
-            .map(|(encoding, readout)| Pass {
-                ids: &encoding.ids,
-                positions: &encoding.positions,
-                segments: &encoding.segments,
-                readout,
+            .map(|(encoding, readout)| {
+                Pass::new(
+                    &encoding.ids,
+                    &encoding.positions,
+                    &encoding.segments,
+                    readout,
+                )
+                .with_options(&encoding.slots)
             })
             .collect();
 
@@ -449,7 +521,7 @@ impl LocalEngine {
             option_end: backend.delimiter(SPECIAL[3])?,
             decide: backend.delimiter(SPECIAL[4])?,
         };
-        encode::encode(record, &delimiters, self.limits, |text| {
+        encode::encode(record, &delimiters, self.limits, self.isolation, |text| {
             backend.tokenise(text)
         })
     }
@@ -461,12 +533,13 @@ impl LocalEngine {
         encoding: &Encoding,
     ) -> Result<Vec<Vec<f32>>> {
         let readout = encoding.readout();
-        let pass = Pass {
-            ids: &encoding.ids,
-            positions: &encoding.positions,
-            segments: &encoding.segments,
-            readout: &readout,
-        };
+        let pass = Pass::new(
+            &encoding.ids,
+            &encoding.positions,
+            &encoding.segments,
+            &readout,
+        )
+        .with_options(&encoding.slots);
         let hidden = backend.hidden(&pass)?;
         self.distributions(hidden, encoding)
     }

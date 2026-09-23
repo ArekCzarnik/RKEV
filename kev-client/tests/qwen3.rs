@@ -291,12 +291,7 @@ fn the_packed_pass_and_the_row_form_agree() {
     let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2];
     let positions: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 3, 4, 5, 6, 7, 8];
     let readout: Vec<usize> = vec![8, 7, 14, 13];
-    let pass = Pass {
-        ids: &ids,
-        positions: &positions,
-        segments: &segments,
-        readout: &readout,
-    };
+    let pass = Pass::new(&ids, &positions, &segments, &readout);
 
     let packed = backend.hidden(&pass).unwrap();
     let rows: Vec<Vec<f32>> = pass
@@ -556,12 +551,7 @@ fn the_forward_pass_matches_a_transcription_of_modeling_qwen3() {
     // Every position, not just the readout ones: nothing gets to be wrong
     // somewhere the answers happen not to look.
     let readout: Vec<usize> = (0..ids.len()).collect();
-    let pass = Pass {
-        ids: &ids,
-        positions: &positions,
-        segments: &segments,
-        readout: &readout,
-    };
+    let pass = Pass::new(&ids, &positions, &segments, &readout);
 
     let ours = backend.hidden(&pass).unwrap();
     let reference = reference_hidden(&fixture.tensors, &ids, &positions, &|query, key| {
@@ -772,12 +762,7 @@ fn a_repeated_state_is_prefilled_once_and_then_found() {
     let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1];
     let positions: Vec<u32> = (0..ids.len() as u32).collect();
     let readout: Vec<usize> = vec![8, 7];
-    let pass = Pass {
-        ids: &ids,
-        positions: &positions,
-        segments: &segments,
-        readout: &readout,
-    };
+    let pass = Pass::new(&ids, &positions, &segments, &readout);
 
     let first = backend.hidden(&pass).unwrap();
     assert_eq!(
@@ -800,12 +785,7 @@ fn a_repeated_state_is_prefilled_once_and_then_found() {
         .unwrap()
         .with_prefix_min_tokens(0)
         .with_prefix_cache(1);
-    let other_pass = Pass {
-        ids: &other,
-        positions: &positions,
-        segments: &segments,
-        readout: &readout,
-    };
+    let other_pass = Pass::new(&other, &positions, &segments, &readout);
     small.hidden(&pass).unwrap();
     small.hidden(&other_pass).unwrap();
     small.hidden(&pass).unwrap();
@@ -905,12 +885,7 @@ fn a_batch_prefills_each_state_once_however_many_requests_want_it() {
     let readout: Vec<usize> = vec![8, 7];
     let passes: Vec<Pass<'_>> = ids
         .iter()
-        .map(|ids| Pass {
-            ids,
-            positions: &positions,
-            segments: &segments,
-            readout: &readout,
-        })
+        .map(|ids| Pass::new(ids, &positions, &segments, &readout))
         .collect();
 
     let batched = backend.hidden_batch(&passes).unwrap();
@@ -959,4 +934,58 @@ fn a_reduced_precision_backbone_answers_close_to_the_exact_one() {
             "{option}: {exact} in f32, {half} in f16"
         );
     }
+}
+
+#[test]
+fn isolated_options_answer_the_same_whatever_order_they_arrive_in() {
+    // The property option isolation exists for, over a real backbone: every
+    // option span sits at the same positions and reads only itself, so its
+    // representation cannot depend on which options came before it, and
+    // `<decide>`'s attention over the spans is permutation-invariant. The same
+    // question with the options swapped must give each option the same
+    // probability — and without isolation it must not, or this proves nothing.
+    let fixture = checkpoint("isolation", false, false);
+    let head = || pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
+    let ask = |first: &str, second: &str| {
+        SystemOneRequest::new("a ticket about money").ask(
+            "team",
+            Choice::new("which team ?")
+                .option_bare(first)
+                .option_bare(second),
+        )
+    };
+    let probability = |isolation: bool, first: &str, second: &str, of: &str| -> f64 {
+        let engine = LocalEngine::new(Backend::open(&fixture.dir, None).unwrap(), head())
+            .with_option_isolation(isolation);
+        engine
+            .system_one_blocking(&ask(first, second))
+            .unwrap()
+            .answer("team")
+            .unwrap()
+            .probabilities()
+            .unwrap()[of]
+    };
+
+    let isolated = (
+        probability(true, "returns", "billing", "returns"),
+        probability(true, "billing", "returns", "returns"),
+    );
+    assert!(
+        (isolated.0 - isolated.1).abs() < 1e-4,
+        "isolated, returns: {} first, {} second",
+        isolated.0,
+        isolated.1
+    );
+
+    let packed = (
+        probability(false, "returns", "billing", "returns"),
+        probability(false, "billing", "returns", "returns"),
+    );
+    assert!(
+        (packed.0 - packed.1).abs() > 1e-4,
+        "without isolation the order has to matter, or the test above is vacuous: \
+         {} first, {} second",
+        packed.0,
+        packed.1
+    );
 }

@@ -461,6 +461,13 @@ impl Forward for Backend {
     }
 
     fn hidden(&mut self, pass: &Pass<'_>) -> Result<Vec<Vec<f32>>> {
+        // Option isolation is a rule about who may read whom, and a recurrence
+        // reads everything it walked past. Refusing is the only honest answer.
+        if pass.is_isolated() && self.is_hybrid() {
+            return Err(Error::Invalid(String::from(
+                "option isolation needs the packed mask, which a recurrent base cannot honour",
+            )));
+        }
         // The state is the part every question shares. Running it once and
         // continuing each question from it is less work than the packed pass —
         // which computes attention across questions only to mask it away — and
@@ -611,6 +618,11 @@ pub fn pointer_head(path: &Path) -> Result<PointerHead> {
 /// confident the distribution looks — which is exactly the kind of difference
 /// that goes unnoticed.
 pub fn temperature(path: &Path) -> Result<Option<f32>> {
+    Ok(meta(path, "temperature")?.map(|value| value as f32))
+}
+
+/// One number out of `head.pt`'s metadata dict.
+fn meta(path: &Path, key: &str) -> Result<Option<f64>> {
     let file = std::fs::File::open(path)
         .map_err(|e| Error::Engine(format!("cannot read {}: {e}", path.display())))?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
@@ -626,7 +638,17 @@ pub fn temperature(path: &Path) -> Result<Option<f32>> {
         .map_err(|e| Error::Engine(format!("cannot read {pickled}: {e}")))?;
     let mut stack = candle_core::pickle::Stack::empty();
     stack.read_loop(&mut std::io::BufReader::new(reader))?;
-    Ok(scalar(&stack.finalize()?, "temperature").map(|value| value as f32))
+    Ok(scalar(&stack.finalize()?, key))
+}
+
+/// Whether a checkpoint was trained with option isolation, from `head.pt`.
+///
+/// `Meta.option_isolation`, which the released checkpoints leave false. Serving a
+/// checkpoint that wants it without
+/// [`LocalEngine::with_option_isolation`](crate::LocalEngine::with_option_isolation)
+/// is a silently different prompt, not an error, which is why it is worth asking.
+pub fn option_isolation(path: &Path) -> Result<Option<bool>> {
+    Ok(meta(path, "option_isolation")?.map(|value| value != 0.0))
 }
 
 /// The number stored under `key`, anywhere in a pickled object. Shallower
@@ -639,6 +661,8 @@ fn scalar(object: &candle_core::pickle::Object, key: &str) -> Option<f64> {
         Object::Float(value) => Some(*value),
         Object::Int(value) => Some(f64::from(*value)),
         Object::Long(value) => Some(*value as f64),
+        // `option_isolation` and friends are saved as Python bools.
+        Object::Bool(value) => Some(f64::from(u8::from(*value))),
         _ => None,
     };
     match object {
@@ -687,6 +711,8 @@ mod tests {
         text(&mut bytes, "lora");
         bytes.push(b'J');
         bytes.extend(16i32.to_le_bytes());
+        text(&mut bytes, "option_isolation");
+        bytes.push(0x88); // NEWTRUE
         bytes.extend(*b"u.");
         bytes
     }
@@ -711,6 +737,23 @@ mod tests {
         // A checkpoint without one leaves the head raw rather than guessing.
         assert_eq!(scalar(&meta, "holdout"), None);
         assert_eq!(scalar(&meta, "base"), None, "a string is not a number");
+        // Saved as a Python bool, and read as one.
+        assert_eq!(scalar(&meta, "option_isolation"), Some(1.0));
+    }
+
+    #[test]
+    fn a_checkpoint_says_whether_it_wants_option_isolation() {
+        let path = std::env::temp_dir().join("kev-head-isolation.pt");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file("archive/data.pkl", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut archive, &pickled_meta()).unwrap();
+        archive.finish().unwrap();
+
+        assert_eq!(option_isolation(&path).unwrap(), Some(true));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

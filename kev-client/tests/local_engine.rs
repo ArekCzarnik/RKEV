@@ -527,3 +527,68 @@ async fn permuting_works_off_the_runtime_thread_too() {
 
     assert_eq!(permuted["runs"].as_array().unwrap().len(), 3);
 }
+
+#[test]
+fn isolating_the_options_puts_every_span_at_the_same_positions() {
+    use kev_client::OptionSlot;
+
+    // Every option span restarts where the instructions end, and `<decide>` sits
+    // past the longest of them — so no option can be told apart by where it sits.
+    let (stub, log, _) = Stub::new(vec![vec![0.5, 0.3, 0.2]]);
+    let engine = LocalEngine::new(stub, identity_head()).with_option_isolation(true);
+    let request = SystemOneRequest::new("a ticket").ask(
+        "team",
+        Choice::new("which team ?")
+            .option_bare("returns")
+            .option("shipping", "a much longer description")
+            .option_bare("x"),
+    );
+
+    engine.system_one_blocking(&request).unwrap();
+
+    let log = log.lock().unwrap();
+    let pass = &log.passes[0];
+    assert_eq!(pass.options.len(), pass.ids.len(), "every token has a slot");
+
+    let span = |option: u8| -> Vec<u32> {
+        pass.options
+            .iter()
+            .zip(&pass.positions)
+            .filter(|(slot, _)| **slot == OptionSlot::Option(option))
+            .map(|(_, position)| *position)
+            .collect()
+    };
+    let starts: Vec<u32> = (0..3).map(|option| span(option)[0]).collect();
+    assert_eq!(starts[0], starts[1], "spans start at the same position");
+    assert_eq!(starts[1], starts[2]);
+    // Each span is consecutive from there.
+    for option in 0..3 {
+        let positions = span(option);
+        let expected: Vec<u32> = (starts[0]..starts[0] + positions.len() as u32).collect();
+        assert_eq!(positions, expected, "option {option}");
+    }
+    // `<decide>` sits one past the longest span, whichever option that was.
+    let longest = (0..3).map(|option| span(option).len()).max().unwrap() as u32;
+    let decide = pass
+        .options
+        .iter()
+        .zip(&pass.positions)
+        .find(|(slot, _)| **slot == OptionSlot::Decide)
+        .map(|(_, position)| *position)
+        .unwrap();
+    assert_eq!(decide, starts[0] + longest);
+}
+
+#[test]
+fn without_isolation_no_token_carries_a_slot() {
+    let (engine, log, _) = engine(vec![vec![0.5, 0.5]]);
+
+    engine
+        .system_one_blocking(&SystemOneRequest::new("a ticket").ask("q", Noul::new("late?")))
+        .unwrap();
+
+    // The usual layout costs nothing to carry: the slots stay empty, and
+    // `Pass::attends` never looks at them.
+    assert!(log.lock().unwrap().passes[0].options.is_empty());
+    assert!(!log.lock().unwrap().passes[0].as_pass().is_isolated());
+}

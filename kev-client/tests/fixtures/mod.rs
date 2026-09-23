@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kev_client::{
-    Error, Forward, Linear, LocalEngine, Pass, PointerHead, Result, DECIDE, OPTION, OPTION_END,
-    QUESTION, STATE,
+    Error, Forward, Linear, LocalEngine, OptionSlot, Pass, PointerHead, Result, DECIDE, OPTION,
+    OPTION_END, QUESTION, STATE,
 };
 
 /// Words the toy tokenizer knows; everything else becomes `[UNK]`.
@@ -182,16 +182,13 @@ pub struct Recorded {
     pub positions: Vec<u32>,
     pub segments: Vec<u32>,
     pub readout: Vec<usize>,
+    pub options: Vec<OptionSlot>,
 }
 
 impl Recorded {
     pub fn as_pass(&self) -> Pass<'_> {
-        Pass {
-            ids: &self.ids,
-            positions: &self.positions,
-            segments: &self.segments,
-            readout: &self.readout,
-        }
+        Pass::new(&self.ids, &self.positions, &self.segments, &self.readout)
+            .with_options(&self.options)
     }
 
     /// The token indices belonging to question `question` (1-based).
@@ -285,6 +282,7 @@ impl Forward for Stub {
             positions: pass.positions.to_vec(),
             segments: pass.segments.to_vec(),
             readout: pass.readout.to_vec(),
+            options: pass.options.to_vec(),
         });
 
         if !self.rows {

@@ -127,7 +127,7 @@ fn answers_have_the_shapes_and_formulas_the_python_gives() {
 fn a_rounded_distribution_still_sums_to_one_closely_enough() {
     for probabilities in [
         std::iter::once(0.79)
-            .chain(std::iter::repeat_n(0.21 / 39.0, 39))
+            .chain(std::iter::repeat(0.21 / 39.0).take(39))
             .collect::<Vec<f64>>(),
         vec![1.0 / 255.0; 255],
     ] {
@@ -198,12 +198,7 @@ fn a_question_sees_the_state_and_itself_by_the_python_rule() {
     let ids = [0u32; 6];
     let positions = [0u32, 1, 2, 3, 2, 3];
     let segments = [0u32, 0, 1, 1, 2, 2];
-    let pass = Pass {
-        ids: &ids,
-        positions: &positions,
-        segments: &segments,
-        readout: &[],
-    };
+    let pass = Pass::new(&ids, &positions, &segments, &[]);
 
     // Question 1 sees the state and itself.
     assert!(pass.attends(3, 0) && pass.attends(3, 1) && pass.attends(3, 2));
@@ -249,4 +244,40 @@ fn the_temperature_divides_the_logits_and_leaves_the_winner() {
             .map(|(index, _)| index)
     };
     assert_eq!(winner(&raw), winner(&calibrated));
+}
+
+/// `test_option_isolation_mask_rule`, with the same segments, slots and indices:
+/// state twice, then one question of instructions twice, two two-token options
+/// and `<decide>`.
+#[test]
+fn an_isolated_option_is_read_by_itself_and_by_decide() {
+    use kev_client::OptionSlot::{Decide, Elsewhere, Option as Span};
+
+    let ids = [0u32; 9];
+    let positions = [0u32, 1, 2, 3, 4, 5, 4, 5, 6];
+    let segments = [0u32, 0, 1, 1, 1, 1, 1, 1, 1];
+    let slots = [
+        Elsewhere,
+        Elsewhere,
+        Elsewhere,
+        Elsewhere,
+        Span(0),
+        Span(0),
+        Span(1),
+        Span(1),
+        Decide,
+    ];
+    let pass = Pass::new(&ids, &positions, &segments, &[]).with_options(&slots);
+
+    assert!(pass.is_isolated());
+    // Option 1 never sees option 0.
+    assert!(!pass.attends(6, 4) && !pass.attends(7, 5));
+    // An option sees the instructions and the state.
+    assert!(pass.attends(6, 2) && pass.attends(6, 3) && pass.attends(6, 0));
+    // And itself, causally within its span.
+    assert!(pass.attends(7, 6) && pass.attends(5, 4));
+    // `<decide>` sees everything in its question.
+    assert!((0..9).all(|key| pass.attends(8, key)));
+    // The instructions never see the options, which causality already settles.
+    assert!(!pass.attends(3, 4));
 }

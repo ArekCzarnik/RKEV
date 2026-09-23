@@ -586,12 +586,7 @@ fn compare_with_the_reference(
         .collect();
     let positions: Vec<u32> = (0..ids.len() as u32).collect();
     let readout: Vec<usize> = (state..ids.len()).collect();
-    let pass = Pass {
-        ids: &ids,
-        positions: &positions,
-        segments: &segments,
-        readout: &readout,
-    };
+    let pass = Pass::new(&ids, &positions, &segments, &readout);
 
     let ours = backend.hidden(&pass).unwrap();
     let reference: Vec<Vec<f32>> =
@@ -1183,4 +1178,32 @@ fn what_reduced_precision_costs_on_a_cpu() {
             answered.usage.input_tokens
         );
     }
+}
+
+#[test]
+fn a_recurrent_base_refuses_option_isolation() {
+    // Isolation is a rule about who may read whom, and a recurrence reads
+    // everything it walked past. The Python refuses it for the same reason
+    // (`option_isolation needs the packed mask`), and refusing beats answering
+    // with a layout the checkpoint was not trained on.
+    let fixture = checkpoint("isolation", false, false);
+    let engine = LocalEngine::new(
+        Backend::open(&fixture.dir, None).unwrap(),
+        pointer_head(&fixture.dir.join("head.safetensors")).unwrap(),
+    )
+    .with_option_isolation(true);
+
+    let error = engine
+        .system_one_blocking(
+            &SystemOneRequest::new("a ticket about money").ask(
+                "team",
+                kev_client::Choice::new("which team ?")
+                    .option_bare("returns")
+                    .option_bare("billing"),
+            ),
+        )
+        .unwrap_err();
+
+    assert!(error.is_validation(), "got {error:?}");
+    assert!(error.to_string().contains("packed mask"), "{error}");
 }

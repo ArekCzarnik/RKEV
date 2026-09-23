@@ -80,11 +80,11 @@ mod weights;
 pub const DEFAULT_MODEL: &str = "kev-latest";
 
 #[cfg(feature = "candle")]
-pub use backend::{pointer_head, temperature, Backend};
+pub use backend::{option_isolation, pointer_head, temperature, Backend};
 #[cfg(feature = "http")]
 pub use client::{Client, DEFAULT_BASE_URL};
 #[cfg(feature = "local")]
-pub use encode::{Limits, DECIDE, OPTION, OPTION_END, QUESTION, SPECIAL, STATE};
+pub use encode::{Limits, OptionSlot, DECIDE, OPTION, OPTION_END, QUESTION, SPECIAL, STATE};
 pub use error::{Error, Result};
 #[cfg(feature = "local")]
 pub use local::{Forward, LocalEngine, OwnedPass, Pass};

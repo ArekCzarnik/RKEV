@@ -428,6 +428,33 @@ request that does not make sense; `is_validation()` covers it.
 That closes the API gap: everything the HTTP client offers except `/v1/models`,
 which is about a server's own state and has nothing to answer locally.
 
+## Done: option isolation
+
+Commit "Lay options out in isolation when a checkpoint wants it".
+
+The layout an option-isolated checkpoint was trained on: every option span
+restarts where the instructions end, all spans share those positions, `<decide>`
+sits one past the longest of them, and the mask lets an option be read only by
+itself and by `<decide>`. `Pass` carries the per-token `OptionSlot` for it —
+`Pass::new` for the ordinary case, `with_options` for this one — and `attends`
+gained the extra rule. `Encoding.slots` is empty when isolation is off, so the
+usual path carries nothing.
+
+What it buys is asserted over a real backbone in `tests/qwen3.rs`: the same
+question with its two options swapped gives each option the same probability. The
+same test asserts that the *ordinary* layout does not have that property, so it
+cannot pass vacuously. The mask rule itself is ported from
+`test_option_isolation_mask_rule`, indices and all.
+
+A recurrent base refuses it, as the Python does: the rule is about who may read
+whom, and a recurrence reads everything it walked past.
+`option_isolation(head.pt)` reads what a checkpoint was trained with — the pickle
+walker needed to learn that Python bools are numbers too — because serving the
+wrong layout is a silently different prompt, not an error.
+
+`std::iter::repeat_n` had to go back to `repeat().take()`: it is stable since
+1.82 and the crate says 1.75.
+
 ## Left to do
 
 1. **Parity — the tool is there, it has not been run.** `examples/parity.rs`
@@ -447,9 +474,8 @@ which is about a server's own state and has nothing to answer locally.
    been run at all, and a *server* would want to collect concurrent requests into
    a batch itself — `system_one_batch_blocking` is the call it would make, not the
    queue in front of it.
-3. `option_isolation`, if a checkpoint ever serves with it. It needs the packed
-   mask and a per-option sub-branch mask, and the released checkpoints do not use
-   it.
+3. Nothing else from the original plan. What is left is the parity run, and
+   whatever a real checkpoint turns out to need.
 
 ## Design decisions
 

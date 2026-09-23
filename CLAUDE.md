@@ -159,6 +159,16 @@ so the split cannot rot.
   `readout.rs` reproduce the Python kev, down to `True` for a boolean and
   `json.dumps`' spacing in `usage.output_tokens`. Change them only to follow the
   Python, and name the function upstream when you do.
+- **Option isolation is off unless a checkpoint asks for it.** With it, every
+  option span restarts at the instructions' end, shares its positions with the
+  other spans, and is read only by itself and by `<decide>`; `tests/qwen3.rs`
+  asserts what that buys — the same probability per option whichever order they
+  arrive in — and asserts that the ordinary layout does *not* have that property,
+  so the test cannot go vacuous. `head.pt` says which layout a checkpoint was
+  trained on (`option_isolation()`), the released ones say false, and serving the
+  wrong one is a silently different prompt rather than an error. A recurrent base
+  refuses it: the rule is about who may read whom, and a recurrence reads
+  everything it walked past.
 - **Delimiters are unforgeable, and that is load-bearing.** Caller text has
   `<|name|>` rewritten to `<¦name¦>` before tokenising, because a tokenizer
   matches its own special tokens inside ordinary text (`encode_special_tokens`

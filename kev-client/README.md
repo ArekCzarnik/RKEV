@@ -66,6 +66,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Kev can also be trained to lay each option out as a sub-branch of its own, so
+that an option's representation cannot depend on which options came before it.
+`head.pt` says whether a checkpoint was (`option_isolation()`); the released ones
+were not, and the engine follows it only when told:
+
+```rust
+let engine = LocalEngine::new(backend, head).with_option_isolation(true);
+```
+
 ## Question types
 
 | Builder | Wire type | Answer |

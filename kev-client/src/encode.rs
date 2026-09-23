@@ -80,6 +80,27 @@ impl Limits {
     }
 }
 
+/// Which option span a token belongs to.
+///
+/// Only meaningful for a checkpoint trained with **option isolation**, where each
+/// option span is a sub-branch of its own: it reads the state and the
+/// instructions and itself, all spans share the same position ids, and `<decide>`
+/// sits at one fixed position after the longest of them. The per-option
+/// representations are then the same whichever order the options arrive in —
+/// permutation invariance by construction rather than by hope.
+///
+/// The released checkpoints do not use it (`Meta.option_isolation` is false), and
+/// it needs the packed mask, so it is not available on a recurrent base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionSlot {
+    /// The state, or a question's instructions.
+    Elsewhere,
+    /// One of the options, by its index in the question.
+    Option(u8),
+    /// The `<decide>` token, which reads every option.
+    Decide,
+}
+
 /// One packed request: the tokens, where they sit, and where to read from.
 #[derive(Debug, Clone)]
 pub(crate) struct Encoding {
@@ -93,6 +114,9 @@ pub(crate) struct Encoding {
     pub decide: Vec<usize>,
     /// Index of each option's `</opt>` token, per question, in option order.
     pub options: Vec<Vec<usize>>,
+    /// Which option span each token belongs to. Empty unless the layout is
+    /// option-isolated, since nothing else needs to know.
+    pub slots: Vec<OptionSlot>,
 }
 
 impl Encoding {
@@ -171,6 +195,7 @@ pub(crate) fn encode<F>(
     record: &Record,
     delimiters: &Delimiters,
     limits: Limits,
+    isolation: bool,
     mut tokenise: F,
 ) -> Result<Encoding>
 where
@@ -191,41 +216,77 @@ where
 
     let mut segments = vec![0; state_len];
     let mut positions: Vec<u32> = (0..state_len as u32).collect();
+    let mut slots = vec![OptionSlot::Elsewhere; state_len];
     let mut decide = Vec::with_capacity(record.questions.len());
     let mut options = Vec::with_capacity(record.questions.len());
 
     for (index, question) in record.questions.iter().enumerate() {
         let segment = index as u32 + 1;
-        let mut branch = vec![delimiters.question];
-        branch.extend(tokenise(&escape_specials(&question.instructions))?);
+        let mut instructions = vec![delimiters.question];
+        instructions.extend(tokenise(&escape_specials(&question.instructions))?);
 
-        let mut ends = Vec::with_capacity(question.options.len());
+        // Each option is a span of its own: <opt>, the text, </opt>.
+        let mut spans = Vec::with_capacity(question.options.len());
         for option in &question.options {
-            branch.push(delimiters.option);
-            branch.extend(tokenise(&escape_specials(option))?);
-            branch.push(delimiters.option_end);
-            // The `</opt>` token just pushed: the hidden state the pointer
-            // head reads this option from.
-            ends.push(branch.len() - 1);
+            let mut span = vec![delimiters.option];
+            span.extend(tokenise(&escape_specials(option))?);
+            span.push(delimiters.option_end);
+            spans.push(span);
         }
-        branch.push(delimiters.decide);
 
-        if state_len + branch.len() > limits.max_branch {
+        let span_tokens: usize = spans.iter().map(Vec::len).sum();
+        let length = instructions.len() + span_tokens + 1;
+        if state_len + length > limits.max_branch {
             return Err(Error::ContextOverflow(format!(
-                "branch too long: {} tokens with a {state_len}-token state (row limit {})",
-                branch.len(),
+                "branch too long: {length} tokens with a {state_len}-token state (row limit {})",
                 limits.max_branch
             )));
         }
 
         let base = ids.len();
-        // Positions restart just after the state, so every question is laid
-        // out as if it were the only one.
-        positions.extend((state_len..state_len + branch.len()).map(|p| p as u32));
-        segments.extend(std::iter::repeat(segment).take(branch.len()));
-        decide.push(base + branch.len() - 1);
-        options.push(ends.into_iter().map(|end| base + end).collect());
-        ids.extend(branch);
+        // Positions restart just after the state, so every question is laid out
+        // as if it were the only one. Under isolation each option span restarts
+        // again, and `<decide>` sits past the longest of them, so that no option
+        // can be told apart by where it sits.
+        let mut position = state_len as u32;
+        positions.extend(position..position + instructions.len() as u32);
+        position += instructions.len() as u32;
+        let after_instructions = position;
+        let longest = spans.iter().map(Vec::len).max().unwrap_or(0) as u32;
+        for span in &spans {
+            if isolation {
+                positions.extend(after_instructions..after_instructions + span.len() as u32);
+            } else {
+                positions.extend(position..position + span.len() as u32);
+                position += span.len() as u32;
+            }
+        }
+        positions.push(if isolation {
+            after_instructions + longest
+        } else {
+            position
+        });
+
+        segments.extend(std::iter::repeat(segment).take(length));
+        slots.extend(std::iter::repeat(OptionSlot::Elsewhere).take(instructions.len()));
+        let mut ends = Vec::with_capacity(spans.len());
+        let mut cursor = base + instructions.len();
+        for (option, span) in spans.iter().enumerate() {
+            slots.extend(std::iter::repeat(OptionSlot::Option(option as u8)).take(span.len()));
+            cursor += span.len();
+            // The `</opt>` token just placed: what the pointer head reads this
+            // option from.
+            ends.push(cursor - 1);
+        }
+        slots.push(OptionSlot::Decide);
+
+        ids.extend(instructions);
+        for span in spans {
+            ids.extend(span);
+        }
+        ids.push(delimiters.decide);
+        decide.push(base + length - 1);
+        options.push(ends);
     }
 
     Ok(Encoding {
@@ -234,6 +295,7 @@ where
         positions,
         decide,
         options,
+        slots: if isolation { slots } else { Vec::new() },
     })
 }
 #[cfg(test)]
