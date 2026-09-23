@@ -52,10 +52,12 @@
 
 mod client;
 mod error;
+mod system_one;
 mod types;
 
 pub use client::{Client, DEFAULT_BASE_URL, DEFAULT_MODEL};
 pub use error::{Error, Result};
+pub use system_one::SystemOne;
 pub use types::{
     Answer, Choice, Noul, NoulCriteria, Question, Score, SystemOneRequest, SystemOneResponse, Usage,
 };

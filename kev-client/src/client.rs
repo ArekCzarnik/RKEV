@@ -1,7 +1,10 @@
+use std::future::Future;
+
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::system_one::SystemOne;
 use crate::types::{SystemOneRequest, SystemOneResponse};
 
 /// Default address of a locally served Kev
@@ -12,6 +15,9 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8009";
 pub const DEFAULT_MODEL: &str = "kev-latest";
 
 const REQUEST_ID_HEADER: &str = "x-typesafe-request-id";
+
+const SYSTEM_ONE_PATH: &str = "/v1/systemone";
+const SYSTEM_ONE_SEPARATE_PATH: &str = "/v1/systemone/separate";
 
 /// An HTTP client for a Kev server.
 ///
@@ -76,7 +82,7 @@ impl Client {
 
     /// Ask all questions in one forward pass — the normal call.
     pub async fn system_one(&self, request: &SystemOneRequest) -> Result<SystemOneResponse> {
-        self.post_system_one("/v1/systemone", request).await
+        self.post_system_one(SYSTEM_ONE_PATH, request).await
     }
 
     /// Ask each question in its own forward pass.
@@ -87,7 +93,7 @@ impl Client {
         &self,
         request: &SystemOneRequest,
     ) -> Result<SystemOneResponse> {
-        self.post_system_one("/v1/systemone/separate", request)
+        self.post_system_one(SYSTEM_ONE_SEPARATE_PATH, request)
             .await
     }
 
@@ -180,5 +186,25 @@ impl Client {
         let parsed =
             serde_json::from_str::<T>(&body).map_err(|source| Error::Decode { source, body })?;
         Ok((request_id, parsed))
+    }
+}
+
+impl SystemOne for Client {
+    // Delegating to the private helper rather than to the inherent methods of
+    // the same name: `Client::system_one` would resolve to the inherent method
+    // here, but nothing in the signature says so, and a later edit could turn
+    // this into silent infinite recursion.
+    fn system_one(
+        &self,
+        request: &SystemOneRequest,
+    ) -> impl Future<Output = Result<SystemOneResponse>> + Send {
+        self.post_system_one(SYSTEM_ONE_PATH, request)
+    }
+
+    fn system_one_separate(
+        &self,
+        request: &SystemOneRequest,
+    ) -> impl Future<Output = Result<SystemOneResponse>> + Send {
+        self.post_system_one(SYSTEM_ONE_SEPARATE_PATH, request)
     }
 }
