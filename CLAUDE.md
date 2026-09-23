@@ -95,8 +95,16 @@ Three modules behind a flat re-export surface in `src/lib.rs`:
   task file has the evidence. Three load-bearing details: `Clone` is cheap
   because `spawn_blocking` needs `'static`, the backend lives in an
   `Arc<Mutex<dyn Forward>>` so clones share one loaded model, and `Pass::rows`
-  exists because backbones with recurrent layers (Qwen3.5, so every current
-  checkpoint) cannot honour `Pass::attends`. No backend ships yet.
+  exists because backbones with recurrent layers (Qwen3.5) cannot honour
+  `Pass::attends`.
+- `src/qwen3.rs`, `src/backend.rs` (feature `qwen3`) — the backbone itself, in
+  candle: the attention-only Qwen3 bases (the `@qwen3` checkpoints), with the
+  checkpoint's LoRA merged in f32 as the weights are read, and `Qwen3Backend`
+  putting it together with the tokenizer as a `Forward`. It exists separately
+  from candle's and mistral.rs' Qwen3 because it has to take an arbitrary
+  additive mask and explicit position ids, and has to stop at the hidden states
+  — no vocabulary head, no KV cache, one prefill pass per request. The hybrid
+  Qwen3.5 bases (Gated DeltaNet) are refused rather than answered wrongly.
 - `src/error.rs` — `Error` with predicates (`is_validation` for Kev's 422,
   `is_unauthorized` for 401/403) instead of making callers match on status
   codes.
@@ -104,7 +112,9 @@ Three modules behind a flat re-export surface in `src/lib.rs`:
 ### Features
 
 `http` (on by default) pulls in `reqwest`; `local` pulls in tokio for
-`spawn_blocking` and will carry the inference backend once one is written. The
+`spawn_blocking`; `qwen3` adds `local` plus candle and tokenizers, i.e. the
+actual model. candle is pinned to 0.9 on purpose: 0.10 made `candle-core` depend
+on `tokenizers` with oniguruma, a C dependency this crate has no use for. The
 types, the errors and the `SystemOne` trait build with neither, so a
 local-inference build carries no HTTP stack. Consequences to keep in mind when editing:
 `Error::Transport` and `From<reqwest::Error>` are `#[cfg]`-gated, the crate-level
@@ -146,7 +156,11 @@ the `SystemOne` trait is implementable without reqwest. `tests/local_engine.rs`
 drives the engine over a backend with no model in it, whose hidden states are
 built to produce a chosen distribution — that is what makes the prompt, the
 question isolation and the readout testable without weights, and it is where the
-Kev README's published numbers are asserted. Tests
+Kev README's published numbers are asserted. `tests/qwen3.rs` writes a
+two-layer checkpoint (config, safetensors, tokenizer, head) into the temp
+directory and runs the real backbone over it: made-up weights, but the
+properties under test hold for any weights — question isolation, packed against
+row form, and that merging an adapter equals a pre-merged checkpoint. Tests
 assert on JSON shape and public accessor behaviour, never on internals — keep
 new tests in that style, and update the README example and these fixtures
 together whenever the wire format legitimately changes.
