@@ -92,13 +92,14 @@ fi
 # and aborts the script.
 step "cargo test" cargo test ${cargo_test_args[@]+"${cargo_test_args[@]}"}
 
-# http and local are optional, so every combination has to build on its own -
+# local and candle are optional, so every combination has to build on its own -
 # a cfg that only compiles with default features is a trap that shows up much
-# later. Skipped when a specific test was named, where the matrix is noise.
+# later. `--all-features` is the same set as the default; it is in the list so
+# that adding a feature later cannot skip it. Skipped when a specific test was
+# named, where the matrix is noise.
 if [ "$skip_features" -eq 0 ] && [ ${#cargo_test_args[@]} -eq 0 ]; then
     for combo in "--no-default-features" \
                  "--no-default-features --features local" \
-                 "--no-default-features --features candle" \
                  "--all-features"; do
         # shellcheck disable=SC2086
         step "cargo test $combo" cargo test $combo

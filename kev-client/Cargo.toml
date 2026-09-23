@@ -11,7 +11,6 @@ license = "Apache-2.0"
 # Question and option order is part of the request and can move the answer,
 # so maps have to keep insertion order.
 indexmap = { version = "2", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` is not optional here: a JSON state is rendered into the
 # prompt field by field, so the order its keys arrive in is part of the model
@@ -34,14 +33,13 @@ tokenizers = { version = "0.22", default-features = false, features = ["fancy-re
 zip = { version = "7", default-features = false, optional = true }
 
 [features]
-default = ["http"]
-# Talking to a Kev server over HTTP. Turn it off for a build that only uses a
-# local inference engine; `SystemOne`, the types and the errors stay available.
-http = ["dep:reqwest"]
-# A local inference engine instead of an HTTP server. The prompt layout and the
-# pointer-head readout are here; what is missing is a backbone behind `Forward`
-# (hidden states, not logits - see .claude/tasks/2026-09-23-local-inference.md),
-# so this still brings in only the runtime support the blocking call needs.
+# The model itself is the point of this crate, so it is what you get by default.
+# `--no-default-features` leaves the wire-format types, the errors and the
+# `SystemOne` seam, which is all a caller needs to talk to something else.
+default = ["candle"]
+# The engine without a backbone: the prompt layout and the pointer-head readout,
+# with `Forward` left to the caller (hidden states, not logits). Brings in only
+# the runtime support the blocking call needs.
 local = ["dep:tokio"]
 # The model itself, in candle: both generations of Kev's bases, as a `Forward`
 # backend. Raises the MSRV to whatever candle needs.
@@ -50,10 +48,6 @@ candle = ["local", "dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:zi
 [dev-dependencies]
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-[[example]]
-name = "triage"
-required-features = ["http"]
 
 [[example]]
 name = "parity"

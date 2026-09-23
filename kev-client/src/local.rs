@@ -393,12 +393,11 @@ impl LocalEngine {
     /// Run one `choice` question under several option orders, to see whether the
     /// order moves the answer.
     ///
-    /// The same thing `/v1/systemone/permute` does, in the same JSON shape the
-    /// [`Client`](crate::Client) hands back for it — `runs` (each with its
-    /// `order`, `probabilities`, `choice` and `latency_ms`), `argmax_stable` and
-    /// the per-option `spread`. Raw JSON for the same reason the client's is: the
-    /// envelope is not in the API docs, and a struct here would invent a
-    /// contract.
+    /// The same thing `/v1/systemone/permute` does, in the shape that endpoint
+    /// answers in — `runs` (each with its `order`, `probabilities`, `choice` and
+    /// `latency_ms`), `argmax_stable` and the per-option `spread`. Raw JSON on
+    /// purpose: that envelope is not in the API docs, so a struct here would
+    /// invent a contract rather than follow one.
     ///
     /// The first run keeps the order as given and the rest are shuffled from
     /// `seed`, so a repeat with the same seed sees the same orders. They will not
@@ -406,10 +405,9 @@ impl LocalEngine {
     /// CPython's shuffle — and they do not need to be: what the endpoint is for is
     /// how far the probabilities move, not which permutations were tried.
     ///
-    /// Only the named question is asked, as on the server, and `rounds` is
-    /// clamped to 1..=64 as [`Client::permute`](crate::Client::permute) clamps
-    /// `n_perm`. Every run repeats the same state, so the second one onwards costs
-    /// only its own branch.
+    /// Only the named question is asked, as on the server, and `rounds` is clamped
+    /// to 1..=64, the range the server accepts for `n_perm`. Every run repeats the
+    /// same state, so the second one onwards costs only its own branch.
     pub fn permute_blocking(
         &self,
         request: &SystemOneRequest,
@@ -600,7 +598,6 @@ impl LocalEngine {
             },
             latency_ms: Some((started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0),
             // A header the HTTP server sets; there is no server here.
-            request_id: None,
         })
     }
 

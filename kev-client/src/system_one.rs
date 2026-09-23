@@ -1,8 +1,7 @@
 //! The backend seam.
 //!
-//! Answering a System One request does not have to mean an HTTP call. This
-//! trait is what every backend has in common, so callers can be written once
-//! and keep working when the backend changes.
+//! What every backend has in common, so callers can be written once and keep
+//! working when the backend underneath changes.
 
 use std::future::Future;
 
@@ -11,8 +10,9 @@ use crate::types::{SystemOneRequest, SystemOneResponse};
 
 /// The System One API, independent of how it is served.
 ///
-/// [`Client`](crate::Client) implements it over HTTP (feature `http`); a local
-/// inference engine will implement the same two calls.
+/// [`LocalEngine`](crate::LocalEngine) implements it (feature `local`). Anything
+/// else that can answer these two calls — another engine, a queue in front of
+/// one, a recording — fits the same seam.
 ///
 /// The methods return `impl Future + Send` instead of being `async fn`: Rust
 /// 1.75 cannot put a `Send` bound on an `async fn` in a trait, and without it

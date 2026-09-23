@@ -17,7 +17,7 @@ pub struct SystemOneRequest {
     /// The content to evaluate. A string, or any JSON object/array — Kev
     /// converts objects and arrays to labelled text.
     pub state: Value,
-    /// Left empty here, the [`Client`](crate::Client) fills in its own model.
+    /// The checkpoint to answer with, when a caller wants to name one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Question id -> question. The id is yours; the model never sees it.
@@ -217,9 +217,6 @@ pub struct SystemOneResponse {
     pub usage: Usage,
     #[serde(default)]
     pub latency_ms: Option<f64>,
-    /// Taken from the `x-typesafe-request-id` header, not the body.
-    #[serde(skip)]
-    pub request_id: Option<String>,
 }
 
 impl SystemOneResponse {

@@ -652,6 +652,47 @@ from the real checkpoint, and only the user's Mac can produce them** — with a
 400-word state the container's hybrid fixture shows the shape (cache 3.6x, f16
 1.15x) but not the magnitudes.
 
+## Done: the HTTP client is gone
+
+Commit "Remove the HTTP client and make the model the default feature". The user
+does not need the path through a running Python server any more, so it is out
+rather than carried along: dead weight in a crate is worse than a missing feature,
+and `reqwest` was the crate's only dependency that needed a C toolchain.
+
+Removed: `src/client.rs`, `examples/triage.rs`, `scripts/triage.sh`, the `http`
+feature and `reqwest`, `tests/seam.rs`'s `over_http` module. With them went the
+error variants that only existed for HTTP — `InvalidBaseUrl`, `Transport`, `Api`,
+`Decode` — and `SystemOneResponse.request_id`, which came from a response header.
+
+Kept, and why:
+
+- **The `SystemOne` trait.** It was designed as the seam between backends and it
+  still is one: a recording, a queue, another engine. It needs no feature, and
+  `tests/seam.rs` still proves a backend with no model in it can implement it with
+  `--no-default-features`.
+- **The `Send` bound tests.** They used to be about `Client`; the property is about
+  the trait, so they moved to `LocalEngine` (three tests in `over_the_local_engine`,
+  using the stub from `tests/fixtures`). `#[path]` resolves relative to the module
+  it sits in, so the fixtures module has to be declared at the test crate's root.
+- **`Error::Invalid` is now unconditional.** With every variant behind a feature, a
+  `--no-default-features` build would have an *uninhabited* `Error`, and `Display`
+  cannot exhaustively match a reference to one. One always-present variant, and the
+  question does not arise.
+
+Two deliberate consequences:
+
+- **`default = ["candle"]`.** The model is what the crate is for, and with `http`
+  gone the old default named a feature that no longer existed. Every documented
+  command lost its `--no-default-features --features candle`, and `cargo test`,
+  `cargo run --example decide` now work as they read.
+- **The whole feature matrix builds in this container for the first time.**
+  `scripts/test.sh` ran green here end to end — fmt, clippy `--all-features`,
+  tests, matrix — because nothing left needs `cc`. Previously `--all-features`
+  could not even be attempted.
+
+Tests: 83 with the default features (was 80, plus the three moved seam tests), 50
+with `local`, 14 with none. `scripts/test.sh` green.
+
 ## Left to do
 
 1. **Parity — the only thing left that needs the server.** The loading, the real

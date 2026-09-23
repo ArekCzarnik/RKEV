@@ -28,11 +28,10 @@ Or directly:
 
 ```bash
 cd kev-client
-cargo test                                   # all tests; needs no server
+cargo test                                   # all tests; needs no server or weights
 cargo test --test wire_format                # the integration test file
 cargo test request_matches_the_readme_example  # a single test by name
-cargo run --example triage                   # needs a running Kev server
-cargo run --example triage -- "custom ticket text"
+cargo run --release --example decide -- --base <dir> --checkpoint <dir> --state "..."
 cargo doc --open                             # the crate is documented in rustdoc
 ```
 
@@ -40,10 +39,10 @@ cargo doc --open                             # the crate is documented in rustdo
 change is unverified instead.
 
 This container has no C toolchain (no `cc`, no glibc `crt1.o`), so a plain
-`cargo test` cannot link, and `--features http` cannot be built here at all
-(`ring` needs a C compiler). A Rust toolchain installs with `rustup`, and the
-non-HTTP features do run here through the musl target; the recipe is at the end
-of `.claude/tasks/2026-09-23-local-inference.md`.
+`cargo test` cannot link. A Rust toolchain installs with `rustup`, and everything
+does run here — the recipe (rust-lld, a lib shim, a hand-built `crt1.o`) is at the
+end of `.claude/tasks/2026-09-23-local-inference.md`. Since reqwest went, no
+dependency needs a C compiler, so the whole feature matrix builds here.
 
 `scripts/local.sh` is the same idea for the local engine, and needs neither a
 server nor Python:
@@ -54,30 +53,21 @@ scripts/local.sh --fetch jaredpalmer/kev-0.6b   # download a checkpoint first
 scripts/local.sh --checkpoint <dir> --measure   # with the timing measurements
 ```
 
-`scripts/triage.sh` runs the example; it probes the server first and passes
-`KEV_*` through:
-
-```bash
-scripts/triage.sh                              # the README ticket
-scripts/triage.sh "My parcel never arrived."   # your own ticket
-scripts/triage.sh -f ticket.txt                # or from a file / stdin
-```
-
-`cargo run --example triage` reads `KEV_BASE_URL`, `KEV_MODEL` and
-`KEV_API_KEY`; without them it targets `http://127.0.0.1:8009` with model
-`kev-latest` and no auth. Starting a server needs the separate Python Kev repo
-(`uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b --port 8009`),
-which is not vendored here.
+The Python Kev server is still what `examples/parity.rs` compares against, and it
+is not vendored here; starting one needs the separate Kev repo
+(`uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b --port 8009`).
+Nothing else in this repo talks to it — **the HTTP client was removed** on the
+user's request; do not reintroduce one without being asked.
 
 ## Architecture
 
-`kev-client` is a thin async HTTP client for [Kev](https://github.com/jaredpalmer/kev),
-which implements TypeSafe's System One API. One call sends a **state** (any
-text or JSON document) plus a map of **questions**; the server answers each
-question with a probability distribution rather than a single label. Questions
-share the state but cannot read each other.
+`kev-client` runs [Kev](https://github.com/jaredpalmer/kev) locally. Kev
+implements TypeSafe's System One API, and a call here answers the same shape a
+server would: a **state** (any text or JSON document) plus a map of **questions**,
+each answered with a probability distribution rather than a single label.
+Questions share the state but cannot read each other.
 
-Three modules behind a flat re-export surface in `src/lib.rs`:
+The modules behind a flat re-export surface in `src/lib.rs`:
 
 - `src/types.rs` — the wire format. `SystemOneRequest` is built fluently
   (`.ask(id, question)`); `Question` is an internally tagged enum
@@ -86,14 +76,11 @@ Three modules behind a flat re-export surface in `src/lib.rs`:
   response side, with accessors (`as_noul`, `as_choice`, `as_score`,
   `confidence`, `probabilities`, `top`, `legend`) that return `Option` rather
   than panicking on a type mismatch.
-- `src/system_one.rs` — the `SystemOne` trait: the backend seam. HTTP today, a
-  local inference engine later. Deliberately outside `client.rs` so it stays
-  available with the `http` feature off.
-- `src/client.rs` — `Client` (feature `http`) and the shared `read()` helper
-  that every request funnels through: it captures the `x-typesafe-request-id` header, turns non-2xx
-  into `Error::Api`, and reads the body as text before decoding so a failed
-  parse can report what actually arrived. `with_model_filled_in` injects the
-  client's default model only when the request did not pin one.
+- `src/system_one.rs` — the `SystemOne` trait: the backend seam, which
+  `LocalEngine` implements. It stays outside the engine and needs no feature, so a
+  caller can be written against it and hold a recording, a queue or another engine
+  instead. `tests/seam.rs` pins that: its first backend has no model in it and
+  compiles with no features at all.
 - `src/prompt.rs`, `src/encode.rs`, `src/readout.rs` (feature `local`) — the
   Kev-specific half of a local forward pass, mirroring `kev/api.py` and
   `kev/model.py`: the text the model sees, the token layout (`<state>`, then
@@ -137,17 +124,22 @@ Three modules behind a flat re-export surface in `src/lib.rs`:
 
 ### Features
 
-`http` (on by default) pulls in `reqwest`; `local` pulls in tokio for
-`spawn_blocking`; `qwen3` adds `local` plus candle and tokenizers, i.e. the
-actual model. candle is pinned to 0.9 on purpose: 0.10 made `candle-core` depend
-on `tokenizers` with oniguruma, a C dependency this crate has no use for. The
-types, the errors and the `SystemOne` trait build with neither, so a
-local-inference build carries no HTTP stack. Consequences to keep in mind when editing:
-`Error::Transport` and `From<reqwest::Error>` are `#[cfg]`-gated, the crate-level
-doctest hides its body behind `#[cfg(feature = "http")]`, and the triage example
-declares `required-features = ["http"]`. `scripts/test.sh` runs
-a feature matrix (`--no-default-features`, `--features local`, `--all-features`)
-so the split cannot rot.
+`candle` is the default: the model itself, which is what the crate is for. `local`
+is the layer under it — prompt, layout, readout, `Forward` left to the caller —
+and pulls in tokio for `spawn_blocking` only. With neither, the wire-format types,
+the errors and the `SystemOne` trait still build, which is what a caller holding a
+recording or fronting another engine needs.
+
+candle is pinned to 0.9 on purpose: 0.10 made `candle-core` depend on `tokenizers`
+with oniguruma, a C dependency this crate has no use for. Consequences to keep in
+mind when editing: every example declares `required-features = ["candle"]`, the
+crate-level doctest hides its body behind `#[cfg(feature = "candle")]`,
+`Error::Model` and `From<candle_core::Error>` are `#[cfg]`-gated, and every
+`Error` variant but `Invalid` is — `Invalid` stays unconditional so the enum is
+never uninhabited, which a feature-less build would otherwise trip over in
+`Display`. `scripts/test.sh` runs a feature matrix
+(`--no-default-features`, `--no-default-features --features local`,
+`--all-features`) so the split cannot rot.
 
 ### Invariants worth preserving
 
@@ -159,14 +151,13 @@ so the split cannot rot.
   answer, so `confidence()` and `probabilities()` deliberately return `None`.
   Confidence elsewhere is a shape measure of the distribution, not an accuracy
   rate — keep the docs saying so.
-- **Undocumented endpoints stay `serde_json::Value`.** `permute` and `models`
-  return raw JSON on purpose: the API docs do not pin their envelopes, and a
-  typed struct would invent a contract. Do not "improve" these into structs —
-  and that holds for `LocalEngine::permute`, which *builds* that shape rather
-  than decoding it, so that a caller can swap the two backends.
+- **The undocumented envelope stays `serde_json::Value`.** `LocalEngine::permute`
+  *builds* the shape `/v1/systemone/permute` answers in rather than decoding it,
+  and returns raw JSON on purpose: the API docs do not pin that envelope, so a
+  typed struct would invent a contract. Do not "improve" it into one.
 - **Optional response fields.** Only `model` and `answers` are guaranteed;
-  `usage` and `latency_ms` use `#[serde(default)]`. `request_id` is
-  `#[serde(skip)]` — it comes from a header, not the body.
+  `usage` and `latency_ms` use `#[serde(default)]`, because a response may be a
+  recording of a server that omitted them.
 - **`serde_json` keeps `preserve_order` on.** A JSON state is rendered into the
   prompt field by field, so sorted keys would build a different prompt — and a
   different answer — than the server does. It is not there for convenience.
@@ -194,10 +185,11 @@ so the split cannot rot.
 
 ### Tests
 
-Three files, all offline. `tests/wire_format.rs` pins serialised requests and
+Five files, all offline. `tests/wire_format.rs` pins serialised requests and
 deserialised responses against the worked example in the Kev README, so a
-refactor cannot silently change what goes on the wire. `tests/seam.rs` proves
-the `SystemOne` trait is implementable without reqwest. `tests/local_engine.rs`
+refactor cannot silently change what goes on the wire. `tests/seam.rs` proves the
+`SystemOne` trait is implementable with no features at all, and that the engine's
+futures are `Send` so a caller can spawn them. `tests/local_engine.rs`
 drives the engine over a backend with no model in it, whose hidden states are
 built to produce a chosen distribution — that is what makes the prompt, the
 question isolation and the readout testable without weights, and it is where the
@@ -333,8 +325,9 @@ been run at all here.
 
 `examples/parity.rs` (feature `candle`) answers a recorded request in process and
 compares every probability with the server's recorded response, exiting non-zero
-past a tolerance. It needs no HTTP stack on purpose: the server side is a file,
-which makes the recording reusable as an offline fixture later. Nothing else in
+past a tolerance. The server side is a file on purpose, which makes a recording
+reusable as an offline fixture later — and is why removing the HTTP client cost
+this check nothing. Nothing else in
 this repo compares the engine with the reference *running*, so this is the check
 that decides whether the local numbers mean anything.
 
@@ -361,8 +354,8 @@ more than one ticket is missed. It is not parity and does not replace it.
 checkpoint and answers requests in process — `--request` (repeatable, which
 batches), `--state` with `--questions`, or `--lines` for a state per line on
 stdin, which keeps one loaded model and a warm prefix cache. `--json` prints the
-server's envelope with `answers_json()` inside it, so a caller can drop the HTTP
-server without changing what it parses; everything else goes to stderr. It is the
+server's envelope with `answers_json()` inside it, so a caller that used to POST to
+`kev.serve` can keep parsing what it parsed; everything else goes to stderr. It is the
 only example that is a tool rather than a check, and the reason `answers_json` is
 public.
 
@@ -385,8 +378,7 @@ head and the tokenizer, then the base named in `adapter_config.json`, sharded
 weights included (the index names the shards). It then runs `scripts/test.sh`,
 the sanity example, the suite again with `KEV_TOKENIZER` pointed at the real
 vocabulary, one request through `decide`, and with `--measure` the `#[ignore]`d
-timings. Everything is `--no-default-features --features candle`: none of it
-talks HTTP, and reqwest would drag in `ring`, which needs a C compiler.
+timings. No feature flags: the model is the crate's default.
 
 `KEV_HF` points the downloads at a mirror — or at a `file://` tree, which is how
 the fetch path was tested here without reaching the hub.
@@ -395,8 +387,9 @@ the fetch path was tested here without reaching the hub.
 
 The crate is documented in three places that must stay in sync when the public
 API changes: `kev-client/README.md`, the `//!` module docs in `src/lib.rs`
-(a compiled `no_run` doctest), and `examples/triage.rs`. All three use the same
-support-ticket triage example as the README of the upstream Kev project.
+(a compiled `no_run` doctest), and `examples/decide.rs`. The first two use the
+same support-ticket triage example as the README of the upstream Kev project, so
+the numbers stay comparable with the published ones.
 
 `README.md` at the repo root is the fourth, and it is in **German**: the overview,
 the quickstart without Python, the feature and example tables, and the honest

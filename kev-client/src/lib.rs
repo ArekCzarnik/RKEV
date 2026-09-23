@@ -1,48 +1,52 @@
-//! A Rust client for [Kev](https://github.com/jaredpalmer/kev), the small
+//! Local inference for [Kev](https://github.com/jaredpalmer/kev), the small
 //! decision models that speak TypeSafe's System One API.
 //!
-//! You send a `state` — a support ticket, a document, any text — plus a set of
+//! You hand it a `state` — a support ticket, a document, any text — plus a set of
 //! questions about it, and get back probabilities instead of a single label.
 //! Questions share the state but cannot read each other.
 //!
-//! Start a server first:
-//!
-//! ```text
-//! uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b --port 8009
-//! ```
-//!
-//! Then:
+//! Everything happens in this process: the prompt, one forward pass over a Qwen
+//! backbone with the checkpoint's LoRA merged in, and the pointer head that turns
+//! the hidden states into answers. No server, and no Python.
 //!
 //! ```no_run
-//! # #[cfg(feature = "http")]
-//! # async fn run() -> Result<(), kev_client::Error> {
-//! use kev_client::{Choice, Client, Noul, Score, SystemOneRequest};
+//! # #[cfg(feature = "candle")]
+//! # fn run() -> Result<(), kev_client::Error> {
+//! use std::path::Path;
 //!
-//! let client = Client::local()?;
+//! use kev_client::{pointer_head, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest};
 //!
-//! let response = client
-//!     .system_one(
-//!         &SystemOneRequest::new(
-//!             "Shoes arrived two weeks late and in the wrong size. \
-//!              Also I see two charges on my card.",
-//!         )
-//!         .ask(
-//!             "department",
-//!             Choice::new("Which team should handle this?")
-//!                 .option("returns", "Exchanges, refunds, wrong or damaged items")
-//!                 .option("shipping", "Delivery status, delays, lost packages")
-//!                 .option("billing", "Charges, invoices, payment problems"),
-//!         )
-//!         .ask("escalate", Noul::new("Does this need urgent human attention?"))
-//!         .ask(
-//!             "frustration",
-//!             Score::new("How frustrated is the customer?")
-//!                 .level("Calm")
-//!                 .level("Frustrated")
-//!                 .level("Very angry"),
-//!         ),
+//! let base = Path::new("models/qwen3-0.6b-base");
+//! let checkpoint = Path::new("models/kev-0.6b");
+//!
+//! // The base model with the checkpoint's adapter, and the checkpoint's own
+//! // pointer head: the two halves of a Kev model.
+//! let engine = LocalEngine::new(
+//!     Backend::open(base, Some(checkpoint))?,
+//!     pointer_head(&checkpoint.join("head.pt"))?,
+//! );
+//!
+//! let response = engine.system_one_blocking(
+//!     &SystemOneRequest::new(
+//!         "Shoes arrived two weeks late and in the wrong size. \
+//!          Also I see two charges on my card.",
 //!     )
-//!     .await?;
+//!     .ask(
+//!         "department",
+//!         Choice::new("Which team should handle this?")
+//!             .option("returns", "Exchanges, refunds, wrong or damaged items")
+//!             .option("shipping", "Delivery status, delays, lost packages")
+//!             .option("billing", "Charges, invoices, payment problems"),
+//!     )
+//!     .ask("escalate", Noul::new("Does this need urgent human attention?"))
+//!     .ask(
+//!         "frustration",
+//!         Score::new("How frustrated is the customer?")
+//!             .level("Calm")
+//!             .level("Frustrated")
+//!             .level("Very angry"),
+//!     ),
+//! )?;
 //!
 //! if let Some(answer) = response.answer("department") {
 //!     println!("{:?} (confidence {:?})", answer.as_choice(), answer.confidence());
@@ -50,11 +54,12 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`LocalEngine::system_one`] is the same call for an async caller: it moves the
+//! pass off the runtime thread, since a forward pass is CPU-bound.
 
 #[cfg(feature = "candle")]
 mod backend;
-#[cfg(feature = "http")]
-mod client;
 #[cfg(feature = "local")]
 mod encode;
 mod error;
@@ -75,14 +80,11 @@ mod types;
 #[cfg(feature = "candle")]
 mod weights;
 
-/// Model alias a Kev server resolves to whatever checkpoint it loaded, and the
-/// name a local engine reports when a request does not pin one.
+/// The name a local engine reports when a request does not pin one.
 pub const DEFAULT_MODEL: &str = "kev-latest";
 
 #[cfg(feature = "candle")]
 pub use backend::{option_isolation, pointer_head, temperature, Backend};
-#[cfg(feature = "http")]
-pub use client::{Client, DEFAULT_BASE_URL};
 #[cfg(feature = "local")]
 pub use encode::{Limits, OptionSlot, DECIDE, OPTION, OPTION_END, QUESTION, SPECIAL, STATE};
 pub use error::{Error, Result};
@@ -90,7 +92,6 @@ pub use error::{Error, Result};
 pub use local::{Forward, LocalEngine, OwnedPass, Pass};
 #[cfg(feature = "local")]
 pub use prompt::render;
-#[cfg(feature = "local")]
 #[cfg(feature = "local")]
 pub use readout::{answers_json, softmax, Linear, PointerHead};
 pub use system_one::SystemOne;

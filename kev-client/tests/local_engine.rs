@@ -288,8 +288,6 @@ fn the_answers_are_billed_the_way_the_server_serialises_them() {
     assert_eq!(response.usage.output_tokens, serialised.len() as u64);
     assert!(response.usage.input_tokens > 0);
     assert!(response.latency_ms.is_some());
-    // A header the HTTP server sets; there is none here.
-    assert_eq!(response.request_id, None);
 }
 
 #[test]
@@ -353,7 +351,7 @@ fn clones_share_one_backend_rather_than_loading_the_model_twice() {
 }
 
 #[tokio::test]
-async fn the_engine_answers_through_the_same_seam_as_the_http_client() {
+async fn the_engine_answers_through_the_same_seam() {
     // The point of the seam: this function never names LocalEngine.
     async fn ask<B: SystemOne>(backend: &B) -> Result<f64> {
         let response = backend

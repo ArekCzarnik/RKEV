@@ -272,21 +272,20 @@ echo "==> head       $head_file"
 echo "==> tokenizer  $tokenizer"
 
 # Always --release: a real checkpoint under a debug build is minutes per pass.
-# --no-default-features throughout: none of this talks HTTP, and reqwest drags
-# in ring, which needs a C compiler this crate otherwise does not.
+# The model is the crate's default feature, so there is nothing to pass here.
 step "the engine against itself and against obvious cases (example sanity)" \
-    cargo run --release --no-default-features --features candle --example sanity -- \
+    cargo run --release --example sanity -- \
     "${model[@]}"
 
 # KEV_TOKENIZER turns on the checks that need a real Qwen vocabulary: the
 # specials Kev reuses as delimiters have to be single known ids, and text that
 # looks like one must not become one.
 step "the suite again with the real tokenizer (KEV_TOKENIZER)" \
-    env KEV_TOKENIZER="$tokenizer" cargo test --release --no-default-features --features candle
+    env KEV_TOKENIZER="$tokenizer" cargo test --release
 
 # One answer through the front end, which is the thing you would actually run.
 step "one request end to end (example decide)" \
-    cargo run --release --no-default-features --features candle --example decide -- \
+    cargo run --release --example decide -- \
     "${model[@]}" \
     --state "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card."
 
@@ -294,12 +293,12 @@ if [ "$measure" -eq 1 ]; then
     # On the real checkpoint: what f16 buys, and what the prefix cache buys, with
     # the controls that keep a cache hit from being read as a precision win.
     step "the timings on this checkpoint (example measure)" \
-        cargo run --release --no-default-features --features candle --example measure -- \
+        cargo run --release --example measure -- \
         "${model[@]}"
     # And on the synthetic fixtures, which is where the released checkpoints'
     # layer widths are reproduced without their weights.
     step "the timings on the fixtures (#[ignore]d tests)" \
-        cargo test --release --no-default-features --features candle -- --ignored --nocapture
+        cargo test --release -- --ignored --nocapture
 fi
 
 if [ -n "$failed" ]; then

@@ -1,15 +1,22 @@
-//! The backend seam. `Client` is one way to answer a System One request; a
-//! local inference engine will be another. These tests pin what the seam has
-//! to allow, and need no server.
+//! The backend seam. `LocalEngine` is one way to answer a System One request; a
+//! recording, a queue or another engine can be others. These tests pin what the
+//! seam has to allow, and the first of them runs with no features at all.
 
 use std::future::Future;
+
+// The stub backend, shared with tests/local_engine.rs. At the root of this test
+// crate rather than inside the module that uses it: a #[path] resolves relative
+// to the module it sits in.
+#[cfg(feature = "local")]
+#[path = "fixtures/mod.rs"]
+mod fixtures;
 
 use kev_client::{
     Answer, IndexMap, Noul, Result, SystemOne, SystemOneRequest, SystemOneResponse, Usage,
 };
 
-/// A backend that answers from a canned response, the way a local engine will:
-/// no HTTP involved. Compiles and runs with `--no-default-features`.
+/// A backend that answers from a canned response. Compiles and runs with
+/// `--no-default-features`, which is the point: the seam costs a caller nothing.
 struct Canned(SystemOneResponse);
 
 // Kept as `-> impl Future + Send` rather than `async fn`: it mirrors the trait
@@ -41,7 +48,6 @@ fn canned_response() -> SystemOneResponse {
         answers,
         usage: Usage::default(),
         latency_ms: None,
-        request_id: None,
     }
 }
 
@@ -55,7 +61,7 @@ async fn ask<B: SystemOne>(backend: &B, request: &SystemOneRequest) -> Result<Sy
 }
 
 #[tokio::test]
-async fn a_backend_that_is_not_http_can_answer_through_the_seam() {
+async fn a_backend_with_no_model_in_it_can_answer_through_the_seam() {
     let backend = Canned(canned_response());
 
     let response = ask(&backend, &a_request()).await.unwrap();
@@ -72,37 +78,38 @@ async fn the_separate_call_goes_through_the_same_seam() {
     assert_eq!(response.model, "stub");
 }
 
-#[cfg(feature = "http")]
-mod over_http {
-    use super::a_request;
-    use kev_client::{Client, SystemOne};
+#[cfg(feature = "local")]
+mod over_the_local_engine {
+    use super::{a_request, fixtures};
+    use kev_client::SystemOne;
 
     fn assert_send<F: Send>(_future: F) {}
 
     #[test]
-    fn the_http_client_implements_the_seam() {
+    fn the_local_engine_implements_the_seam() {
         fn triage<B: SystemOne>(_backend: &B) {}
 
-        triage(&Client::local().unwrap());
+        let (engine, _log, _calls) = fixtures::engine(vec![vec![1.0, 0.0]]);
+        triage(&engine);
     }
 
     #[test]
     fn the_returned_futures_can_be_sent_across_threads() {
-        // The `+ Send` in the trait is what lets a caller tokio::spawn a
-        // request. Building a future sends nothing, so this needs no server.
-        let client = Client::local().unwrap();
+        // The `+ Send` in the trait is what lets a caller tokio::spawn a request.
+        // Building a future runs nothing, so this needs no weights.
+        let (engine, _log, _calls) = fixtures::engine(vec![vec![1.0, 0.0]]);
         let request = a_request();
 
-        assert_send(SystemOne::system_one(&client, &request));
-        assert_send(SystemOne::system_one_separate(&client, &request));
+        assert_send(SystemOne::system_one(&engine, &request));
+        assert_send(SystemOne::system_one_separate(&engine, &request));
     }
 
     #[test]
     fn the_inherent_methods_still_win_for_existing_callers() {
-        // Client keeps its own system_one, so importing the trait cannot
+        // The engine keeps its own system_one, so importing the trait cannot
         // change which method existing code calls.
-        let client = Client::local().unwrap();
+        let (engine, _log, _calls) = fixtures::engine(vec![vec![1.0, 0.0]]);
 
-        assert_send(client.system_one(&a_request()));
+        assert_send(engine.system_one(&a_request()));
     }
 }

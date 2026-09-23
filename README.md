@@ -1,14 +1,13 @@
 # kevexample — Kev in Rust
 
-Ein Rust-Client **und** eine vollständige lokale Inferenz-Engine für
+Eine vollständige lokale Inferenz-Engine für
 [Kev](https://github.com/jaredpalmer/kev), die kleinen Entscheidungsmodelle, die
 TypeSafe's [System One](https://docs.typesafe.ai/api)-API sprechen.
 
-Zwei Wege, dieselbe API:
-
-- **Über HTTP** gegen einen laufenden Kev-Server (Python).
-- **Lokal im eigenen Prozess** — Prompt, Forward-Pass und Readout in Rust, ohne
-  Server und ohne Python. Das ist der größere Teil dieses Repos.
+Prompt, Forward-Pass und Readout laufen in Rust im eigenen Prozess — **ohne
+Server und ohne Python**. Kev selbst ist Python; gebraucht wird es hier nur noch
+für eine Sache, nämlich den Vergleich der Zahlen mit der Referenz (siehe *Stand
+und Grenzen*).
 
 Das einzige Crate liegt in [`kev-client/`](kev-client/); das Wurzelverzeichnis ist
 kein Cargo-Workspace, `cargo`-Befehle laufen also aus `kev-client/`. Die
@@ -49,7 +48,7 @@ Danach beantwortest du Anfragen direkt:
 
 ```bash
 cd kev-client
-cargo run --release --no-default-features --features candle --example decide -- \
+cargo run --release --example decide -- \
     --base ~/models/qwen-qwen3-0.6b-base --checkpoint ~/models/kev-0.6b \
     --state "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card."
 ```
@@ -85,7 +84,7 @@ geht auf stderr, Antworten auf stdout.
 
 ```toml
 [dependencies]
-kev-client = { path = "kev-client", default-features = false, features = ["candle"] }
+kev-client = { path = "kev-client" }
 ```
 
 ```rust
@@ -111,33 +110,32 @@ let request = SystemOneRequest::new("Schuhe zwei Wochen zu spät und in der fals
 let response = engine.system_one_blocking(&request)?;   // oder .system_one(..).await
 ```
 
-Gegen einen Server statt lokal: `Client::local()` bzw. `Client::new(url)` mit dem
-Feature `http` — dieselben Typen, dieselbe `SystemOne`-Trait-Naht, so dass beide
-Backends austauschbar sind.
+Ein asynchroner Aufrufer nimmt `engine.system_one(&request).await` — das schiebt
+den Pass vom Runtime-Thread weg, weil ein Forward-Pass CPU-gebunden ist.
+`LocalEngine` ist billig zu klonen, und Klone teilen das eine geladene Modell.
 
 ## Features
 
 | Feature | Was es bringt | Kosten |
 |---|---|---|
-| `http` (Standard) | `Client` über reqwest | reqwest, rustls |
-| `local` | Prompt, Token-Layout, Pointer-Head, `LocalEngine` | tokio (nur `spawn_blocking`) |
-| `candle` | das Modell selbst: beide Qwen-Generationen | candle 0.9, tokenizers, zip |
+| `candle` (Standard) | das Modell selbst: beide Qwen-Generationen | candle 0.9, tokenizers, zip |
+| `local` | Prompt, Token-Layout, Pointer-Head, `LocalEngine`; `Forward` bleibt dir | tokio (nur `spawn_blocking`) |
+| — | die Wire-Format-Typen, die Fehler, die `SystemOne`-Naht | nichts |
 
-Die Typen, die Fehler und die `SystemOne`-Naht bauen **ohne jedes** Feature. Eine
-lokale Installation trägt also keinen HTTP-Stack mit sich, und umgekehrt. MSRV ist
-1.75 ohne `candle`, mit `candle` dessen eigener Wert.
+Ohne jedes Feature (`--no-default-features`) bleibt also genau das, was ein
+Aufrufer braucht, um mit etwas anderem zu reden — oder um eine Aufzeichnung zu
+halten. MSRV ist 1.75 ohne `candle`, mit `candle` dessen eigener Wert.
 
 ## Beispiele
 
-Alle in `kev-client/examples/`, alle mit `--features candle` außer `triage`:
+Alle in `kev-client/examples/`:
 
 | Beispiel | Wofür | Braucht |
 |---|---|---|
-| `decide` | Anfragen lokal beantworten — der Server-Job im eigenen Prozess | Checkpoint |
+| `decide` | Anfragen beantworten — der Server-Job im eigenen Prozess | Checkpoint |
 | `sanity` | prüft die Engine gegen sich selbst und gegen eindeutige Fälle | Checkpoint |
 | `measure` | f16 gegen f32, Prefix-Cache, Chunking, Batching — mit Kontrollzeilen | Checkpoint |
 | `parity` | vergleicht jede Wahrscheinlichkeit mit einer aufgezeichneten Server-Antwort | Aufzeichnung |
-| `triage` | dasselbe Ticket über HTTP | Server (`--features http`) |
 
 ## Skripte
 
@@ -146,7 +144,6 @@ scripts/test.sh                                 # fmt, clippy, Tests, Feature-Ma
 scripts/local.sh                                # die Offline-Suite allein
 scripts/local.sh --fetch jaredpalmer/kev-0.6b   # Checkpoint holen, dann alles prüfen
 scripts/local.sh --checkpoint <dir> --measure   # dazu die Zeitmessungen
-scripts/triage.sh "Mein Paket ist nie angekommen."   # gegen einen Server
 ```
 
 `scripts/local.sh --help` listet den Rest. `KEV_HF` zeigt die Downloads auf einen
@@ -158,9 +155,9 @@ Alle offline, keiner braucht einen Server oder Gewichte:
 
 ```bash
 cd kev-client
-cargo test --no-default-features --features candle   # 80
-cargo test --no-default-features --features local    # 47
-cargo test --no-default-features                     # 14
+cargo test                                    # 83
+cargo test --no-default-features --features local   # 50
+cargo test --no-default-features              # 14
 ```
 
 Wo die Erwartungen herkommen, ist der Punkt: beide Forward-Pässe werden gegen

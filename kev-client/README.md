@@ -1,63 +1,58 @@
 # kev-client
 
-A Rust client for [Kev](https://github.com/jaredpalmer/kev) — small decision
-models you run yourself. Kev implements TypeSafe's
-[System One](https://docs.typesafe.ai/api) API, so this client works against
-either.
+[Kev](https://github.com/jaredpalmer/kev) in Rust — small decision models you run
+yourself, in this process. Kev implements TypeSafe's
+[System One](https://docs.typesafe.ai/api) API, and this crate answers the same
+requests locally: no server, and no Python.
 
-You send a **state** (a ticket, a document, any text) plus a set of
+You hand it a **state** (a ticket, a document, any text) plus a set of
 **questions**, and get back probabilities rather than a single label. The
 questions share the state but cannot read each other.
-
-## Start a server
-
-Kev itself is Python. From a checkout of the Kev repo:
-
-```bash
-uv sync --extra serve
-uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b --port 8009
-```
-
-The first run downloads the adapter and the base model.
 
 ## Use it
 
 ```toml
 [dependencies]
 kev-client = { path = "../kev-client" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ```rust
-use kev_client::{Choice, Client, Noul, Score, SystemOneRequest};
+use std::path::Path;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::local()?;
+use kev_client::{pointer_head, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest};
 
-    let response = client
-        .system_one(
-            &SystemOneRequest::new(
-                "Shoes arrived two weeks late and in the wrong size. \
-                 Also I see two charges on my card.",
-            )
-            .ask(
-                "department",
-                Choice::new("Which team should handle this?")
-                    .option("returns", "Exchanges, refunds, wrong or damaged items")
-                    .option("shipping", "Delivery status, delays, lost packages")
-                    .option("billing", "Charges, invoices, payment problems"),
-            )
-            .ask("escalate", Noul::new("Does this need urgent human attention?"))
-            .ask(
-                "frustration",
-                Score::new("How frustrated is the customer?")
-                    .level("Calm")
-                    .level("Frustrated")
-                    .level("Very angry"),
-            ),
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let base = Path::new("models/qwen3-0.6b-base");
+    let checkpoint = Path::new("models/kev-0.6b");
+
+    // The base model with the checkpoint's adapter, and the checkpoint's own
+    // pointer head: the two halves of a Kev model.
+    let engine = LocalEngine::new(
+        Backend::open(base, Some(checkpoint))?,
+        pointer_head(&checkpoint.join("head.pt"))?,
+    );
+
+    let response = engine.system_one_blocking(
+        &SystemOneRequest::new(
+            "Shoes arrived two weeks late and in the wrong size. \
+             Also I see two charges on my card.",
         )
-        .await?;
+        .ask(
+            "department",
+            Choice::new("Which team should handle this?")
+                .option("returns", "Exchanges, refunds, wrong or damaged items")
+                .option("shipping", "Delivery status, delays, lost packages")
+                .option("billing", "Charges, invoices, payment problems"),
+        )
+        .ask("escalate", Noul::new("Does this need urgent human attention?"))
+        .ask(
+            "frustration",
+            Score::new("How frustrated is the customer?")
+                .level("Calm")
+                .level("Frustrated")
+                .level("Very angry"),
+        ),
+    )?;
 
     let department = response.answer("department").unwrap();
     println!("{:?} {:?}", department.as_choice(), department.top());
@@ -65,6 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+An async caller uses `engine.system_one(&request).await` instead, which moves the
+pass off the runtime thread — a forward pass is CPU-bound and has no business on
+one. `LocalEngine` is cheap to clone, and clones share the one loaded model.
 
 Kev can also be trained to lay each option out as a sub-branch of its own, so
 that an option's representation cannot depend on which options came before it.
@@ -91,35 +90,33 @@ the answer.
 Option order is part of the request and can change the answer, so options and
 questions keep the order you add them in.
 
-## Run the example
+## The examples
 
-```bash
-cargo run --example triage
-cargo run --example triage -- "My parcel never arrived and nobody answers."
-```
+| Example | For | Needs |
+|---|---|---|
+| `decide` | answering requests — the server's job in this process | a checkpoint |
+| `sanity` | the engine against itself, and against tickets whose answer is not in doubt | a checkpoint |
+| `measure` | f16 against f32, the prefix cache, chunking, batching | a checkpoint |
+| `parity` | every probability against a recorded server response | a recording |
 
-`KEV_BASE_URL`, `KEV_MODEL` and `KEV_API_KEY` override the defaults
-(`http://127.0.0.1:8009`, `kev-latest`, no auth). Set `KEV_API_KEY` when the
-server runs with one — Kev then requires `Authorization: Bearer <key>` on
-`/v1/*`.
+## What it answers
 
-## Endpoints covered
-
-| Method | Path | Client | Local engine |
-|---|---|---|---|
-| `POST` | `/v1/systemone` | `system_one` | `system_one` |
-| `POST` | `/v1/systemone/separate` | `system_one_separate` | `system_one_separate` |
-| `POST` | `/v1/systemone/permute` | `permute` — raw JSON, the shape is not documented | `permute`, the same shape |
-| `GET` | `/v1/models` | `models` — raw JSON, same reason | — |
+| The Python's endpoint | Here |
+|---|---|
+| `POST /v1/systemone` | `system_one`, `system_one_blocking` |
+| `POST /v1/systemone/separate` | `system_one_separate`, `system_one_separate_blocking` |
+| `POST /v1/systemone/permute` | `permute`, `permute_blocking` — raw JSON, since that envelope is not documented |
 
 `permute` runs one `choice` question under several option orders and reports how
 far each probability travelled (`spread`) and whether the winner ever changed
 (`argmax_stable`) — the question of whether option order moves the answer, which
-it can. The local engine answers it in the same JSON shape, so the two backends
-swap; the first run keeps the order as given, the rest are shuffled from a seed,
+it can. The first run keeps the order as given, the rest are shuffled from a seed,
 and every run repeats the same state, so only the first pays for it.
 
-## Without a server (features `local`, `candle`)
+Several requests at once are `system_one_batch_blocking`, which has no endpoint
+behind it: it is what a server would call for a batch it collected itself.
+
+## Inside the engine (features `local`, `candle`)
 
 `LocalEngine` answers the same requests in this process: it builds Kev's prompt,
 runs one forward pass and reads the answers off the pointer head.
@@ -143,7 +140,7 @@ There is a command-line front end for it too, which is the whole server's job
 done in process — no HTTP, no Python:
 
 ```bash
-cargo run --release --features candle --example decide -- \
+cargo run --release --example decide -- \
     --base ~/models/qwen3-4b-base --checkpoint ~/models/kev-4b \
     --state "Shoes arrived two weeks late and in the wrong size. \
              Also I see two charges on my card."
@@ -209,7 +206,7 @@ All of this is measurable on your own checkpoint rather than on the fixtures —
 what the prefix, its cache and f16 are worth on the weights you will serve:
 
 ```bash
-cargo run --release --features candle --example measure -- \
+cargo run --release --example measure -- \
     --base <base> --checkpoint <kev> [--words 400] [--repeat 3] [--batch 4]
 ```
 
@@ -255,7 +252,7 @@ compares every probability with a recorded server response.
 KEV_DTYPE=fp32 uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b@qwen3 --port 8009
 curl -s localhost:8009/v1/systemone -H 'content-type: application/json' -d @request.json > server.json
 
-cargo run --features candle --example parity -- \
+cargo run --release --example parity -- \
     --base <the base model directory> --checkpoint <the kev checkpoint> \
     --request request.json --server server.json
 ```
@@ -264,7 +261,7 @@ Without a server — and without Python — two things are still checkable, and
 `examples/sanity.rs` runs both against a real checkpoint:
 
 ```bash
-cargo run --features candle --example sanity -- \
+cargo run --release --example sanity -- \
     --base <the base model directory> --checkpoint <the kev checkpoint>
 ```
 
@@ -328,11 +325,16 @@ let head = PointerHead::new(query, key)?.with_temperature(2.3)?;
 let engine = LocalEngine::new(backbone, head);
 ```
 
-A local-only build carries no HTTP stack:
+The model is the default feature. A build that only wants the wire-format types,
+the errors and the `SystemOne` seam — to talk to something else, or to hold a
+recording — turns it off:
 
 ```toml
-kev-client = { path = "../kev-client", default-features = false, features = ["candle"] }
+kev-client = { path = "../kev-client", default-features = false }
 ```
+
+`--features local` sits between the two: the prompt, the layout and the readout,
+with `Forward` left to you.
 
 ## Tests
 
@@ -341,10 +343,10 @@ cargo test
 ```
 
 The tests check the request and response shapes against the worked example in
-the Kev README; they need no server. With the `candle` feature they also run the
-backbone over a checkpoint they write themselves. Two checks want a real Qwen
+the Kev README, and run the backbone over a checkpoint they write themselves.
+Nothing needs a server, weights or a network. Two checks want a real Qwen
 tokenizer, which is not vendored here:
 
 ```bash
-KEV_TOKENIZER=/path/to/tokenizer.json cargo test --features candle
+KEV_TOKENIZER=/path/to/tokenizer.json cargo test
 ```
