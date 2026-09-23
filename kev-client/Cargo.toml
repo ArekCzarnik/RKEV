@@ -11,9 +11,15 @@ license = "Apache-2.0"
 # Question and option order is part of the request and can move the answer,
 # so maps have to keep insertion order.
 indexmap = { version = "2", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[features]
+default = ["http"]
+# Talking to a Kev server over HTTP. Turn it off for a build that only uses a
+# local inference engine; `SystemOne`, the types and the errors stay available.
+http = ["dep:reqwest"]
 
 [dev-dependencies]
 serde_json = "1"
@@ -21,3 +27,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [[example]]
 name = "triage"
+required-features = ["http"]

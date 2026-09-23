@@ -14,9 +14,10 @@
 //! Then:
 //!
 //! ```no_run
+//! # #[cfg(feature = "http")]
+//! # async fn run() -> Result<(), kev_client::Error> {
 //! use kev_client::{Choice, Client, Noul, Score, SystemOneRequest};
 //!
-//! # async fn run() -> Result<(), kev_client::Error> {
 //! let client = Client::local()?;
 //!
 //! let response = client
@@ -50,11 +51,13 @@
 //! # }
 //! ```
 
+#[cfg(feature = "http")]
 mod client;
 mod error;
 mod system_one;
 mod types;
 
+#[cfg(feature = "http")]
 pub use client::{Client, DEFAULT_BASE_URL, DEFAULT_MODEL};
 pub use error::{Error, Result};
 pub use system_one::SystemOne;

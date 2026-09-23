@@ -6,6 +6,7 @@ pub enum Error {
     /// The base URL was not an absolute `http://` or `https://` URL.
     InvalidBaseUrl(String),
     /// The request never completed (connection refused, timeout, TLS, ...).
+    #[cfg(feature = "http")]
     Transport(reqwest::Error),
     /// The server answered with a non-2xx status. Kev returns `422` for
     /// invalid requests, `401` when `KEV_API_KEY` is set and the bearer
@@ -49,6 +50,7 @@ impl fmt::Display for Error {
             Error::InvalidBaseUrl(url) => {
                 write!(f, "base url must start with http:// or https://, got {url:?}")
             }
+            #[cfg(feature = "http")]
             Error::Transport(e) => write!(f, "request to the kev server failed: {e}"),
             Error::Api {
                 status,
@@ -71,6 +73,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            #[cfg(feature = "http")]
             Error::Transport(e) => Some(e),
             Error::Decode { source, .. } => Some(source),
             _ => None,
@@ -78,6 +81,7 @@ impl std::error::Error for Error {
     }
 }
 
+#[cfg(feature = "http")]
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {
         Error::Transport(e)

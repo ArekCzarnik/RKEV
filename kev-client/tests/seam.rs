@@ -72,6 +72,7 @@ async fn the_separate_call_goes_through_the_same_seam() {
     assert_eq!(response.model, "stub");
 }
 
+#[cfg(feature = "http")]
 mod over_http {
     use super::a_request;
     use kev_client::{Client, SystemOne};
