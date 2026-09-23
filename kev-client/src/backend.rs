@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -137,7 +137,36 @@ impl Backend {
     }
 
     /// As [`Backend::open`], on a device of your choosing.
+    ///
+    /// The precision follows the device, as `kev.serve` does it: bf16 on a GPU,
+    /// where it halves the memory and the reported difference is about 0.01 on a
+    /// probability, and f32 on the CPU, where bf16 buys nothing because the
+    /// arithmetic is emulated. [`Backend::with_dtype`] overrides it, and f32 is
+    /// what every published number was measured at.
     pub fn open_on(base: &Path, adapter: Option<&Path>, device: Device) -> Result<Self> {
+        let dtype = if device.is_cpu() {
+            DType::F32
+        } else {
+            DType::BF16
+        };
+        Self::open_as(base, adapter, device, dtype)
+    }
+
+    /// As [`Backend::open_on`], in a precision of your choosing.
+    pub fn open_as(
+        base: &Path,
+        adapter: Option<&Path>,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        // candle's CPU backend has no bf16 matmul (f16, f32 and f64 only), so
+        // this would otherwise fail on the first projection, several layers deep,
+        // with nothing to say about what to do instead.
+        if dtype == DType::BF16 && device.is_cpu() {
+            return Err(Error::Engine(String::from(
+                "candle has no bf16 matmul on the CPU: use f32 there, which is the                  exact path anyway, or f16 for half the memory",
+            )));
+        }
         let path = tokenizer_path(base, adapter)?;
         let mut tokenizer = Tokenizer::from_file(&path)
             .map_err(|e| Error::Engine(format!("cannot read {}: {e}", path.display())))?;
@@ -161,9 +190,9 @@ impl Backend {
             .as_ref()
             .is_some_and(|types| types.iter().any(|kind| kind == "linear_attention"));
         let model = if hybrid {
-            Model::Hybrid(qwen3_5::Backbone::load(base, adapter, &device)?)
+            Model::Hybrid(qwen3_5::Backbone::load(base, adapter, &device, dtype)?)
         } else {
-            Model::Attention(qwen3::Backbone::load(base, adapter, &device)?)
+            Model::Attention(qwen3::Backbone::load(base, adapter, &device, dtype)?)
         };
 
         Ok(Self {
@@ -255,6 +284,35 @@ impl Backend {
         }
     }
 
+    /// What the backbone runs in. The adapter was merged in f32 before the cast,
+    /// and the delta rule, the gated norm and the pointer head stay in f32.
+    pub fn dtype(&self) -> DType {
+        match &self.model {
+            Model::Attention(model) => model.dtype(),
+            Model::Hybrid(model) => model.dtype(),
+        }
+    }
+
+    /// Reload the weights in another precision.
+    ///
+    /// bf16 halves the memory and is what `kev.serve` serves on a GPU; f32 is the
+    /// path every published number was measured at. On a CPU bf16 is slower, not
+    /// faster: nothing there has bf16 arithmetic, so it is emulated.
+    pub fn with_dtype(self, base: &Path, adapter: Option<&Path>, dtype: DType) -> Result<Self> {
+        let Self {
+            device,
+            prefix,
+            prefix_min,
+            cache,
+            ..
+        } = self;
+        let mut reloaded = Self::open_as(base, adapter, device, dtype)?;
+        reloaded.prefix = prefix;
+        reloaded.prefix_min = prefix_min;
+        reloaded.cache.keep = cache.keep;
+        Ok(reloaded)
+    }
+
     /// Whether this checkpoint's base carries recurrent layers, and so answers
     /// one question per row.
     pub fn is_hybrid(&self) -> bool {
@@ -301,6 +359,7 @@ impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Backend")
             .field("hidden_size", &self.hidden_size())
+            .field("dtype", &self.dtype())
             .field("hybrid", &self.is_hybrid())
             .finish_non_exhaustive()
     }
@@ -450,6 +509,7 @@ impl Forward for Backend {
                     pass.ids.len(),
                     |query, key| pass.attends(query, key),
                     &self.device,
+                    self.dtype(),
                 )?;
                 let hidden = model.forward(pass.ids, pass.positions, &mask)?;
                 self.pick(&hidden, pass.readout)
@@ -468,6 +528,7 @@ impl Forward for Backend {
                         row.ids.len(),
                         |query, key| row.attends(query, key),
                         &self.device,
+                        self.dtype(),
                     )?;
                     let hidden = model.forward(row.ids, row.positions, &mask)?;
                     states.extend(self.pick(&hidden, row.readout)?);

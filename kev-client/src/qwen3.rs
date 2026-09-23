@@ -177,6 +177,7 @@ pub struct Backbone {
     layers: Vec<Layer>,
     norm: Tensor,
     device: Device,
+    dtype: DType,
 }
 
 struct Layer {
@@ -199,9 +200,14 @@ impl Backbone {
     /// `base` is a directory of safetensors plus `config.json`; `adapter` is a
     /// PEFT adapter directory (`adapter_config.json`,
     /// `adapter_model.safetensors`), which is what a Kev checkpoint ships.
-    pub fn load(base: &Path, adapter: Option<&Path>, device: &Device) -> Result<Self> {
+    pub fn load(
+        base: &Path,
+        adapter: Option<&Path>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
         let config = Config::read(base)?;
-        let weights = Weights::open(base, adapter, device)?;
+        let weights = Weights::open(base, adapter, device, dtype)?;
 
         let layers = (0..config.num_hidden_layers)
             .map(|index| {
@@ -231,7 +237,13 @@ impl Backbone {
             layers,
             config,
             device: device.clone(),
+            dtype,
         })
+    }
+
+    /// What the backbone runs in.
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     pub fn config(&self) -> &Config {
@@ -251,7 +263,7 @@ impl Backbone {
     /// where it may not.
     pub fn forward(&self, ids: &[u32], positions: &[u32], mask: &Tensor) -> Result<Tensor> {
         let (hidden, _) = self.run(&[(ids, positions)], mask, None)?;
-        Ok(hidden.i(0)?)
+        Ok(hidden.i(0)?.to_dtype(DType::F32)?)
     }
 
     /// Run the state tokens and keep what a branch needs to continue from them.
@@ -262,7 +274,12 @@ impl Backbone {
     /// state too. This is the same reuse `kev.serve` does, and exact for the
     /// same reason.
     pub fn prefill(&self, ids: &[u32], positions: &[u32]) -> Result<Prefix> {
-        let mask = attention_mask(ids.len(), |query, key| key <= query, &self.device)?;
+        let mask = attention_mask(
+            ids.len(),
+            |query, key| key <= query,
+            &self.device,
+            self.dtype,
+        )?;
         let (_, layers) = self.run(&[(ids, positions)], &mask, None)?;
         Ok(Prefix {
             tokens: ids.to_vec(),
@@ -279,7 +296,7 @@ impl Backbone {
             return Ok(Vec::new());
         }
         let (ids, positions, lengths, padded) = pad_rows(rows);
-        let mask = prefill_batch_mask(&lengths, padded, &self.device)?;
+        let mask = prefill_batch_mask(&lengths, padded, &self.device, self.dtype)?;
         let batched: Vec<(&[u32], &[u32])> = (0..rows.len())
             .map(|row| {
                 (
@@ -338,7 +355,13 @@ impl Backbone {
         rows: &[(&[u32], &[u32])],
     ) -> Result<Vec<Tensor>> {
         let (ids, positions, lengths, padded) = pad_rows(rows);
-        let mask = branch_batch_mask(prefix.tokens.len(), &lengths, padded, &self.device)?;
+        let mask = branch_batch_mask(
+            prefix.tokens.len(),
+            &lengths,
+            padded,
+            &self.device,
+            self.dtype,
+        )?;
         let batched: Vec<(&[u32], &[u32])> = (0..rows.len())
             .map(|row| {
                 (
@@ -351,7 +374,7 @@ impl Backbone {
         lengths
             .iter()
             .enumerate()
-            .map(|(row, length)| Ok(hidden.i(row)?.narrow(0, 0, *length)?))
+            .map(|(row, length)| Ok(hidden.i(row)?.narrow(0, 0, *length)?.to_dtype(DType::F32)?))
             .collect()
     }
 
@@ -392,10 +415,16 @@ impl Backbone {
             .embed_tokens
             .index_select(&tokens, 0)?
             .reshape((batch, len, self.config.hidden_size))?
-            .to_dtype(DType::F32)?;
+            .to_dtype(self.dtype)?;
 
         let dim = self.config.head_dim();
-        let (cos, sin) = rotary_tables(&positions, dim, self.config.rope_theta()?, &self.device)?;
+        let (cos, sin) = rotary_tables(
+            &positions,
+            dim,
+            self.config.rope_theta()?,
+            &self.device,
+            self.dtype,
+        )?;
         let cos = cos.reshape((batch, len, dim / 2))?;
         let sin = sin.reshape((batch, len, dim / 2))?;
 
@@ -468,7 +497,9 @@ impl Backbone {
         let scores = (q.matmul(&repeat_kv(&keys, repeats)?.transpose(2, 3)?)? * scale)?;
         // The mask is what keeps one question from reading another.
         let scores = scores.broadcast_add(mask)?;
-        let weights = candle_nn::ops::softmax_last_dim(&scores)?;
+        // The reference takes the softmax in f32 whatever the backbone runs in.
+        let weights = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
+            .to_dtype(self.dtype)?;
 
         let out = weights
             .matmul(&repeat_kv(&values, repeats)?)?

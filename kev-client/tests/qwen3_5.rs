@@ -1096,3 +1096,91 @@ fn how_much_batching_the_prefills_saves() {
         }
     }
 }
+
+#[test]
+fn a_reduced_precision_backbone_answers_close_to_the_exact_one() {
+    use candle_core::{DType, Device};
+
+    // Reduced precision is what `kev.serve` serves on a GPU, in bf16. candle has
+    // no bf16 matmul on a CPU, so what can be run here is f16 — the same path
+    // through the same code, and the same question: how far the answers move. On
+    // the released checkpoints the reference reports at most 0.017 with no change
+    // of answer; the weights here are noise, so this measures rather than claims.
+    let fixture = checkpoint("half", false, false);
+    let head = || pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
+    let request = SystemOneRequest::new("a ticket about money late shoes a ticket about money")
+        .ask("money", Noul::new("is this about money ?"))
+        .ask("late", Noul::new("is this late ?"));
+
+    let exact = Backend::open(&fixture.dir, None).unwrap();
+    assert_eq!(
+        exact.dtype(),
+        DType::F32,
+        "the CPU default is the exact path"
+    );
+    let half = Backend::open_as(&fixture.dir, None, Device::Cpu, DType::F16).unwrap();
+    assert_eq!(half.dtype(), DType::F16);
+
+    let exact = LocalEngine::new(exact, head())
+        .system_one_blocking(&request)
+        .unwrap();
+    let half = LocalEngine::new(half, head())
+        .system_one_blocking(&request)
+        .unwrap();
+
+    for id in ["money", "late"] {
+        let difference = (probability(&exact, id) - probability(&half, id)).abs();
+        assert!(
+            difference < 0.01,
+            "{id}: {} in f32, {} in f16",
+            probability(&exact, id),
+            probability(&half, id)
+        );
+    }
+}
+
+#[test]
+fn bf16_on_a_cpu_says_what_to_do_instead() {
+    use candle_core::{DType, Device};
+
+    let fixture = checkpoint("bf16-cpu", false, false);
+
+    let error = Backend::open_as(&fixture.dir, None, Device::Cpu, DType::BF16).unwrap_err();
+
+    assert!(error.to_string().contains("no bf16 matmul"), "{error}");
+}
+
+#[test]
+#[ignore = "a measurement, not an assertion: cargo test --release -- --ignored --nocapture"]
+fn what_reduced_precision_costs_on_a_cpu() {
+    use candle_core::{DType, Device};
+    use std::time::Instant;
+
+    // On a GPU bf16 halves the memory and the time, which is why `kev.serve`
+    // serves it there. On a CPU candle has no bf16 matmul at all, and f16 is the
+    // reduced precision it can run: this says what that costs, with no cache, so
+    // the state is paid for every time.
+    let dir = wide_checkpoint("precision");
+    let state = "a ticket about money late shoes ".repeat(85);
+    let request = SystemOneRequest::new(state)
+        .ask("money", Noul::new("is this about money ?"))
+        .ask("late", Noul::new("is this late ?"));
+
+    for dtype in [DType::F32, DType::F16] {
+        let backend = Backend::open_as(&dir, None, Device::Cpu, dtype)
+            .unwrap()
+            .with_prefix_cache(0);
+        let engine = LocalEngine::new(
+            backend,
+            pointer_head(&dir.join("head.safetensors")).unwrap(),
+        );
+        engine.system_one_blocking(&request).unwrap(); // warm up
+        let started = Instant::now();
+        let answered = engine.system_one_blocking(&request).unwrap();
+        println!(
+            "{dtype:?}: {:>8.1} ms  ({} tokens in, 128-wide heads)",
+            started.elapsed().as_secs_f64() * 1000.0,
+            answered.usage.input_tokens
+        );
+    }
+}

@@ -359,6 +359,37 @@ The chunk size is `with_chunk_size` now, default 64, a power of two because the
 block-by-block triangular inverse halves it down to one. The transcription test
 runs at 2, 8 and 64, on a long row and a short one.
 
+## Done: precision, bf16 for serving
+
+Commit "Serve in bf16 where it exists, keep f32 exact".
+
+The backbone runs in whatever `Backend::open_as` is given, and `open_on` picks it
+the way `kev.serve` does: **bf16 on a GPU, f32 on the CPU**. What stays f32
+whatever the backbone runs in, because the reference keeps it there: the LoRA
+merge (before the cast — in bf16 that lands closer to the f32 numbers than merging
+after), the softmax, the whole delta rule with its decay and write strength, the
+DeltaNet's gated norm and its `A_log`/`dt_bias`, the hidden states handed back,
+and the pointer head.
+
+**candle has no bf16 matmul on the CPU** (f16, f32, f64 only), so asking for it
+there is refused with a message that says what to use instead, rather than failing
+several layers deep in a projection. f16 is the reduced precision a CPU can run,
+and it goes through exactly the same code.
+
+Measured on the wide fixture, one request of 536 tokens, no cache:
+
+| | |
+|---|---|
+| f32 | 707 ms |
+| f16 | 567 ms |
+
+and both backbones have a test asserting f16 answers stay within 0.01 of f32.
+f32 remains the CPU default anyway: it is the path every published number was
+measured at, and this is a model whose whole output is a calibrated probability.
+
+Not documented yet: CLAUDE.md and the README still describe the engine as f32
+only. That is the next small thing to do.
+
 ## Left to do
 
 1. **Parity — the tool is there, it has not been run.** `examples/parity.rs`
@@ -373,10 +404,10 @@ runs at 2, 8 and 64, on a long row and a short one.
    come along. A real `head.pt` is part of what it exercises: the fixture here is
    in torch's shape, but only torch writes the real thing.
 2. **Performance, what is left of it.** The prefix, the batched branches, the
-   chunked delta rule and the batched prefills are in (below). Still open:
-   everything is f32 on the CPU unless a caller passes a device, nothing is
-   quantised, and a *server* would want to collect concurrent requests into a
-   batch itself — `system_one_batch_blocking` is the call it would make, not the
+   chunked delta rule, the batched prefills and the precision knob are in
+   (below). Still open: nothing is quantised, no device other than the CPU has
+   been run at all, and a *server* would want to collect concurrent requests into
+   a batch itself — `system_one_batch_blocking` is the call it would make, not the
    queue in front of it.
 3. `permute`, and `option_isolation` if a checkpoint ever serves with it.
 

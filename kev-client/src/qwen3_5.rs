@@ -194,6 +194,7 @@ pub struct Backbone {
     layers: Vec<Layer>,
     norm: Tensor,
     device: Device,
+    dtype: DType,
     /// Whether the delta rule runs in chunks; `None` decides per request. See
     /// [`Backbone::with_chunked_recurrence`].
     chunked: Option<bool>,
@@ -243,9 +244,14 @@ struct DeltaNet {
 
 impl Backbone {
     /// Load a base model, optionally with a Kev adapter merged into it.
-    pub fn load(base: &Path, adapter: Option<&Path>, device: &Device) -> Result<Self> {
+    pub fn load(
+        base: &Path,
+        adapter: Option<&Path>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
         let config = Config::read(base)?;
-        let weights = Weights::open(base, adapter, device)?;
+        let weights = Weights::open(base, adapter, device, dtype)?;
 
         let layers = (0..config.num_hidden_layers)
             .map(|index| {
@@ -253,10 +259,12 @@ impl Backbone {
                 let mixer = if config.layer_types[index] == "linear_attention" {
                     Mixer::Recurrence(DeltaNet {
                         conv1d: weights.plain(&format!("{layer}.linear_attn.conv1d.weight"))?,
-                        dt_bias: weights.plain(&format!("{layer}.linear_attn.dt_bias"))?,
-                        a_log: weights.plain(&format!("{layer}.linear_attn.A_log"))?,
+                        // These three stay f32: the reference computes the decay
+                        // and the gated norm in f32 whatever the backbone runs in.
+                        dt_bias: weights.plain_f32(&format!("{layer}.linear_attn.dt_bias"))?,
+                        a_log: weights.plain_f32(&format!("{layer}.linear_attn.A_log"))?,
                         // Ones-centred, unlike every other norm in this model.
-                        norm: weights.plain(&format!("{layer}.linear_attn.norm.weight"))?,
+                        norm: weights.plain_f32(&format!("{layer}.linear_attn.norm.weight"))?,
                         in_proj_qkv: weights
                             .adapted(&format!("{layer}.linear_attn.in_proj_qkv"))?,
                         in_proj_z: weights.adapted(&format!("{layer}.linear_attn.in_proj_z"))?,
@@ -292,9 +300,16 @@ impl Backbone {
             layers,
             config,
             device: device.clone(),
+            dtype,
             chunked: None,
             chunk: CHUNK,
         })
+    }
+
+    /// What the backbone runs in. The delta rule, the gated norm and the pointer
+    /// head stay in f32 regardless, as they do in the reference.
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     /// Force the chunked form of the delta rule on or off.
@@ -344,12 +359,17 @@ impl Backbone {
     /// [`Pass::rows`](crate::Pass::rows) produces.
     pub fn forward(&self, ids: &[u32], positions: &[u32], mask: &Tensor) -> Result<Tensor> {
         let (hidden, _) = self.run(&[(ids, positions)], mask, None, None)?;
-        Ok(hidden.i(0)?)
+        Ok(hidden.i(0)?.to_dtype(DType::F32)?)
     }
 
     /// Run the state tokens and keep what a branch needs to continue from them.
     pub fn prefill(&self, ids: &[u32], positions: &[u32]) -> Result<Prefix> {
-        let mask = attention_mask(ids.len(), |query, key| key <= query, &self.device)?;
+        let mask = attention_mask(
+            ids.len(),
+            |query, key| key <= query,
+            &self.device,
+            self.dtype,
+        )?;
         let (_, layers) = self.run(&[(ids, positions)], &mask, None, None)?;
         Ok(Prefix {
             tokens: ids.to_vec(),
@@ -369,7 +389,7 @@ impl Backbone {
             return Ok(Vec::new());
         }
         let (ids, positions, lengths, padded) = pad_rows(rows);
-        let mask = prefill_batch_mask(&lengths, padded, &self.device)?;
+        let mask = prefill_batch_mask(&lengths, padded, &self.device, self.dtype)?;
         let batched: Vec<(&[u32], &[u32])> = (0..rows.len())
             .map(|row| {
                 (
@@ -436,7 +456,7 @@ impl Backbone {
     ) -> Result<Vec<Tensor>> {
         let (ids, positions, lengths, padded) = pad_rows(rows);
         let state = prefix.tokens.len();
-        let mask = branch_batch_mask(state, &lengths, padded, &self.device)?;
+        let mask = branch_batch_mask(state, &lengths, padded, &self.device, self.dtype)?;
         let batched: Vec<(&[u32], &[u32])> = (0..rows.len())
             .map(|row| {
                 (
@@ -449,7 +469,7 @@ impl Backbone {
         lengths
             .iter()
             .enumerate()
-            .map(|(row, length)| Ok(hidden.i(row)?.narrow(0, 0, *length)?))
+            .map(|(row, length)| Ok(hidden.i(row)?.narrow(0, 0, *length)?.to_dtype(DType::F32)?))
             .collect()
     }
 
@@ -491,7 +511,7 @@ impl Backbone {
             .embed_tokens
             .index_select(&tokens, 0)?
             .reshape((batch, len, self.config.hidden_size))?
-            .to_dtype(DType::F32)?;
+            .to_dtype(self.dtype)?;
 
         // Every row carries its own position ids, so the tables are built per
         // row and the rotary embedding broadcasts over the heads only.
@@ -500,6 +520,7 @@ impl Backbone {
             self.config.rotary_dim(),
             self.config.rope_theta()?,
             &self.device,
+            self.dtype,
         )?;
         let rotary = self.config.rotary_dim() / 2;
         let cos = cos.reshape((batch, len, rotary))?;
@@ -606,7 +627,9 @@ impl Backbone {
         let scale = 1.0 / (dim as f64).sqrt();
         let scores = (q.matmul(&repeat_kv(&keys, repeats)?.transpose(2, 3)?)? * scale)?;
         let scores = scores.broadcast_add(mask)?;
-        let weights = candle_nn::ops::softmax_last_dim(&scores)?;
+        // The reference takes the softmax in f32 whatever the backbone runs in.
+        let weights = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
+            .to_dtype(self.dtype)?;
 
         let out = weights
             .matmul(&repeat_kv(&values, repeats)?)?
@@ -644,7 +667,7 @@ impl Backbone {
         // continuing from a state, it is the tail the prefix kept.
         let window = match past {
             Some((window, _)) => window.expand((batch, channels, kernel - 1))?.contiguous()?,
-            None => Tensor::zeros((batch, channels, kernel - 1), DType::F32, &self.device)?,
+            None => Tensor::zeros((batch, channels, kernel - 1), self.dtype, &self.device)?,
         };
         let inputs = Tensor::cat(&[&window, &projected], 2)?.contiguous()?;
         let mixed = inputs.conv1d(&layer.conv1d, 0, 1, 1, channels)?;
@@ -677,9 +700,11 @@ impl Backbone {
         let z = linear(xs, &layer.in_proj_z)?.reshape((batch, len, value_heads, value_dim))?;
 
         // beta: how strongly this token overwrites the memory. g: how much of
-        // the memory survives it, per head.
-        let beta = candle_nn::ops::sigmoid(&linear(xs, &layer.in_proj_b)?)?;
-        let a = linear(xs, &layer.in_proj_a)?;
+        // the memory survives it, per head. Both in f32, and so is everything
+        // downstream of them: the reference's delta rule casts to f32 first, and
+        // a decay that is multiplied in hundreds of times is no place to round.
+        let beta = candle_nn::ops::sigmoid(&linear(xs, &layer.in_proj_b)?.to_dtype(DType::F32)?)?;
+        let a = linear(xs, &layer.in_proj_a)?.to_dtype(DType::F32)?;
         let decay = (softplus(&a.broadcast_add(&layer.dt_bias)?)?
             .broadcast_mul(&layer.a_log.exp()?)?
             * -1.0)?;
@@ -696,8 +721,8 @@ impl Backbone {
 
         // The key heads are shared: each one serves several value heads.
         let group = value_heads / key_heads;
-        let q = l2_norm(&repeat_interleave(&q, group)?)?;
-        let k = l2_norm(&repeat_interleave(&k, group)?)?;
+        let q = l2_norm(&repeat_interleave(&q, group)?.to_dtype(DType::F32)?)?;
+        let k = l2_norm(&repeat_interleave(&k, group)?.to_dtype(DType::F32)?)?;
         // The reference scales the query by the key width, not the value width.
         let q = (q / (key_dim as f64).sqrt())?;
 
@@ -711,7 +736,7 @@ impl Backbone {
         };
         let q = heads_first(&q, key_dim)?;
         let k = heads_first(&k, key_dim)?;
-        let v = heads_first(&v, value_dim)?;
+        let v = heads_first(&v.to_dtype(DType::F32)?, value_dim)?;
         let beta = flatten(&beta)?;
         let decay = flatten(&decay)?;
 
@@ -737,9 +762,12 @@ impl Backbone {
             .reshape((batch, value_heads, len, value_dim))?
             .transpose(1, 2)?;
 
-        // The output norm is gated by z, and normalises one head at a time.
+        // The output norm is gated by z, and normalises one head at a time — in
+        // f32, then back to the backbone's dtype for the projection out.
         let out = rms_norm(&out, &layer.norm, config.rms_norm_eps)?;
-        let out = (out * candle_nn::ops::silu(&z)?)?.reshape((batch, len, values))?;
+        let out = (out * candle_nn::ops::silu(&z.to_dtype(DType::F32)?)?)?
+            .reshape((batch, len, values))?
+            .to_dtype(self.dtype)?;
         Ok((linear(&out, &layer.out_proj)?, kept_window, state))
     }
 

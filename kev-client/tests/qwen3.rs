@@ -928,3 +928,35 @@ fn a_batch_prefills_each_state_once_however_many_requests_want_it() {
     backend.hidden_batch(&passes).unwrap();
     assert_eq!(backend.prefix_hits(), (4, 2));
 }
+
+#[test]
+fn a_reduced_precision_backbone_answers_close_to_the_exact_one() {
+    use candle_core::{DType, Device};
+
+    let fixture = checkpoint("half", false, false);
+    let head = || pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
+    let request = SystemOneRequest::new("a ticket about money late shoes").ask(
+        "team",
+        Choice::new("which team ?")
+            .option_bare("returns")
+            .option_bare("billing"),
+    );
+
+    let exact = LocalEngine::new(Backend::open(&fixture.dir, None).unwrap(), head())
+        .system_one_blocking(&request)
+        .unwrap();
+    let half = LocalEngine::new(
+        Backend::open_as(&fixture.dir, None, Device::Cpu, DType::F16).unwrap(),
+        head(),
+    )
+    .system_one_blocking(&request)
+    .unwrap();
+
+    for (option, exact) in exact.answer("team").unwrap().probabilities().unwrap() {
+        let half = half.answer("team").unwrap().probabilities().unwrap()[option];
+        assert!(
+            (exact - half).abs() < 0.01,
+            "{option}: {exact} in f32, {half} in f16"
+        );
+    }
+}

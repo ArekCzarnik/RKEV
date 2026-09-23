@@ -17,6 +17,10 @@ pub(crate) struct Weights {
     base: candle_core::safetensors::MmapedSafetensors,
     adapter: Option<Adapter>,
     device: Device,
+    /// What the backbone runs in. The adapter is merged in f32 whatever this
+    /// says, and cast afterwards — which is both exact in f32 and, in bf16,
+    /// closer to the f32 numbers than merging after the cast would be.
+    dtype: DType,
 }
 
 struct Adapter {
@@ -36,7 +40,12 @@ struct AdapterConfig {
 }
 
 impl Weights {
-    pub fn open(base: &Path, adapter: Option<&Path>, device: &Device) -> Result<Self> {
+    pub fn open(
+        base: &Path,
+        adapter: Option<&Path>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
         let files = safetensors_in(base)?;
         // Safety: the files must not change while they are mapped, which is the
         // same contract every safetensors reader takes.
@@ -75,12 +84,19 @@ impl Weights {
             base,
             adapter,
             device: device.clone(),
+            dtype,
         })
     }
 
     /// A tensor the adapter never touches (the embeddings, the norms, the
-    /// convolution and the per-head scalars).
+    /// convolution and the per-head scalars), in the backbone's dtype.
     pub fn plain(&self, path: &str) -> Result<Tensor> {
+        Ok(self.plain_f32(path)?.to_dtype(self.dtype)?)
+    }
+
+    /// The same, kept in f32 — for the few weights the reference computes with
+    /// in f32 whatever the backbone runs in.
+    pub fn plain_f32(&self, path: &str) -> Result<Tensor> {
         let name = format!("model.{path}");
         Ok(self.base.load(&name, &self.device)?.to_dtype(DType::F32)?)
     }
@@ -90,18 +106,19 @@ impl Weights {
     /// parameter). Folding the 1.0 in here keeps the forward pass to one
     /// multiplication, as candle's `rms_norm` expects.
     pub fn zero_centred_norm(&self, path: &str) -> Result<Tensor> {
-        let weight = self.plain(&format!("{path}.weight"))?;
-        Ok((weight + 1.0)?)
+        let weight = self.plain_f32(&format!("{path}.weight"))?;
+        Ok((weight + 1.0)?.to_dtype(self.dtype)?)
     }
 
-    /// A projection, with the adapter's `B @ A` delta merged in.
+    /// A projection, with the adapter's `B @ A` delta merged in — in f32, before
+    /// the cast to the backbone's dtype, as `LoadOptions.merge` does it.
     pub fn adapted(&self, path: &str) -> Result<Tensor> {
-        let weight = self.plain(&format!("{path}.weight"))?;
+        let weight = self.plain_f32(&format!("{path}.weight"))?;
         let Some(adapter) = &self.adapter else {
-            return Ok(weight);
+            return Ok(weight.to_dtype(self.dtype)?);
         };
         let Some((a, b)) = self.lora(adapter, path)? else {
-            return Ok(weight);
+            return Ok(weight.to_dtype(self.dtype)?);
         };
         let delta = (b.matmul(&a)? * adapter.scale)?;
         if delta.dims() != weight.dims() {
@@ -111,7 +128,7 @@ impl Weights {
                 weight.dims()
             )));
         }
-        Ok((weight + delta)?)
+        Ok((weight + delta)?.to_dtype(self.dtype)?)
     }
 
     fn lora(&self, adapter: &Adapter, path: &str) -> Result<Option<(Tensor, Tensor)>> {
@@ -151,7 +168,12 @@ fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
 ///
 /// `allowed(query, key)` is [`Pass::attends`](crate::Pass): causal, and blind
 /// across questions.
-pub(crate) fn attention_mask<F>(len: usize, allowed: F, device: &Device) -> Result<Tensor>
+pub(crate) fn attention_mask<F>(
+    len: usize,
+    allowed: F,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor>
 where
     F: Fn(usize, usize) -> bool,
 {
@@ -163,7 +185,7 @@ where
             values.push(if allowed(query, key) { 0.0 } else { f32::MIN });
         }
     }
-    Ok(Tensor::from_vec(values, (1, 1, len, len), device)?)
+    Ok(Tensor::from_vec(values, (1, 1, len, len), device)?.to_dtype(dtype)?)
 }
 
 /// `y = x W^T`, for the bias-free projections these models use throughout.
@@ -199,6 +221,7 @@ pub(crate) fn rotary_tables(
     dim: usize,
     theta: f64,
     device: &Device,
+    dtype: DType,
 ) -> Result<(Tensor, Tensor)> {
     let inverse: Vec<f32> = (0..dim / 2)
         .map(|i| (1.0 / theta.powf(2.0 * i as f64 / dim as f64)) as f32)
@@ -207,7 +230,12 @@ pub(crate) fn rotary_tables(
     let angles: Vec<f32> = positions.iter().map(|p| *p as f32).collect();
     let angles = Tensor::from_vec(angles, (positions.len(), 1), device)?;
     let angles = angles.matmul(&inverse)?;
-    Ok((angles.cos()?, angles.sin()?))
+    // The tables are built in f32 whatever the backbone runs in: a position's
+    // angle is not something to round early.
+    Ok((
+        angles.cos()?.to_dtype(dtype)?,
+        angles.sin()?.to_dtype(dtype)?,
+    ))
 }
 
 /// Apply the rotary embedding to the first `2 * cos.dim(1)` components of each
@@ -239,6 +267,7 @@ pub(crate) fn branch_batch_mask(
     lengths: &[usize],
     padded: usize,
     device: &Device,
+    dtype: DType,
 ) -> Result<Tensor> {
     let mut values = Vec::with_capacity(lengths.len() * padded * (state + padded));
     for length in lengths {
@@ -254,11 +283,10 @@ pub(crate) fn branch_batch_mask(
             }
         }
     }
-    Ok(Tensor::from_vec(
-        values,
-        (lengths.len(), 1, padded, state + padded),
-        device,
-    )?)
+    Ok(
+        Tensor::from_vec(values, (lengths.len(), 1, padded, state + padded), device)?
+            .to_dtype(dtype)?,
+    )
 }
 
 /// Token ids and position ids for a batch of rows, padded to the longest with
@@ -287,6 +315,7 @@ pub(crate) fn prefill_batch_mask(
     lengths: &[usize],
     padded: usize,
     device: &Device,
+    dtype: DType,
 ) -> Result<Tensor> {
     let mut values = Vec::with_capacity(lengths.len() * padded * padded);
     for length in lengths {
@@ -301,11 +330,7 @@ pub(crate) fn prefill_batch_mask(
             }
         }
     }
-    Ok(Tensor::from_vec(
-        values,
-        (lengths.len(), 1, padded, padded),
-        device,
-    )?)
+    Ok(Tensor::from_vec(values, (lengths.len(), 1, padded, padded), device)?.to_dtype(dtype)?)
 }
 
 /// `1.0` at a row's real tokens and `0.0` at its padding, `[rows, padded]`.
