@@ -144,6 +144,8 @@ scripts/test.sh                                 # fmt, clippy, Tests, Feature-Ma
 scripts/local.sh                                # die Offline-Suite allein
 scripts/local.sh --fetch jaredpalmer/kev-0.6b   # Checkpoint holen, dann alles prüfen
 scripts/local.sh --checkpoint <dir> --measure   # dazu die Zeitmessungen
+scripts/parity.sh --base <dir> --checkpoint <dir>    # gegen einen Server aufzeichnen
+scripts/parity.sh --check-only --base <dir> --checkpoint <dir>   # und offline nachprüfen
 ```
 
 `scripts/local.sh --help` listet den Rest. `KEV_HF` zeigt die Downloads auf einen
@@ -185,7 +187,9 @@ Was offen ist:
 
 - **Parität mit dem Python-Server ist nicht geprüft.** Dass die Zahlen plausibel
   und untereinander konsistent sind, heißt nicht, dass sie dieselben sind. Dafür
-  braucht es den Server einmal; `examples/parity.rs` ist dieser Vergleich.
+  braucht es den Server **einmal**: `scripts/parity.sh` zeichnet fünf Anfragen
+  über beide Endpunkte auf und vergleicht jede Wahrscheinlichkeit. Danach sind die
+  Aufzeichnungen Dateien, und `--check-only` wiederholt den Vergleich offline.
 - Auf einer CPU gibt es in candle kein bf16-Matmul, also wird bf16 dort mit einer
   Meldung abgelehnt statt tief in einer Projektion zu scheitern; f16 ist die
   reduzierte Präzision, die eine CPU kann.

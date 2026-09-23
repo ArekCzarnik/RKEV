@@ -1,0 +1,27 @@
+{
+  "state": "Ticket 8814, escalated twice, opened eleven days ago. The parcel was due on the third and has not arrived. Tracking last updated a week ago in the wrong city. I paid for next-day delivery and was charged twice for it. Support told me to wait and then closed the ticket without a word. The shoes that did arrive are two sizes too small and the box was open. I would like the refund processed today, and confirmation in writing. The parcel was due on the third and has not arrived. Tracking last updated a week ago in the wrong city. I paid for next-day delivery and was charged twice for it. Support told me to wait and then closed the ticket without a word. The shoes that did arrive are two sizes too small and the box was open. I would like the refund processed today, and confirmation in writing. The parcel was due on the third and has not arrived. Tracking last updated a week ago in the wrong city. I paid for next-day delivery and was charged twice for it. Support told me to wait and then closed the ticket without a word. The shoes that did arrive are two sizes too small and the box was open. I would like the refund processed today, and confirmation in writing. The parcel was due on the third and has not arrived. Tracking last updated a week ago in the wrong city. I paid for next-day delivery and was charged twice for it. Support told me to wait and then closed the ticket without a word. The shoes that did arrive are two sizes too small and the box was open. I would like the refund processed today, and confirmation in writing. The parcel was due on the third and has not arrived. Tracking last updated a week ago in the wrong city. I paid for next-day delivery and was charged twice for it. Support told me to wait and then closed the ticket without a word. The shoes that did arrive are two sizes too small and the box was open. I would like the refund processed today, and confirmation in writing. The parcel was due on the third and has not arrived. Tracking last updated a week ago in the wrong city. I paid for next-day delivery and was charged twice for it. Support told me to wait and then closed the ticket without a word. The shoes that did arrive are two sizes too small and the box was open. I would like the refund processed today, and confirmation in writing.",
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {
+        "returns": "Exchanges, refunds, wrong or damaged items",
+        "shipping": "Delivery status, delays, lost packages",
+        "billing": "Charges, invoices, payment problems"
+      }
+    },
+    "escalate": {
+      "type": "noul",
+      "instructions": "Does this need urgent human attention?"
+    },
+    "frustration": {
+      "type": "score",
+      "instructions": "How frustrated is the customer?",
+      "criteria": [
+        "Calm",
+        "Frustrated",
+        "Very angry"
+      ]
+    }
+  }
+}

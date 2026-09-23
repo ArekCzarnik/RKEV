@@ -257,6 +257,35 @@ cargo run --release --example parity -- \
     --request request.json --server server.json
 ```
 
+One script does the whole session, and `kev-client/tests/parity/` holds the
+requests it sends — five of them, each picked for something that can break: the
+README's worked example, a JSON state, twelve options with two bare ones, text
+that contains Kev's own delimiters, and a state past the prefix threshold. Each
+goes to `/v1/systemone` and `/v1/systemone/separate`:
+
+```bash
+KEV_DTYPE=fp32 uv run --extra serve python -m kev.serve --run jaredpalmer/kev-0.6b --port 8009
+
+scripts/parity.sh --base ~/models/qwen-qwen3-0.6b-base --checkpoint ~/models/kev-0.6b
+```
+
+It probes the server before building anything, records every answer under
+`tests/parity/recordings/`, then answers the same requests in process and compares
+every probability. Afterwards the recordings are files:
+
+```bash
+scripts/parity.sh --check-only --base <base> --checkpoint <kev>
+```
+
+repeats the comparison with no server and no Python, which is the point of
+recording rather than checking live.
+
+Two things it reports besides the probabilities. `input_tokens`, which is the
+sharper check — probabilities can agree to four decimals over prompts that differ
+by a token, token counts cannot, so a mismatch there fails the run whatever the
+differences look like. And the model name each side answered as, in case the
+server was serving something other than the checkpoint being compared.
+
 Without a server — and without Python — two things are still checkable, and
 `examples/sanity.rs` runs both against a real checkpoint:
 

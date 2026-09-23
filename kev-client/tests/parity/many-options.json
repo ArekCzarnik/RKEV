@@ -1,0 +1,27 @@
+{
+  "state": "The left speaker of the headset crackles at any volume. Bought in March, still under warranty.",
+  "questions": {
+    "product": {
+      "type": "choice",
+      "instructions": "Which product line is this about?",
+      "criteria": {
+        "headsets": "Headphones, earbuds, headsets",
+        "speakers": "Standalone and shelf speakers",
+        "laptops": "Notebooks and accessories for them",
+        "phones": null,
+        "tablets": null,
+        "watches": "Smartwatches and bands",
+        "cameras": "Cameras, lenses, gimbals",
+        "consoles": "Game consoles and controllers",
+        "printers": "Printers, scanners, ink",
+        "monitors": "Displays and stands",
+        "keyboards": "Keyboards, mice, trackpads",
+        "other": "Anything that fits nowhere else"
+      }
+    },
+    "warranty": {
+      "type": "noul",
+      "instructions": "Does the customer claim the item is under warranty?"
+    }
+  }
+}

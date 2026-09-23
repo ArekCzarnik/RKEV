@@ -693,18 +693,69 @@ Two deliberate consequences:
 Tests: 83 with the default features (was 80, plus the three moved seam tests), 50
 with `local`, 14 with none. `scripts/test.sh` green.
 
+## Done: the parity session, as a script
+
+Commit "Record parity against the server, and hold the engine to it". The last
+open item needed the server once; this makes that once count.
+
+`scripts/parity.sh` probes the server, POSTs every request in
+`kev-client/tests/parity/` to `/v1/systemone` **and** `/v1/systemone/separate`,
+saves each answer under `tests/parity/recordings/`, then answers the same requests
+in process and compares every probability. `--check-only` repeats the comparison
+from the recordings with no server and no Python; `--record-only` stops after the
+recording, for a machine with the server but no toolchain.
+
+The five requests, each for something the offline tests cannot see:
+
+| Request | For |
+|---|---|
+| `triage.json` | the README's worked example, with published numbers beside it |
+| `structured-state.json` | a JSON state: Python's `str()`, `True`, `None`, floats, nesting |
+| `many-options.json` | twelve options, two of them bare (`null`), and the rounding |
+| `escaping.json` | text containing `<\|fim_prefix\|>`, `</opt>`, `<decide>`, an injected `<\|im_start\|>`, umlauts, CJK, emoji |
+| `long-state.json` | over 400 words, past the 384-token threshold, so the prefix path answers |
+
+`examples/parity.rs` gained three things in the process:
+
+- **`--separate`**, so a recording of the per-question endpoint is compared with
+  `system_one_separate_blocking` rather than the packed call.
+- **`input_tokens` is decisive.** Probabilities can agree to four decimals over
+  prompts that differ by a token; token counts cannot. A mismatch there fails the
+  run whatever the differences look like, and the message says to read it first.
+  `output_tokens` is a note only: it counts the serialised answers, so it moves
+  with them.
+- **`option_isolation` from `head.pt` is applied**, as `decide` already did.
+  Serving the layout a checkpoint was not trained on would have shown up here as a
+  difference that is ours, and that is exactly the kind of red herring worth not
+  planting.
+
+Verified here without a server, which is as far as this container goes: the
+recordings were generated with `decide --json` over a synthetic fixture (packed and
+separate), and `--check-only` then reports 0.00000 on all ten pairs at tolerance
+0.0 and exits 0. Both failure modes were provoked: a probability moved to 0.9 is
+caught with the difference named, and an `input_tokens` changed to 999 fails the
+pair with the right message while its probabilities still agree. What is untested
+is the recording half's transport — no server answers here.
+
 ## Left to do
 
-1. **Parity — the only thing left that needs the server.** The loading, the real
-   vocabulary and the real `head.pt` are now checked (above): `kev-0.6b` loads and
-   answers sensibly, so what is unverified is narrower than it was — whether the
-   Python gives the *same* numbers for the same request. `examples/parity.rs`
-   answers a recorded request in process and compares every probability with a
-   recorded server response (`--tolerance`, non-zero exit past it). What is left is
-   starting `kev.serve` once with `KEV_DTYPE=fp32` on the same checkpoint the local
-   run used, recording request and response, and turning that pair into an offline
-   fixture so it never needs starting again. Expect small differences from the
-   server's own dtype, and read the argmax and the ordering before the decimals.
+1. **Parity — one server session away.** Everything around it is done: the
+   loading, the real vocabulary and the real `head.pt` are checked, and
+   `scripts/parity.sh` is the whole session in one command. What is left is running
+   it on a machine that can hold the checkpoint *and* serve it:
+
+   ```bash
+   KEV_DTYPE=fp32 uv run --extra serve python -m kev.serve \
+       --run jaredpalmer/kev-0.6b --port 8009
+   scripts/parity.sh --base ~/models/qwen-qwen3-0.6b-base --checkpoint ~/models/kev-0.6b
+   ```
+
+   `KEV_DTYPE=fp32` matters: it is the path the published numbers were measured on
+   and the one the engine defaults to on a CPU. Expect the differences at the
+   fourth decimal, read `input_tokens` before the probabilities, and **commit the
+   recordings** — they are what makes `--check-only` a standing check instead of a
+   one-off. If a pair does differ, the order to look in is: token counts, then the
+   prompt itself (`decide --json` prints what the engine built), then the readout.
 2. **Performance, what is left of it.** The prefix, the batched branches, the
    chunked delta rule, the batched prefills and the precision knob are in
    (below). Still open: nothing is quantised, no device other than the CPU has

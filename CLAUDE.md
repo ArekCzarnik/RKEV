@@ -331,6 +331,26 @@ this check nothing. Nothing else in
 this repo compares the engine with the reference *running*, so this is the check
 that decides whether the local numbers mean anything.
 
+`scripts/parity.sh` is the session: it probes the server, POSTs every request in
+`kev-client/tests/parity/` to `/v1/systemone` *and* `/v1/systemone/separate`,
+saves each answer under `tests/parity/recordings/`, then runs `examples/parity`
+over each pair. `--check-only` repeats the comparison from the recordings with no
+server at all, which is what a one-off session is for; `--record-only` stops after
+the recording, for a machine that has the server but not the toolchain.
+
+The five requests are chosen for what can break where the offline tests cannot
+look: a JSON state (Python's `str()` semantics), twelve options with two bare
+ones, text containing Kev's own delimiters plus an injected `<|im_start|>`, and a
+state past the 384-token prefix threshold. `tests/parity/README.md` says which is
+which — keep that table honest when adding one.
+
+`examples/parity` fails on an `input_tokens` mismatch regardless of the
+probabilities: that is the evidence the two sides tokenised different prompts, and
+it is sharper than any difference in the numbers. `output_tokens` is only a note,
+since it counts the serialised answers and so moves with them. It also applies
+`option_isolation` from `head.pt`, because serving the layout a checkpoint was not
+trained on would show up here as a difference that is ours.
+
 **A real checkpoint has been run** — `jaredpalmer/kev-0.6b` over
 `Qwen/Qwen3-0.6B-Base`, f32 on an Apple CPU, by the user on 2026-09-23: 7 of 7
 of `sanity`'s unambiguous tickets, `head.pt`'s metadata parsed, the paths

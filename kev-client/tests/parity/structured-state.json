@@ -1,0 +1,33 @@
+{
+  "state": {
+    "subject": "Cannot sign in since the password reset",
+    "customer": {"tier": "gold", "tickets_this_month": 3, "verified": true},
+    "order": {"id": 4411, "total": 129.5, "refunded": false, "note": null},
+    "messages": [
+      {"from": "customer", "text": "The reset link says expired every time."},
+      {"from": "support", "text": "Please try an incognito window."},
+      {"from": "customer", "text": "Tried it. Same error. This is the second day."}
+    ]
+  },
+  "questions": {
+    "area": {
+      "type": "choice",
+      "instructions": "Which area is this about?",
+      "criteria": {
+        "access": "Sign-in, passwords, two-factor",
+        "billing": "Charges, invoices, refunds",
+        "shipping": "Delivery and tracking"
+      }
+    },
+    "verified_customer": {
+      "type": "noul",
+      "instructions": "Is this a verified customer?",
+      "criteria": {"true": "the record says verified", "false": "it does not"}
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this?",
+      "criteria": ["can wait", "this week", "today"]
+    }
+  }
+}
