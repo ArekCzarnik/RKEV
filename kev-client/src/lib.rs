@@ -59,8 +59,12 @@ mod local;
 mod system_one;
 mod types;
 
+/// Model alias a Kev server resolves to whatever checkpoint it loaded, and the
+/// name a local engine reports when a request does not pin one.
+pub const DEFAULT_MODEL: &str = "kev-latest";
+
 #[cfg(feature = "http")]
-pub use client::{Client, DEFAULT_BASE_URL, DEFAULT_MODEL};
+pub use client::{Client, DEFAULT_BASE_URL};
 pub use error::{Error, Result};
 #[cfg(feature = "local")]
 pub use local::{Forward, LocalEngine};

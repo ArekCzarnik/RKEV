@@ -6,13 +6,11 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::system_one::SystemOne;
 use crate::types::{SystemOneRequest, SystemOneResponse};
+use crate::DEFAULT_MODEL;
 
 /// Default address of a locally served Kev
 /// (`python -m kev.serve --run jaredpalmer/kev-4b --port 8009`).
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8009";
-
-/// Model alias the server resolves to whatever checkpoint it loaded.
-pub const DEFAULT_MODEL: &str = "kev-latest";
 
 const REQUEST_ID_HEADER: &str = "x-typesafe-request-id";
 
@@ -104,10 +102,12 @@ impl Client {
     /// of this endpoint is not part of the documented API, so it comes back as
     /// raw JSON.
     pub async fn permute(&self, request: &SystemOneRequest, n_perm: u8) -> Result<Value> {
-        let mut body = serde_json::to_value(self.with_model_filled_in(request))
-            .map_err(|source| Error::Decode {
-                source,
-                body: String::from("the request could not be serialised"),
+        let mut body =
+            serde_json::to_value(self.with_model_filled_in(request)).map_err(|source| {
+                Error::Decode {
+                    source,
+                    body: String::from("the request could not be serialised"),
+                }
             })?;
         if let Some(object) = body.as_object_mut() {
             object.insert("n_perm".into(), Value::from(n_perm.clamp(1, 64)));
