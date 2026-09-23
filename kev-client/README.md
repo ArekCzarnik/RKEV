@@ -265,6 +265,20 @@ The exit code is non-zero if a path disagrees or more than one ticket is missed.
 This is not parity: it cannot tell you that the answers match the server, only
 that they are self-consistent and mean something.
 
+One script runs everything that can be checked this way, downloads included:
+
+```bash
+scripts/local.sh                                  # the offline suite; no weights
+scripts/local.sh --fetch jaredpalmer/kev-0.6b     # fetch one with curl, then all of it
+scripts/local.sh --checkpoint ~/models/kev-0.6b --measure
+```
+
+It downloads with `curl` — the `hf` CLI is itself Python — taking the adapter, the
+head and the tokenizer, then the base model that `adapter_config.json` names,
+sharded weights included. Then: the offline suite, the sanity example, the suite
+again with `KEV_TOKENIZER` set to the real vocabulary, one request through
+`decide`, and with `--measure` the timings. `--help` lists the rest.
+
 To put another engine underneath instead, implement `Forward` yourself:
 
 ```rust

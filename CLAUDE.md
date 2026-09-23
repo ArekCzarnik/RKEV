@@ -39,6 +39,15 @@ This container has no C toolchain (no `cc`, no glibc `crt1.o`), so a plain
 non-HTTP features do run here through the musl target; the recipe is at the end
 of `.claude/tasks/2026-09-23-local-inference.md`.
 
+`scripts/local.sh` is the same idea for the local engine, and needs neither a
+server nor Python:
+
+```bash
+scripts/local.sh                                # the offline suite alone
+scripts/local.sh --fetch jaredpalmer/kev-0.6b   # download a checkpoint first
+scripts/local.sh --checkpoint <dir> --measure   # with the timing measurements
+```
+
 `scripts/triage.sh` runs the example; it probes the server first and passes
 `KEV_*` through:
 
@@ -333,6 +342,26 @@ public.
 the things the server can do are reachable from the command line too; the layout
 otherwise comes from `head.pt`, which for a safetensors head answers "unknown"
 rather than failing.
+
+`scripts/local.sh` runs all of that in order, and is the answer to "test it
+without Python and without a server":
+
+```bash
+scripts/local.sh                                  # the offline suite alone
+scripts/local.sh --fetch jaredpalmer/kev-0.6b     # download with curl, then everything
+scripts/local.sh --checkpoint ~/models/kev-0.6b [--measure]
+```
+
+It fetches with `curl` because the `hf` CLI is itself Python: the adapter, the
+head and the tokenizer, then the base named in `adapter_config.json`, sharded
+weights included (the index names the shards). It then runs `scripts/test.sh`,
+the sanity example, the suite again with `KEV_TOKENIZER` pointed at the real
+vocabulary, one request through `decide`, and with `--measure` the `#[ignore]`d
+timings. Everything is `--no-default-features --features candle`: none of it
+talks HTTP, and reqwest would drag in `ring`, which needs a C compiler.
+
+`KEV_HF` points the downloads at a mirror — or at a `file://` tree, which is how
+the fetch path was tested here without reaching the hub.
 
 ## Documentation
 

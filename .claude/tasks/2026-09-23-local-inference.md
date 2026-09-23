@@ -527,6 +527,53 @@ On the way: `temperature()` and `option_isolation()` answered "that is not a
 torch archive" for a head exported as safetensors, which `pointer_head` reads
 happily. They now answer `None`, decided by the extension, with a test.
 
+## Done: one script for the whole server-free check
+
+Commit "Add scripts/local.sh". `scripts/local.sh` is the sequence, in the order
+worth running it, and the answer to "a script for testing locally, no Python, no
+server":
+
+```bash
+scripts/local.sh                                  # the offline suite alone
+scripts/local.sh --fetch jaredpalmer/kev-0.6b     # download, then everything
+scripts/local.sh --checkpoint <dir> [--measure] [--skip-suite] [--base <dir>]
+```
+
+Steps: `scripts/test.sh`, then `examples/sanity`, then the suite again with
+`KEV_TOKENIZER` pointed at the checkpoint's own `tokenizer.json`, then one request
+through `examples/decide`, and with `--measure` the `#[ignore]`d timings. Failures
+are collected and summarised rather than stopping the run, as `test.sh` does.
+
+Decisions worth keeping:
+
+- **`--no-default-features --features candle` throughout.** The first run pulled
+  in reqwest and therefore `ring`, which needs a C compiler this container does
+  not have — and no step here talks HTTP anyway.
+- **`curl`, not `hf`.** The CLI is a Python package, so it is out by definition.
+  The script takes the adapter, `head.pt` and the tokenizer, reads
+  `base_model_name_or_path` out of `adapter_config.json` (stripping a `@rev`
+  suffix), and fetches that base — including sharded weights, whose names it
+  takes out of `model.safetensors.index.json`. `--force` re-downloads, and also
+  deletes first: `-C -` against a complete file is a range request past the end,
+  which the hub answers with 416.
+- **A merged checkpoint passes no `--checkpoint`.** A directory with a
+  `config.json` and no `adapter_config.json` *is* the base, and asking candle for
+  an adapter that is not there is an error, not a no-op. That is also what the
+  test fixtures look like, which is how it surfaced.
+- **The head is checked before anything is built.** No `head.pt` and there is
+  nothing to read answers off; saying so after a release build of candle would be
+  unkind.
+- **`KEV_HF`** overrides the hub URL. It is there for a mirror, and it is how the
+  download path was tested here: a `file://` tree with a fake checkpoint, a
+  sharded fake base, and missing optional files, which exercised every branch
+  except the transport.
+
+Verified on both synthetic fixtures (attention-only and hybrid): all three steps
+run, `sanity` reports 2 of 7 obvious cases and 0.00000 across the paths as it
+should on noise weights, and the script's exit code follows it. The error paths
+were run too: no head, no such directory, unknown argument, `--skip-suite` with
+no checkpoint.
+
 ## Left to do
 
 1. **Parity — the tool is there, it has not been run.** (`examples/sanity.rs`
