@@ -24,7 +24,9 @@ const DEFAULT_TICKET: &str = "Shoes arrived two weeks late and in the wrong size
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ticket = env::args().nth(1).unwrap_or_else(|| DEFAULT_TICKET.to_string());
+    let ticket = env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_TICKET.to_string());
 
     let mut client = Client::new(
         env::var("KEV_BASE_URL").unwrap_or_else(|_| kev_client::DEFAULT_BASE_URL.to_string()),

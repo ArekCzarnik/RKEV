@@ -140,7 +140,10 @@ fn response_from_the_readme_decodes_into_typed_answers() {
         Some("returns")
     );
     assert_eq!(response.answer("escalate").unwrap().as_noul(), Some(0.93));
-    assert_eq!(response.answer("frustration").unwrap().as_score(), Some(1.44));
+    assert_eq!(
+        response.answer("frustration").unwrap().as_score(),
+        Some(1.44)
+    );
 }
 
 #[test]
@@ -181,9 +184,10 @@ fn an_unknown_question_id_is_absent_rather_than_a_panic() {
 #[test]
 fn optional_response_fields_may_be_missing() {
     // Only `model` and `answers` are guaranteed; usage and latency are not.
-    let response: SystemOneResponse =
-        serde_json::from_str(r#"{"model":"kev-latest","answers":{"a":{"type":"noul","noul":0.5}}}"#)
-            .unwrap();
+    let response: SystemOneResponse = serde_json::from_str(
+        r#"{"model":"kev-latest","answers":{"a":{"type":"noul","noul":0.5}}}"#,
+    )
+    .unwrap();
 
     assert_eq!(response.usage.output_tokens, 0);
     assert_eq!(response.latency_ms, None);
