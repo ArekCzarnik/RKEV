@@ -407,6 +407,27 @@ unreachable from this container (checked again: it is).
 
 The stub backend moved to `tests/fixtures/mod.rs` so both test files share one.
 
+## Done: permute
+
+Commit "Answer permute locally too". `LocalEngine::permute_blocking` and its async
+twin run one `choice` question under several option orders and report `runs`,
+`argmax_stable` and the per-option `spread` — the same JSON shape
+`Client::permute` hands back, so the two backends swap. Raw JSON for the reason
+the client's is: the envelope is not in the API docs.
+
+Only the named question is asked, as on the server, and `rounds` is clamped to
+1..=64 as the client clamps `n_perm`. The first run keeps the order as given; the
+rest are shuffled from the seed with a small generator of our own, which is
+reproducible but deliberately *not* CPython's shuffle — the point of the endpoint
+is how far the probabilities move, not which permutations were tried. Every run
+repeats the same state, so the prefix cache means only the first pays for it.
+
+The engine gained `Error::Invalid`, the local equivalent of the server's 422 for a
+request that does not make sense; `is_validation()` covers it.
+
+That closes the API gap: everything the HTTP client offers except `/v1/models`,
+which is about a server's own state and has nothing to answer locally.
+
 ## Left to do
 
 1. **Parity — the tool is there, it has not been run.** `examples/parity.rs`
@@ -426,7 +447,9 @@ The stub backend moved to `tests/fixtures/mod.rs` so both test files share one.
    been run at all, and a *server* would want to collect concurrent requests into
    a batch itself — `system_one_batch_blocking` is the call it would make, not the
    queue in front of it.
-3. `permute`, and `option_isolation` if a checkpoint ever serves with it.
+3. `option_isolation`, if a checkpoint ever serves with it. It needs the packed
+   mask and a per-option sub-branch mask, and the released checkpoints do not use
+   it.
 
 ## Design decisions
 

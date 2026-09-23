@@ -318,6 +318,99 @@ impl LocalEngine {
             .collect()
     }
 
+    /// Run one `choice` question under several option orders, to see whether the
+    /// order moves the answer.
+    ///
+    /// The same thing `/v1/systemone/permute` does, in the same JSON shape the
+    /// [`Client`](crate::Client) hands back for it — `runs` (each with its
+    /// `order`, `probabilities`, `choice` and `latency_ms`), `argmax_stable` and
+    /// the per-option `spread`. Raw JSON for the same reason the client's is: the
+    /// envelope is not in the API docs, and a struct here would invent a
+    /// contract.
+    ///
+    /// The first run keeps the order as given and the rest are shuffled from
+    /// `seed`, so a repeat with the same seed sees the same orders. They will not
+    /// be the *server's* orders for that seed — this does not reimplement
+    /// CPython's shuffle — and they do not need to be: what the endpoint is for is
+    /// how far the probabilities move, not which permutations were tried.
+    ///
+    /// Only the named question is asked, as on the server, and `rounds` is
+    /// clamped to 1..=64 as [`Client::permute`](crate::Client::permute) clamps
+    /// `n_perm`. Every run repeats the same state, so the second one onwards costs
+    /// only its own branch.
+    pub fn permute_blocking(
+        &self,
+        request: &SystemOneRequest,
+        question: &str,
+        rounds: u8,
+        seed: u64,
+    ) -> Result<serde_json::Value> {
+        let Some(crate::Question::Choice(choice)) = request.questions.get(question) else {
+            return Err(Error::Invalid(format!(
+                "{question:?} is not a choice question of this request"
+            )));
+        };
+        let names: Vec<String> = choice.criteria.keys().cloned().collect();
+
+        let mut runs = Vec::new();
+        for round in 0..rounds.clamp(1, 64) {
+            let order = if round == 0 {
+                names.clone()
+            } else {
+                shuffled(&names, seed, u64::from(round))
+            };
+            let mut reordered = crate::Choice {
+                instructions: choice.instructions.clone(),
+                criteria: IndexMap::with_capacity(order.len()),
+            };
+            for name in &order {
+                reordered
+                    .criteria
+                    .insert(name.clone(), choice.criteria[name].clone());
+            }
+            let mut one = request.clone();
+            one.questions =
+                std::iter::once((question.to_string(), crate::Question::Choice(reordered)))
+                    .collect();
+
+            let response = self.system_one_blocking(&one)?;
+            let answer = response.answer(question).ok_or_else(|| {
+                Error::Engine(format!("{question:?} went missing from its own answer"))
+            })?;
+            runs.push(serde_json::json!({
+                "order": order,
+                "probabilities": answer.probabilities(),
+                "choice": answer.as_choice(),
+                "latency_ms": response.latency_ms,
+            }));
+        }
+
+        // How far each option's probability travelled across the orders, and
+        // whether the winner ever changed.
+        let at = |run: &serde_json::Value, name: &str| -> f64 {
+            run["probabilities"][name].as_f64().unwrap_or(f64::NAN)
+        };
+        let spread: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                let values: Vec<f64> = runs.iter().map(|run| at(run, name)).collect();
+                let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let low = values.iter().copied().fold(f64::INFINITY, f64::min);
+                (name.clone(), serde_json::json!(high - low))
+            })
+            .collect();
+        let winners: std::collections::BTreeSet<&str> = runs
+            .iter()
+            .filter_map(|run| run["choice"].as_str())
+            .collect();
+
+        Ok(serde_json::json!({
+            "runs": runs,
+            "argmax_stable": winners.len() == 1,
+            "spread": spread,
+        }))
+    }
+
     /// Answer a request with one forward pass per question.
     ///
     /// Each question is asked on its own, against the same state, the way
@@ -486,11 +579,52 @@ impl SystemOne for LocalEngine {
     }
 }
 
+// Kept out of the `SystemOne` trait on purpose: the shape this returns is not in
+// the API docs, so it is not something to make every backend promise.
+#[allow(clippy::manual_async_fn)]
+impl LocalEngine {
+    /// [`LocalEngine::permute_blocking`], off the runtime thread.
+    pub fn permute(
+        &self,
+        request: &SystemOneRequest,
+        question: &str,
+        rounds: u8,
+        seed: u64,
+    ) -> impl Future<Output = Result<serde_json::Value>> + Send {
+        let engine = self.clone();
+        let request = request.clone();
+        let question = question.to_string();
+        async move { blocking(move || engine.permute_blocking(&request, &question, rounds, seed)).await }
+    }
+}
+
+/// One option order, shuffled from a seed.
+///
+/// A small deterministic generator and a Fisher-Yates pass: enough to try
+/// different orders reproducibly, and not pretending to be CPython's shuffle.
+fn shuffled(names: &[String], seed: u64, round: u64) -> Vec<String> {
+    let mut state = seed
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(round.wrapping_add(1));
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut order = names.to_vec();
+    for index in (1..order.len()).rev() {
+        order.swap(index, (next() % (index as u64 + 1)) as usize);
+    }
+    order
+}
+
 /// Run blocking work off the runtime thread, turning a panic into an error
 /// rather than taking the caller's task down with it.
-async fn blocking<F>(work: F) -> Result<SystemOneResponse>
+async fn blocking<T, F>(work: F) -> Result<T>
 where
-    F: FnOnce() -> Result<SystemOneResponse> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
 {
     tokio::task::spawn_blocking(work)
         .await

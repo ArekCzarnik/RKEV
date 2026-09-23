@@ -96,12 +96,19 @@ server runs with one — Kev then requires `Authorization: Bearer <key>` on
 
 ## Endpoints covered
 
-| Method | Path | Client |
-|---|---|---|
-| `POST` | `/v1/systemone` | `system_one` |
-| `POST` | `/v1/systemone/separate` | `system_one_separate` |
-| `POST` | `/v1/systemone/permute` | `permute` — raw JSON, the shape is not documented |
-| `GET` | `/v1/models` | `models` — raw JSON, same reason |
+| Method | Path | Client | Local engine |
+|---|---|---|---|
+| `POST` | `/v1/systemone` | `system_one` | `system_one` |
+| `POST` | `/v1/systemone/separate` | `system_one_separate` | `system_one_separate` |
+| `POST` | `/v1/systemone/permute` | `permute` — raw JSON, the shape is not documented | `permute`, the same shape |
+| `GET` | `/v1/models` | `models` — raw JSON, same reason | — |
+
+`permute` runs one `choice` question under several option orders and reports how
+far each probability travelled (`spread`) and whether the winner ever changed
+(`argmax_stable`) — the question of whether option order moves the answer, which
+it can. The local engine answers it in the same JSON shape, so the two backends
+swap; the first run keeps the order as given, the rest are shuffled from a seed,
+and every run repeats the same state, so only the first pays for it.
 
 ## Without a server (features `local`, `candle`)
 

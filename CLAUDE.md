@@ -146,7 +146,9 @@ so the split cannot rot.
   rate — keep the docs saying so.
 - **Undocumented endpoints stay `serde_json::Value`.** `permute` and `models`
   return raw JSON on purpose: the API docs do not pin their envelopes, and a
-  typed struct would invent a contract. Do not "improve" these into structs.
+  typed struct would invent a contract. Do not "improve" these into structs —
+  and that holds for `LocalEngine::permute`, which *builds* that shape rather
+  than decoding it, so that a caller can swap the two backends.
 - **Optional response fields.** Only `model` and `answers` are guaranteed;
   `usage` and `latency_ms` use `#[serde(default)]`. `request_id` is
   `#[serde(skip)]` — it comes from a header, not the body.

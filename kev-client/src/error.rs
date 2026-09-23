@@ -26,6 +26,10 @@ pub enum Error {
     /// [`Error::is_validation`] is true here too.
     #[cfg(feature = "local")]
     ContextOverflow(String),
+    /// The request itself does not make sense — what the server answers `422`
+    /// for, [`Error::is_validation`] included.
+    #[cfg(feature = "local")]
+    Invalid(String),
     /// The backbone failed: loading weights, or the forward pass itself.
     #[cfg(feature = "candle")]
     Model(candle_core::Error),
@@ -40,7 +44,7 @@ impl Error {
     /// `true` for the `422` that Kev returns for a malformed request body.
     pub fn is_validation(&self) -> bool {
         #[cfg(feature = "local")]
-        if matches!(self, Error::ContextOverflow(_)) {
+        if matches!(self, Error::ContextOverflow(_) | Error::Invalid(_)) {
             return true;
         }
         matches!(self, Error::Api { status: 422, .. })
@@ -94,6 +98,8 @@ impl fmt::Display for Error {
             Error::ContextOverflow(message) => {
                 write!(f, "the request does not fit the model context: {message}")
             }
+            #[cfg(feature = "local")]
+            Error::Invalid(message) => write!(f, "invalid request: {message}"),
             #[cfg(feature = "candle")]
             Error::Model(e) => write!(f, "the model failed: {e}"),
             Error::Decode { source, body } => {

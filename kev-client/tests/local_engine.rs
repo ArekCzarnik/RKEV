@@ -409,3 +409,121 @@ fn a_request_that_does_not_fit_fails_the_whole_batch() {
 
     assert!(error.is_validation(), "got {error:?}");
 }
+
+#[test]
+fn permuting_runs_the_orders_and_reports_what_moved() {
+    // The stub answers by option *position*, so it is a model that cares about
+    // order — which is what this endpoint exists to detect.
+    let (engine, log, _) = engine(vec![vec![0.7, 0.2, 0.1]; 6]);
+    let request = SystemOneRequest::new("a ticket").ask(
+        "team",
+        Choice::new("which team ?")
+            .option_bare("returns")
+            .option_bare("shipping")
+            .option_bare("billing"),
+    );
+
+    let permuted = engine.permute_blocking(&request, "team", 6, 0).unwrap();
+
+    let runs = permuted["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 6);
+    // The first run keeps the order as given.
+    assert_eq!(
+        runs[0]["order"].as_array().unwrap(),
+        &["returns", "shipping", "billing"]
+            .map(serde_json::Value::from)
+            .to_vec()
+    );
+    // Every run reports a full distribution and its winner.
+    for run in runs {
+        assert_eq!(run["probabilities"].as_object().unwrap().len(), 3);
+        assert!(run["choice"].is_string());
+        assert!(run["latency_ms"].is_f64());
+    }
+    // A model that answers by position cannot be stable under shuffling.
+    assert_eq!(permuted["argmax_stable"], serde_json::json!(false));
+    let spread = permuted["spread"].as_object().unwrap();
+    assert_eq!(spread.len(), 3);
+    assert!(
+        spread.values().any(|value| value.as_f64().unwrap() > 0.5),
+        "{spread:?}"
+    );
+    // Only the named question was asked, six times over the same state.
+    let texts = &log.lock().unwrap().texts;
+    assert_eq!(texts.iter().filter(|text| *text == "a ticket").count(), 6);
+    assert!(!texts.iter().any(|text| text == "is this late ?"));
+}
+
+#[test]
+fn one_round_of_permuting_moves_nothing() {
+    let (engine, _, _) = engine(vec![vec![0.6, 0.4]]);
+    let request = SystemOneRequest::new("a ticket").ask(
+        "team",
+        Choice::new("which team ?")
+            .option_bare("returns")
+            .option_bare("billing"),
+    );
+
+    // Zero rounds is one round: the clamp the client applies to `n_perm`.
+    let permuted = engine.permute_blocking(&request, "team", 0, 7).unwrap();
+
+    assert_eq!(permuted["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(permuted["argmax_stable"], serde_json::json!(true));
+    for spread in permuted["spread"].as_object().unwrap().values() {
+        assert_eq!(spread.as_f64().unwrap(), 0.0);
+    }
+}
+
+#[test]
+fn permuting_is_the_same_twice_from_the_same_seed() {
+    let orders = |seed: u64| {
+        let (engine, _, _) = engine(vec![vec![0.5, 0.3, 0.2]; 5]);
+        let request = SystemOneRequest::new("a ticket").ask(
+            "team",
+            Choice::new("which team ?")
+                .option_bare("returns")
+                .option_bare("shipping")
+                .option_bare("billing"),
+        );
+        let permuted = engine.permute_blocking(&request, "team", 5, seed).unwrap();
+        permuted["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run| run["order"].clone())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(orders(3), orders(3));
+    assert_ne!(orders(3), orders(4), "the seed has to change something");
+}
+
+#[test]
+fn permuting_anything_but_a_choice_question_is_a_validation_error() {
+    let (engine, _, _) = engine(vec![vec![0.5, 0.5]]);
+    let request = SystemOneRequest::new("a ticket").ask("late", Noul::new("is this late ?"));
+
+    let error = engine.permute_blocking(&request, "late", 4, 0).unwrap_err();
+    assert!(error.is_validation(), "got {error:?}");
+    assert!(error.to_string().contains("choice question"), "{error}");
+
+    let missing = engine
+        .permute_blocking(&request, "absent", 4, 0)
+        .unwrap_err();
+    assert!(missing.is_validation(), "got {missing:?}");
+}
+
+#[tokio::test]
+async fn permuting_works_off_the_runtime_thread_too() {
+    let (engine, _, _) = engine(vec![vec![0.6, 0.4]; 3]);
+    let request = SystemOneRequest::new("a ticket").ask(
+        "team",
+        Choice::new("which team ?")
+            .option_bare("returns")
+            .option_bare("billing"),
+    );
+
+    let permuted = engine.permute(&request, "team", 3, 1).await.unwrap();
+
+    assert_eq!(permuted["runs"].as_array().unwrap().len(), 3);
+}
