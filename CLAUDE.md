@@ -188,8 +188,14 @@ set, since a real Qwen tokenizer cannot be vendored. `tests/qwen3_5.rs` does the
 same for the hybrid backbone, transcription included — the delta rule has a decay,
 a write strength, an L2 norm (not an RMS norm), a short convolution and a gated
 output norm, and every one of them is a place to be quietly wrong.
-`tests/fixtures/mod.rs` is shared by both: the safetensors and tokenizer writers,
-so no test needs a dev-dependency to build a checkpoint. Tests
+`tests/fixtures/mod.rs` is shared by all of them: the safetensors and tokenizer
+writers, so no test needs a dev-dependency to build a checkpoint, and the stub
+backend whose hidden states produce a chosen distribution.
+`tests/upstream_unit.rs` ports the Python kev's own `tests/test_unit.py` — the
+exact render output, the record mapping, the answer formulas, the 255-option
+rounding tolerance, the confidence edge cases, the mask rule and the temperature.
+Those expectations come from outside this repository, which is most of their
+value; keep them named after the test they came from. Tests
 assert on JSON shape and public accessor behaviour, never on internals — keep
 new tests in that style, and update the README example and these fixtures
 together whenever the wire format legitimately changes.

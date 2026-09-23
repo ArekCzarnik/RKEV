@@ -389,6 +389,24 @@ measured at, and this is a model whose whole output is a calibrated probability.
 
 CLAUDE.md and the README describe this now, precision section and all.
 
+## Done: the upstream unit tests, ported
+
+Commit "Port the Python unit tests". `tests/upstream_unit.rs` carries
+`tests/test_unit.py` over: the six exact `render` outputs, the record mapping for
+all three question types (state text, option texts, keys, legend), the answer
+formulas for given distributions, that a rounded 40- and 255-option distribution
+still sums to one within TypeSafe's 0.02, the confidence edge cases, the mask rule
+with the same indices, and that the temperature divides the logits without moving
+the winner. All seven passed first run.
+
+Their worth is that the expectations come from outside this repository. Every
+other test here compares the implementation against itself or against a
+transcription this repository wrote; these are the reference's own numbers, which
+is the closest thing to a parity run available while huggingface.co stays
+unreachable from this container (checked again: it is).
+
+The stub backend moved to `tests/fixtures/mod.rs` so both test files share one.
+
 ## Left to do
 
 1. **Parity — the tool is there, it has not been run.** `examples/parity.rs`
