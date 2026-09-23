@@ -4,10 +4,7 @@ Eine vollständige lokale Inferenz-Engine für
 [Kev](https://github.com/jaredpalmer/kev), die kleinen Entscheidungsmodelle, die
 TypeSafe's [System One](https://docs.typesafe.ai/api)-API sprechen.
 
-Prompt, Forward-Pass und Readout laufen in Rust im eigenen Prozess — **ohne
-Server und ohne Python**. Kev selbst ist Python; gebraucht wird es hier nur noch
-für eine Sache, nämlich den Vergleich der Zahlen mit der Referenz (siehe *Stand
-und Grenzen*).
+Prompt, Forward-Pass und Readout laufen in Rust im eigenen Prozess.
 
 Das einzige Crate liegt in [`kev-client/`](kev-client/); das Wurzelverzeichnis ist
 kein Cargo-Workspace, `cargo`-Befehle laufen also aus `kev-client/`. Die
@@ -70,9 +67,23 @@ frustration    Frustrated   level 1.04   confidence 0.97
 ```
 
 Das Ticket nennt absichtlich drei Abteilungen gleichzeitig; bei eindeutigen
-Tickets sitzt dieses Modell auf 1.00. Ob die Checkpoints auf deutschen Texten
-genauso zuverlässig sind, ist hier nicht gemessen — das findest du mit `--lines`
-an deinen eigenen Tickets am schnellsten heraus.
+Tickets sitzt dieses Modell auf 1.00.
+
+Ob die Checkpoints auf **deutschen** Texten genauso zuverlässig sind, ist nicht
+vorhergesagt, sondern messbar — die Checkpoints sind auf englischen Daten
+veröffentlicht, die Qwen-Basis ist mehrsprachig:
+
+```bash
+cargo run --release --example deutsch -- \
+    --basis ~/models/qwen-qwen3-0.6b-base --checkpoint ~/models/kev-0.6b --vergleich
+```
+
+Ein deutsches Ticket mit allen drei Fragetypen, danach sieben Fälle, deren
+Antwort nicht in Frage steht — und mit `--vergleich` dieselben Inhalte auf
+englisch in der Spalte daneben. Verglichen wird über die Position der Option,
+nicht über ihren Namen: Optionsnamen stehen im Prompt (`name: beschreibung`) und
+sind damit Teil der Sprache. Die Zufallslinie steht unter der Tabelle, damit eine
+Trefferzahl nicht besser aussieht als sie ist.
 
 Weitere Eingabeformen: `--request anfrage.json` (genau das, was du sonst POSTen
 würdest, mehrfach = Batch), `--questions fragen.json` zu einem `--state`,
@@ -136,6 +147,7 @@ Alle in `kev-client/examples/`:
 | `sanity` | prüft die Engine gegen sich selbst und gegen eindeutige Fälle | Checkpoint |
 | `measure` | f16 gegen f32, Prefix-Cache, Chunking, Batching — mit Kontrollzeilen | Checkpoint |
 | `parity` | vergleicht jede Wahrscheinlichkeit mit einer aufgezeichneten Server-Antwort | Aufzeichnung |
+| `deutsch` | ein deutsches Ticket mit allen drei Fragetypen, und mit `--vergleich` dieselben Inhalte auf englisch daneben | Checkpoint |
 
 ## Skripte
 

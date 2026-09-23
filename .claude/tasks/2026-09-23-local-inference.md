@@ -737,6 +737,36 @@ caught with the difference named, and an `input_tokens` changed to 999 fails the
 pair with the right message while its probabilities still agree. What is untested
 is the recording half's transport — no server answers here.
 
+## Done: a German example
+
+Commit "Add a German example". `examples/deutsch.rs` — German doc comment,
+identifiers, comments and output, and that is on purpose rather than a slip.
+
+It has two halves. One German ticket with all three question types, printed with
+the full distribution under each answer. Then seven cases whose answer is not in
+doubt, and with `--vergleich` the same content in English in the column beside
+them, so the comparison is against the same content rather than against a
+remembered number. The chance baseline (2.7 of 7 here) is printed underneath,
+because a tally without it reads better than it deserves to.
+
+What made it more than a translation:
+
+- **Option names are part of the prompt.** `option_text` renders
+  `name: description`, so a German request needs German option names, and the
+  expectation cannot be a name. It is the option's *position* instead.
+- **The questions are translated too, not just the state.** A German ticket with
+  an English question would measure something nobody serves.
+- It takes `--basis`/`--kopf`/`--vergleich` and accepts `--base`/`--head`/
+  `--compare` as aliases, so the call reads like the other examples' when copied.
+
+Why it exists: the checkpoints are published on English data, the Qwen base is
+multilingual, and the root README said German was "nicht gemessen". This makes it
+measurable in one command instead of a guess.
+
+Verified on both synthetic fixtures: 2 of 7 on either language, which is the
+chance line — as it has to be on noise weights. What the real checkpoint says is
+the user's to run.
+
 ## Left to do
 
 1. **Parity — one server session away.** Everything around it is done: the

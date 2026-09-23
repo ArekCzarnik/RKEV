@@ -98,6 +98,7 @@ questions keep the order you add them in.
 | `sanity` | the engine against itself, and against tickets whose answer is not in doubt | a checkpoint |
 | `measure` | f16 against f32, the prefix cache, chunking, batching | a checkpoint |
 | `parity` | every probability against a recorded server response | a recording |
+| `deutsch` | the same thing in German, and with `--vergleich` the same content in English beside it — the checkpoints are published on English data and the base is multilingual, so what that costs is worth measuring rather than assuming | a checkpoint |
 
 ## What it answers
 

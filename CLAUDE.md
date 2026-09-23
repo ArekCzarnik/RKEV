@@ -411,7 +411,18 @@ API changes: `kev-client/README.md`, the `//!` module docs in `src/lib.rs`
 same support-ticket triage example as the README of the upstream Kev project, so
 the numbers stay comparable with the published ones.
 
+`examples/deutsch.rs` is **German on purpose** — the doc comment, the identifiers,
+the comments and the output. It exists because the checkpoints are published on
+English data while the Qwen base is multilingual, so what German costs is a
+measurement rather than a guess: it answers seven unambiguous cases and, with
+`--vergleich`, the same content in English beside them, with the chance baseline
+printed underneath. Option names are part of the prompt (`name: description`), so
+the German version has German names and the comparison goes by option *position*.
+It accepts `--base`/`--head`/`--compare` as aliases so the call matches the other
+examples. Do not translate it, and keep the German names if you extend it.
+
 `README.md` at the repo root is the fourth, and it is in **German**: the overview,
+
 the quickstart without Python, the feature and example tables, and the honest
 status section. Keep it an entry point rather than a translation — detail belongs
 in the crate's README — and keep it German when editing it. Every number and every
