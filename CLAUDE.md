@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+For what the project is, how to fetch a checkpoint and how to use it, see
+[README.md](README.md) — the entry point, in German — and
+[kev-client/README.md](kev-client/README.md), which is the crate's own, in
+English and in more detail. Keep this file to what only matters when changing the
+code.
+
 ## Layout
 
 The repo root is not a Cargo workspace. The only crate is `kev-client/`, so all
@@ -391,3 +397,10 @@ The crate is documented in three places that must stay in sync when the public
 API changes: `kev-client/README.md`, the `//!` module docs in `src/lib.rs`
 (a compiled `no_run` doctest), and `examples/triage.rs`. All three use the same
 support-ticket triage example as the README of the upstream Kev project.
+
+`README.md` at the repo root is the fourth, and it is in **German**: the overview,
+the quickstart without Python, the feature and example tables, and the honest
+status section. Keep it an entry point rather than a translation — detail belongs
+in the crate's README — and keep it German when editing it. Every number and every
+sample output in it is a measured one; if a run is not to hand, say what the shape
+is rather than inventing a plausible table.
