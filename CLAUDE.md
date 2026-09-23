@@ -106,8 +106,9 @@ Three modules behind a flat re-export surface in `src/lib.rs`:
   candle's and mistral.rs' Qwen3 because they have to take an arbitrary additive
   mask and explicit position ids, and have to stop at the hidden states: no
   vocabulary head, no KV cache, one prefill pass. `weights.rs` reads a checkpoint
-  and merges its LoRA in f32 as it goes; `backend.rs` puts a backbone and the
-  tokenizer together as `Backend`, and picks the backbone from `config.json`.
+  and merges its LoRA in f32 as it goes, before casting to whatever the backbone
+  runs in; `backend.rs` puts a backbone and the tokenizer together as `Backend`,
+  and picks both the backbone and the precision from `config.json` and the device.
   `qwen3_5.rs` is the current generation and the harder one: three quarters of its
   layers are a gated delta rule (a recurrence, not attention), the rest is
   attention with an output gate and only a quarter of each head rotated, and
@@ -257,6 +258,28 @@ What the measurements say, for five questions:
 
 `Backend::with_prefix(false)` keeps the packed path, which is what the
 transcription tests compare against, so leave those calling it.
+
+### Precision
+
+The backbone runs in whatever `Backend::open_as` is given; `open_on` picks it the
+way `kev.serve` does — **bf16 on a GPU, f32 on the CPU**. f32 is the path every
+published number was measured at, and the output here is a calibrated
+probability, so it stays the default where it is affordable.
+
+What is f32 whatever the backbone runs in, because the reference keeps it there:
+
+- the LoRA merge, and it happens **before** the cast — in bf16 that lands closer
+  to the f32 numbers than merging afterwards would;
+- the softmax;
+- the whole delta rule, its decay and write strength included, plus the DeltaNet's
+  `A_log`, `dt_bias` and gated norm;
+- the hidden states handed back, and the pointer head.
+
+**candle has no bf16 matmul on the CPU** (f16, f32 and f64 only), so asking for it
+there is refused with a message that says what to use instead. f16 is what a CPU
+can run — same code, measured 707 ms to 567 ms on the wide fixture, and asserted
+to stay within 0.01 of f32 on both backbones. No device other than the CPU has
+been run at all here.
 
 ### Checking the engine against the server
 

@@ -157,8 +157,21 @@ That is worth something while the states are short — eight 20-token states ran
 about 1.4x faster batched here — and nothing when each state already fills the
 machine, so measure before reaching for it.
 
-It is still CPU and f32 unless you hand `Backend::open_on` a device, and nothing
-is quantised.
+Precision follows the device, as the Python server does it: bf16 on a GPU, f32 on
+the CPU, which is the path every published number was measured at. The LoRA is
+merged in f32 before the cast, and the delta rule, the gated norm and the pointer
+head stay in f32 whatever the backbone runs in.
+
+```rust
+use candle_core::{DType, Device};
+
+let backend = Backend::open_as(base, Some(checkpoint), Device::Cpu, DType::F16)?;
+```
+
+candle has no bf16 matmul on a CPU, so that combination is refused rather than
+failing deep inside a projection; f16 is the reduced precision a CPU can run
+(about 1.2x faster here, and within 0.01 of f32 on the answers). Nothing is
+quantised, and no device other than the CPU has been exercised.
 
 Both forward passes are checked against transcriptions of Hugging Face's
 `modeling_qwen3.py` and `modeling_qwen3_5.py`, so the arithmetic is the

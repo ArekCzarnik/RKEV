@@ -387,8 +387,7 @@ and both backbones have a test asserting f16 answers stay within 0.01 of f32.
 f32 remains the CPU default anyway: it is the path every published number was
 measured at, and this is a model whose whole output is a calibrated probability.
 
-Not documented yet: CLAUDE.md and the README still describe the engine as f32
-only. That is the next small thing to do.
+CLAUDE.md and the README describe this now, precision section and all.
 
 ## Left to do
 
