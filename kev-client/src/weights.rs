@@ -227,6 +227,26 @@ pub(crate) fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Resu
     Tensor::cat(&[rotated, xs.narrow(3, rotary, dim - rotary)?], 3)
 }
 
+/// The additive mask for a branch pass continuing from a prefilled state,
+/// `[1, 1, branch, state + branch]`.
+///
+/// The state is visible from every branch position — it came first and cannot
+/// contain another question — and the branch is causal within itself.
+pub(crate) fn branch_mask(state: usize, branch: usize, device: &Device) -> Result<Tensor> {
+    let mut values = Vec::with_capacity(branch * (state + branch));
+    for query in 0..branch {
+        for key in 0..state + branch {
+            let allowed = key < state || key - state <= query;
+            values.push(if allowed { 0.0 } else { f32::MIN });
+        }
+    }
+    Ok(Tensor::from_vec(
+        values,
+        (1, 1, branch, state + branch),
+        device,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

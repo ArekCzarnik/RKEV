@@ -128,9 +128,21 @@ only, so a whole request runs as one masked pass. The current bases (Qwen3.5) mi
 attention with Gated DeltaNet layers, which are recurrent: a recurrence carries
 state forward token by token and cannot be told to skip another question's
 tokens, so every question runs as its own row — the state, then its branch. That
-is exact rather than masked, and it is what the Python does there too; it also
-means the state is recomputed per question, and the recurrence runs one token at
-a time here, so expect it to be slow.
+is exact rather than masked, and it is what the Python does there too.
+
+The state is run once per request and every question continues from it, and the
+last few states are kept across requests, keyed by their tokens — a repeated
+document then costs only its questions:
+
+```rust
+let backend = Backend::open(base, Some(checkpoint))?
+    .with_prefix_cache(8)        // states kept across requests; 4 by default
+    .with_prefix_min_tokens(0);  // prefill even short states
+let (hits, misses) = backend.prefix_hits();
+```
+
+It is still not fast: CPU by default, f32, no batching, and the recurrence runs
+one token at a time.
 
 Both forward passes are checked against transcriptions of Hugging Face's
 `modeling_qwen3.py` and `modeling_qwen3_5.py`, so the arithmetic is the

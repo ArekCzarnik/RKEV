@@ -240,6 +240,45 @@ rotated instead of a quarter, and the query scaled by the value width. It also
 checks that the adapter is merged into the recurrence's projections, which is
 where `kev.train` puts it on these bases.
 
+## Done: the state prefix, and what it is worth
+
+Commit "Run the state once, and keep it" — `prefill` / `forward_from` on both
+backbones, `Pass::state` and `Pass::branches` to split a request, and an LRU of
+prefilled states in `Backend`.
+
+Every question of a request shares the state, so the state runs once and each
+question continues from it: an attention layer keeps the state's keys and values,
+a recurrent layer keeps its state matrix and the tail of its convolution window.
+Exact, because the state comes first and neither layer kind looks forward — which
+is the same argument `kev.serve` makes. Across requests, the last four states are
+kept, keyed by their token ids, as the server does.
+
+Measured on the synthetic checkpoints (`cargo test --features candle -- --ignored
+--nocapture`; tiny models, so read the ratios, not the milliseconds):
+
+| | five questions, 241-token state |
+|---|---|
+| recurrent, state per question | 57 ms |
+| recurrent, state once | 24 ms |
+| recurrent, state from the cache | 14 ms |
+| attention-only, one packed pass | 20 ms |
+| attention-only, prefilled (miss) | 19 ms |
+
+And on a 1200-token state, attention-only: 129 ms packed, 136 ms on a prefix
+miss, **20 ms** on a hit.
+
+So the defaults differ, and the reason is measured rather than assumed. A
+recurrent base always prefills — it would otherwise run the state per question.
+An attention-only base already runs the state once in its packed pass, so a miss
+buys nothing and costs a few percent in per-pass overhead, while a hit skips the
+state entirely: the prefix path starts at 384 state tokens there, the same
+threshold `kev.serve` uses and for the same reason.
+
+`Backend::with_prefix(false)` keeps the packed path, which is what the
+transcription tests compare against. Both backbones have a test asserting that
+the prefix path answers identically, and the cache has one for hits, misses and
+eviction.
+
 ## Left to do
 
 1. **Parity — the tool is there, it has not been run.** `examples/parity.rs`
@@ -253,11 +292,11 @@ where `kev.train` puts it on these bases.
    thing. Run it with `KEV_TOKENIZER` set too, so the opt-in tokenizer checks
    come along. A real `head.pt` is part of what it exercises: the fixture here is
    in torch's shape, but only torch writes the real thing.
-2. **Performance.** No KV cache, no state-prefix reuse, CPU by default, f32, and
-   on a hybrid base the recurrence runs one token at a time while the state is
-   recomputed per question. A repeated state pays for itself every time; the
-   Python caches it. Nothing here is fast, and the gap is widest exactly where the
-   current checkpoints are.
+2. **Performance, what is left of it.** The state prefix is in (below). Still
+   open: rows are run one at a time rather than batched into one padded pass
+   (`rows_per_pass` on the Python side), the recurrence steps token by token
+   rather than in chunks (`torch_chunk_gated_delta_rule`), everything is f32 on
+   the CPU unless a caller passes a device, and nothing is quantised.
 3. `permute`, and `option_isolation` if a checkpoint ever serves with it.
 
 ## Design decisions

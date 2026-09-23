@@ -70,6 +70,55 @@ impl Pass<'_> {
     /// where `<decide>` and `</opt>` always are. A readout position in the state
     /// belongs to no row and is dropped, which the engine notices as a count
     /// mismatch rather than a wrong answer.
+    /// The state tokens on their own: the part every question shares, and the
+    /// part worth computing once.
+    ///
+    /// Together with [`Pass::branches`] this is [`Pass::rows`] taken apart, for a
+    /// backend that can run the state once and continue from it.
+    pub fn state(&self) -> OwnedPass {
+        let state: Vec<usize> = (0..self.ids.len())
+            .filter(|index| self.segments[*index] == 0)
+            .collect();
+        OwnedPass {
+            ids: state.iter().map(|i| self.ids[*i]).collect(),
+            positions: state.iter().map(|i| self.positions[*i]).collect(),
+            segments: vec![0; state.len()],
+            readout: Vec::new(),
+        }
+    }
+
+    /// One pass per question, holding that question's branch tokens only, with
+    /// the readout positions relative to the branch.
+    ///
+    /// A readout position in the state belongs to no branch and is dropped, as in
+    /// [`Pass::rows`]; `<decide>` and `</opt>` are never there.
+    pub fn branches(&self) -> Vec<OwnedPass> {
+        let mut branches = Vec::new();
+        let mut segment = 1;
+        while self.segments.contains(&segment) {
+            let indices: Vec<usize> = (0..self.ids.len())
+                .filter(|index| self.segments[*index] == segment)
+                .collect();
+            let mut moved = vec![usize::MAX; self.ids.len()];
+            for (offset, packed) in indices.iter().enumerate() {
+                moved[*packed] = offset;
+            }
+            branches.push(OwnedPass {
+                ids: indices.iter().map(|i| self.ids[*i]).collect(),
+                positions: indices.iter().map(|i| self.positions[*i]).collect(),
+                segments: vec![segment; indices.len()],
+                readout: self
+                    .readout
+                    .iter()
+                    .filter(|position| self.segments[**position] == segment)
+                    .map(|position| moved[*position])
+                    .collect(),
+            });
+            segment += 1;
+        }
+        branches
+    }
+
     pub fn rows(&self) -> Vec<OwnedPass> {
         let state: Vec<usize> = (0..self.ids.len())
             .filter(|index| self.segments[*index] == 0)

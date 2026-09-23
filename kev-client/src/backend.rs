@@ -11,13 +11,14 @@
 //! one causal row per question, because its recurrent layers cannot be masked.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use candle_core::{Device, Tensor};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::error::{Error, Result};
-use crate::local::{Forward, Pass};
+use crate::local::{Forward, OwnedPass, Pass};
 use crate::readout::{Linear, PointerHead};
 use crate::weights::attention_mask;
 use crate::{qwen3, qwen3_5};
@@ -27,6 +28,64 @@ pub struct Backend {
     model: Model,
     tokenizer: Tokenizer,
     device: Device,
+    /// Run the state once per request rather than once per question. On by
+    /// default; off is the slow path, kept for comparison.
+    prefix: bool,
+    /// Below this many state tokens the packed pass is left alone. See
+    /// [`Backend::with_prefix_min_tokens`].
+    prefix_min: usize,
+    cache: PrefixCache,
+}
+
+/// A prefilled state, whichever backbone made it.
+#[derive(Clone)]
+enum Prefilled {
+    Attention(Arc<qwen3::Prefix>),
+    Hybrid(Arc<qwen3_5::Prefix>),
+}
+
+impl Prefilled {
+    fn tokens(&self) -> &[u32] {
+        match self {
+            Prefilled::Attention(prefix) => prefix.tokens(),
+            Prefilled::Hybrid(prefix) => prefix.tokens(),
+        }
+    }
+}
+
+/// The states kept across requests, most recently used last.
+///
+/// `kev.serve` keeps four by default and keys them on the state's token ids;
+/// this does the same. A repeated state then costs only its questions, which is
+/// what a playground, or a chess board full of moves, does all day.
+struct PrefixCache {
+    keep: usize,
+    entries: Vec<Prefilled>,
+    hits: usize,
+    misses: usize,
+}
+
+impl PrefixCache {
+    fn get(&mut self, tokens: &[u32]) -> Option<Prefilled> {
+        let at = self
+            .entries
+            .iter()
+            .position(|entry| entry.tokens() == tokens)?;
+        // Most recently used last, so eviction takes from the front.
+        let entry = self.entries.remove(at);
+        self.entries.push(entry.clone());
+        Some(entry)
+    }
+
+    fn insert(&mut self, prefix: Prefilled) {
+        if self.keep == 0 {
+            return;
+        }
+        self.entries.push(prefix);
+        while self.entries.len() > self.keep {
+            self.entries.remove(0);
+        }
+    }
 }
 
 enum Model {
@@ -91,7 +150,59 @@ impl Backend {
             model,
             tokenizer,
             device,
+            prefix: true,
+            // A recurrent base has to run the state per question otherwise, so
+            // the reuse always pays there. On an attention-only base the packed
+            // pass already runs the state once, and the only win is a repeated
+            // state, so short ones are left alone - the same 384 `kev.serve`
+            // uses, and measured here for the same reason: several small passes
+            // cost more in overhead than one large one.
+            prefix_min: if hybrid { 0 } else { 384 },
+            cache: PrefixCache {
+                keep: 4,
+                entries: Vec::new(),
+                hits: 0,
+                misses: 0,
+            },
         })
+    }
+
+    /// Whether to run the state once per request and continue every question
+    /// from it, rather than running the state again for each question.
+    ///
+    /// On by default, and exact either way: the state cannot see a question, so
+    /// its keys, values and recurrent state do not depend on one. Turning it off
+    /// is for comparing the two.
+    pub fn with_prefix(mut self, prefix: bool) -> Self {
+        self.prefix = prefix;
+        self
+    }
+
+    /// The shortest state worth prefilling instead of running the packed pass:
+    /// `0` on a recurrent base, 384 tokens on an attention-only one.
+    ///
+    /// On an attention-only base a *miss* costs a few percent more than the
+    /// packed pass (more passes, more per-op overhead) while a *hit* skips the
+    /// state entirely — on a 1200-token state here, 20 ms against 129 ms. So the
+    /// threshold is about which requests are worth that bet.
+    pub fn with_prefix_min_tokens(mut self, tokens: usize) -> Self {
+        self.prefix_min = tokens;
+        self
+    }
+
+    /// How many states to keep across requests, keyed by their tokens. Four by
+    /// default, as in `kev.serve`; zero keeps none, and a request still runs its
+    /// own state only once.
+    pub fn with_prefix_cache(mut self, states: usize) -> Self {
+        self.cache.keep = states;
+        self.cache.entries.clear();
+        self
+    }
+
+    /// How often a request's state was found already prefilled, and how often it
+    /// had to be run — what `/v1/models` reports on the Python side.
+    pub fn prefix_hits(&self) -> (usize, usize) {
+        (self.cache.hits, self.cache.misses)
     }
 
     /// The width of the hidden states this backbone produces; the pointer head
@@ -107,6 +218,26 @@ impl Backend {
     /// one question per row.
     pub fn is_hybrid(&self) -> bool {
         matches!(self.model, Model::Hybrid(_))
+    }
+
+    /// The request's state, prefilled — from the cache when the same state came
+    /// through before.
+    fn prefilled(&mut self, state: &OwnedPass) -> Result<Prefilled> {
+        if let Some(prefix) = self.cache.get(&state.ids) {
+            self.cache.hits += 1;
+            return Ok(prefix);
+        }
+        self.cache.misses += 1;
+        let prefix = match &self.model {
+            Model::Attention(model) => {
+                Prefilled::Attention(Arc::new(model.prefill(&state.ids, &state.positions)?))
+            }
+            Model::Hybrid(model) => {
+                Prefilled::Hybrid(Arc::new(model.prefill(&state.ids, &state.positions)?))
+            }
+        };
+        self.cache.insert(prefix.clone());
+        Ok(prefix)
     }
 
     /// The hidden states at `readout`, as the trait wants them.
@@ -163,6 +294,42 @@ impl Forward for Backend {
     }
 
     fn hidden(&mut self, pass: &Pass<'_>) -> Result<Vec<Vec<f32>>> {
+        // The state is the part every question shares. Running it once and
+        // continuing each question from it is less work than the packed pass —
+        // which computes attention across questions only to mask it away — and
+        // on a recurrent base it is the only way not to run the state per
+        // question.
+        let state = pass
+            .segments
+            .iter()
+            .filter(|segment| **segment == 0)
+            .count();
+        if self.prefix && state >= self.prefix_min.max(1) {
+            let branches = pass.branches();
+            if !branches.is_empty() {
+                let prefix = self.prefilled(&pass.state())?;
+                let mut states = Vec::with_capacity(pass.readout.len());
+                for branch in &branches {
+                    let branch = branch.as_pass();
+                    let hidden = match (&self.model, &prefix) {
+                        (Model::Attention(model), Prefilled::Attention(prefix)) => {
+                            model.forward_from(prefix, branch.ids, branch.positions)?
+                        }
+                        (Model::Hybrid(model), Prefilled::Hybrid(prefix)) => {
+                            model.forward_from(prefix, branch.ids, branch.positions)?
+                        }
+                        _ => {
+                            return Err(Error::Engine(String::from(
+                                "this prefix was prefilled by another backbone",
+                            )))
+                        }
+                    };
+                    states.extend(self.pick(&hidden, branch.readout)?);
+                }
+                return Ok(states);
+            }
+        }
+
         match &self.model {
             Model::Attention(model) => {
                 let mask = attention_mask(

@@ -544,7 +544,11 @@ fn the_forward_pass_matches_a_transcription_of_modeling_qwen3() {
     // come before the rotation, which key/value head a query head reads, the
     // attention scaling, and the residual and normalisation order.
     let fixture = checkpoint("reference", false, false);
-    let mut backend = Backend::open(&fixture.dir, None).unwrap();
+    // The packed path: it is the one being transcribed, and the only one that
+    // returns hidden states for the state tokens as well as the branches.
+    let mut backend = Backend::open(&fixture.dir, None)
+        .unwrap()
+        .with_prefix(false);
 
     let ids: Vec<u32> = vec![1, 6, 7, 2, 12, 3, 14, 4, 5, 2, 13, 3, 11, 4, 5];
     let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2];
@@ -711,4 +715,145 @@ fn a_real_qwen_tokenizer_carries_the_five_delimiters() {
         1,
         "the state forged a state delimiter"
     );
+}
+
+#[test]
+fn running_the_state_once_gives_the_same_answers_as_running_it_per_question() {
+    // The optimisation has to be invisible: the state cannot see a question, so
+    // its keys and values do not depend on one.
+    let fixture = checkpoint("prefix", false, false);
+    let request = || {
+        SystemOneRequest::new("a ticket about money late shoes")
+            .ask("money", Noul::new("is this about money ?"))
+            .ask(
+                "team",
+                Choice::new("which team ?")
+                    .option_bare("returns")
+                    .option_bare("billing"),
+            )
+    };
+    let head = || pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
+
+    // A short state would otherwise take the packed pass on this backbone.
+    let with = LocalEngine::new(
+        Backend::open(&fixture.dir, None)
+            .unwrap()
+            .with_prefix_min_tokens(0),
+        head(),
+    )
+    .system_one_blocking(&request())
+    .unwrap();
+    let without = LocalEngine::new(
+        Backend::open(&fixture.dir, None)
+            .unwrap()
+            .with_prefix(false),
+        head(),
+    )
+    .system_one_blocking(&request())
+    .unwrap();
+
+    for id in ["money", "team"] {
+        let (with, without) = (with.answer(id).unwrap(), without.answer(id).unwrap());
+        assert_eq!(
+            format!("{with:?}"),
+            format!("{without:?}"),
+            "{id} differs between the prefix path and the packed one"
+        );
+    }
+}
+
+#[test]
+fn a_repeated_state_is_prefilled_once_and_then_found() {
+    let fixture = checkpoint("cache", false, false);
+    let mut backend = Backend::open(&fixture.dir, None)
+        .unwrap()
+        .with_prefix_min_tokens(0);
+    let ids: Vec<u32> = vec![1, 6, 7, 2, 12, 3, 14, 4, 5];
+    let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1];
+    let positions: Vec<u32> = (0..ids.len() as u32).collect();
+    let readout: Vec<usize> = vec![8, 7];
+    let pass = Pass {
+        ids: &ids,
+        positions: &positions,
+        segments: &segments,
+        readout: &readout,
+    };
+
+    let first = backend.hidden(&pass).unwrap();
+    assert_eq!(
+        backend.prefix_hits(),
+        (0, 1),
+        "the first state cannot be a hit"
+    );
+    let second = backend.hidden(&pass).unwrap();
+    assert_eq!(
+        backend.prefix_hits(),
+        (1, 1),
+        "the same state was run again"
+    );
+    assert_eq!(first, second, "the cached state answered differently");
+
+    // A different state is a miss, and with room for one state only the first is
+    // gone afterwards.
+    let other: Vec<u32> = vec![1, 6, 9, 2, 12, 3, 14, 4, 5];
+    let mut small = Backend::open(&fixture.dir, None)
+        .unwrap()
+        .with_prefix_min_tokens(0)
+        .with_prefix_cache(1);
+    let other_pass = Pass {
+        ids: &other,
+        positions: &positions,
+        segments: &segments,
+        readout: &readout,
+    };
+    small.hidden(&pass).unwrap();
+    small.hidden(&other_pass).unwrap();
+    small.hidden(&pass).unwrap();
+    assert_eq!(small.prefix_hits(), (0, 3), "one state was kept, not none");
+}
+
+#[test]
+#[ignore = "a measurement, not an assertion: cargo test -- --ignored --nocapture"]
+fn how_much_the_prefix_saves() {
+    use std::time::Instant;
+
+    let fixture = checkpoint("bench", false, false);
+    let state = "a ticket about money late shoes ".repeat(40);
+    let mut request = SystemOneRequest::new(state.clone());
+    for id in ["a", "b", "c", "d", "e"] {
+        request = request.ask(id, Noul::new("is this about money ?"));
+    }
+    let head = || pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
+
+    for (label, backend) in [
+        (
+            "repeated state (cache hit)",
+            Backend::open(&fixture.dir, None).unwrap(),
+        ),
+        (
+            "new state, prefilled      ",
+            Backend::open(&fixture.dir, None)
+                .unwrap()
+                .with_prefix_cache(0),
+        ),
+        (
+            "one packed pass           ",
+            Backend::open(&fixture.dir, None)
+                .unwrap()
+                .with_prefix(false),
+        ),
+    ] {
+        let engine = LocalEngine::new(backend, head());
+        engine.system_one_blocking(&request).unwrap(); // warm up
+        let started = Instant::now();
+        let runs = 5;
+        for _ in 0..runs {
+            engine.system_one_blocking(&request).unwrap();
+        }
+        println!(
+            "{label}: {:>7.1} ms  ({} state tokens, 5 questions)",
+            started.elapsed().as_secs_f64() * 1000.0 / runs as f64,
+            state.split_whitespace().count() + 1
+        );
+    }
 }

@@ -193,6 +193,30 @@ assert on JSON shape and public accessor behaviour, never on internals — keep
 new tests in that style, and update the README example and these fixtures
 together whenever the wire format legitimately changes.
 
+### The state prefix
+
+Every question of a request shares the state, so the state is run once and each
+question continues from it: attention layers keep the state's keys and values, a
+recurrent layer keeps its state matrix and the tail of its convolution window.
+Exact, because the state comes first and neither layer kind looks forward — the
+same reuse `kev.serve` does, for the same reason. `Backend` also keeps the last
+few states across requests, keyed by their token ids.
+
+The defaults differ by backbone, and the reason is measured, not assumed
+(`cargo test --features candle -- --ignored --nocapture` prints it):
+
+- A **recurrent** base would otherwise run the whole state through every layer
+  once per question, so the reuse always pays: 57 ms to 24 ms for five questions
+  on a 241-token state, and 14 ms when the state is a cache hit.
+- An **attention-only** base already runs the state once in the packed pass. A
+  cache *miss* is then a few percent slower (several small passes instead of one
+  big one), a *hit* skips the state altogether: on a 1200-token state, 129 ms to
+  20 ms. So the prefix path starts at 384 state tokens there, which is what
+  `kev.serve` uses too.
+
+`Backend::with_prefix(false)` turns it off and takes the packed path. That is the
+path the transcription tests compare against, so leave those calling it.
+
 ### Checking the engine against the server
 
 `examples/parity.rs` (feature `candle`) answers a recorded request in process and

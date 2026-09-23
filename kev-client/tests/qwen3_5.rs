@@ -564,7 +564,9 @@ fn the_forward_pass_matches_a_transcription_of_modeling_qwen3_5() {
     // one question's branch. Every hidden unit of every token is compared, not
     // just the ones the readout looks at.
     let fixture = checkpoint("reference", false, false);
-    let mut backend = Backend::open(&fixture.dir, None).unwrap();
+    let mut backend = Backend::open(&fixture.dir, None)
+        .unwrap()
+        .with_prefix(false);
 
     let ids: Vec<u32> = vec![1, 6, 7, 2, 12, 3, 14, 4, 5];
     let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1];
@@ -679,4 +681,81 @@ fn an_adapter_is_merged_into_the_recurrence() {
         probability(&base, "money"),
         "the adapter changed nothing, so it was not applied"
     );
+}
+
+#[test]
+fn running_the_state_once_gives_the_same_answers_as_running_it_per_question() {
+    // This is where the reuse earns its keep: without it a hybrid base runs the
+    // whole state through every layer once per question. The recurrent state and
+    // the convolution window after the state do not depend on the questions, so
+    // the answers must not change.
+    let fixture = checkpoint("prefix", false, false);
+    let head = || pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
+
+    let with = LocalEngine::new(Backend::open(&fixture.dir, None).unwrap(), head())
+        .system_one_blocking(&a_request())
+        .unwrap();
+    let without = LocalEngine::new(
+        Backend::open(&fixture.dir, None)
+            .unwrap()
+            .with_prefix(false),
+        head(),
+    )
+    .system_one_blocking(&a_request())
+    .unwrap();
+
+    for id in ["money", "late"] {
+        assert!(
+            (probability(&with, id) - probability(&without, id)).abs() < 1e-6,
+            "{id}: {} with the prefix, {} without",
+            probability(&with, id),
+            probability(&without, id)
+        );
+    }
+}
+
+#[test]
+#[ignore = "a measurement, not an assertion: cargo test -- --ignored --nocapture"]
+fn how_much_the_prefix_saves() {
+    use std::time::Instant;
+
+    let fixture = checkpoint("bench", false, false);
+    let state = "a ticket about money late shoes ".repeat(40);
+    let mut request = SystemOneRequest::new(state.clone());
+    for id in ["a", "b", "c", "d", "e"] {
+        request = request.ask(id, Noul::new("is this about money ?"));
+    }
+    let head = || pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
+
+    for (label, backend) in [
+        (
+            "repeated state (cache hit)  ",
+            Backend::open(&fixture.dir, None).unwrap(),
+        ),
+        (
+            "new state, once per request ",
+            Backend::open(&fixture.dir, None)
+                .unwrap()
+                .with_prefix_cache(0),
+        ),
+        (
+            "new state, once per question",
+            Backend::open(&fixture.dir, None)
+                .unwrap()
+                .with_prefix(false),
+        ),
+    ] {
+        let engine = LocalEngine::new(backend, head());
+        engine.system_one_blocking(&request).unwrap(); // warm up
+        let started = Instant::now();
+        let runs = 3;
+        for _ in 0..runs {
+            engine.system_one_blocking(&request).unwrap();
+        }
+        println!(
+            "{label}: {:>7.1} ms  ({} state tokens, 5 questions)",
+            started.elapsed().as_secs_f64() * 1000.0 / runs as f64,
+            state.split_whitespace().count() + 1
+        );
+    }
 }

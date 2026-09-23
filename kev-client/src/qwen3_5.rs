@@ -24,7 +24,9 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::qwen3::{read_config, supported_rope, RopeParameters};
-use crate::weights::{linear, repeat_kv, rms_norm, rope, rotary_tables, Weights};
+use crate::weights::{
+    attention_mask, branch_mask, linear, repeat_kv, rms_norm, rope, rotary_tables, Weights,
+};
 
 /// Hugging Face's default when a Qwen3.5 config does not state one.
 const DEFAULT_PARTIAL_ROTARY_FACTOR: f64 = 0.25;
@@ -134,6 +136,11 @@ impl Config {
                 "this backbone reads no attention bias, and the config asks for one",
             )));
         }
+        if self.linear_conv_kernel_dim < 2 {
+            return Err(Error::Engine(String::from(
+                "a convolution kernel below 2 is not implemented",
+            )));
+        }
         if self.num_attention_heads % self.num_key_value_heads != 0
             || self.linear_num_value_heads % self.linear_num_key_heads != 0
         {
@@ -143,6 +150,40 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// A prefilled state: what every question of a request continues from.
+///
+/// An attention layer contributes the state's keys and values; a recurrent layer
+/// contributes its state matrix and the tail of its convolution window. Neither
+/// depends on the questions — the state comes first, and both layer kinds only
+/// ever look backwards — so one prefill serves every question of a request, and
+/// the next request with the same state. That is the reuse `kev.serve` does, and
+/// on these bases it is the difference between running the state once and running
+/// it once per question.
+pub struct Prefix {
+    tokens: Vec<u32>,
+    layers: Vec<LayerPrefix>,
+}
+
+impl Prefix {
+    /// The state tokens this was prefilled from; the cache key.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+}
+
+enum LayerPrefix {
+    Attention {
+        keys: Tensor,
+        values: Tensor,
+    },
+    Recurrence {
+        /// The last `kernel - 1` columns of the convolution's input.
+        window: Tensor,
+        /// One state matrix per value head.
+        state: Tensor,
+    },
 }
 
 /// A Qwen3.5 backbone with the checkpoint's LoRA adapter already merged.
@@ -263,12 +304,45 @@ impl Backbone {
     /// the tokens its question may read, in order, which is what
     /// [`Pass::rows`](crate::Pass::rows) produces.
     pub fn forward(&self, ids: &[u32], positions: &[u32], mask: &Tensor) -> Result<Tensor> {
+        Ok(self.run(ids, positions, mask, None)?.0)
+    }
+
+    /// Run the state tokens and keep what a branch needs to continue from them.
+    pub fn prefill(&self, ids: &[u32], positions: &[u32]) -> Result<Prefix> {
+        let mask = attention_mask(ids.len(), |query, key| key <= query, &self.device)?;
+        let (_, layers) = self.run(ids, positions, &mask, None)?;
+        Ok(Prefix {
+            tokens: ids.to_vec(),
+            layers,
+        })
+    }
+
+    /// The hidden states of one branch, continuing from a prefilled state.
+    pub fn forward_from(&self, prefix: &Prefix, ids: &[u32], positions: &[u32]) -> Result<Tensor> {
+        let mask = branch_mask(prefix.tokens.len(), ids.len(), &self.device)?;
+        Ok(self.run(ids, positions, &mask, Some(prefix))?.0)
+    }
+
+    fn run(
+        &self,
+        ids: &[u32],
+        positions: &[u32],
+        mask: &Tensor,
+        prefix: Option<&Prefix>,
+    ) -> Result<(Tensor, Vec<LayerPrefix>)> {
         if ids.len() != positions.len() {
             return Err(Error::Engine(format!(
                 "{} tokens but {} position ids",
                 ids.len(),
                 positions.len()
             )));
+        }
+        if let Some(prefix) = prefix {
+            if prefix.layers.len() != self.layers.len() {
+                return Err(Error::Engine(String::from(
+                    "this prefix was prefilled by another model",
+                )));
+            }
         }
         let tokens = Tensor::from_slice(ids, ids.len(), &self.device)?;
         let mut xs = self
@@ -284,14 +358,41 @@ impl Backbone {
             &self.device,
         )?;
         let eps = self.config.rms_norm_eps;
-        for layer in &self.layers {
+        let mut kept = Vec::with_capacity(self.layers.len());
+        for (index, layer) in self.layers.iter().enumerate() {
+            let past = prefix.map(|prefix| &prefix.layers[index]);
             let residual = xs.clone();
             let normed = rms_norm(&xs, &layer.input_norm, eps)?;
-            let mixed = match &layer.mixer {
-                Mixer::Attention(attention) => {
-                    self.attention(attention, &normed, &cos, &sin, mask)?
+            let mixed = match (&layer.mixer, past) {
+                (Mixer::Attention(attention), past) => {
+                    let past = match past {
+                        Some(LayerPrefix::Attention { keys, values }) => Some((keys, values)),
+                        Some(LayerPrefix::Recurrence { .. }) => {
+                            return Err(Error::Engine(String::from(
+                                "this prefix has the layers the wrong way round",
+                            )))
+                        }
+                        None => None,
+                    };
+                    let (mixed, keys, values) =
+                        self.attention(attention, &normed, &cos, &sin, mask, past)?;
+                    kept.push(LayerPrefix::Attention { keys, values });
+                    mixed
                 }
-                Mixer::Recurrence(recurrence) => self.recurrence(recurrence, &normed)?,
+                (Mixer::Recurrence(recurrence), past) => {
+                    let past = match past {
+                        Some(LayerPrefix::Recurrence { window, state }) => Some((window, state)),
+                        Some(LayerPrefix::Attention { .. }) => {
+                            return Err(Error::Engine(String::from(
+                                "this prefix has the layers the wrong way round",
+                            )))
+                        }
+                        None => None,
+                    };
+                    let (mixed, window, state) = self.recurrence(recurrence, &normed, past)?;
+                    kept.push(LayerPrefix::Recurrence { window, state });
+                    mixed
+                }
             };
             xs = (residual + mixed)?;
 
@@ -300,11 +401,12 @@ impl Backbone {
             xs = (residual + self.feed_forward(layer, &normed)?)?;
         }
 
-        Ok(rms_norm(&xs, &self.norm, eps)?.i(0)?)
+        Ok((rms_norm(&xs, &self.norm, eps)?.i(0)?, kept))
     }
 
     /// Attention as Qwen3 does it, plus the output gate that comes out of the
-    /// second half of `q_proj`.
+    /// second half of `q_proj`, and optionally continuing from a state's keys
+    /// and values.
     fn attention(
         &self,
         layer: &Attention,
@@ -312,7 +414,8 @@ impl Backbone {
         cos: &Tensor,
         sin: &Tensor,
         mask: &Tensor,
-    ) -> Result<Tensor> {
+        past: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (_, len, _) = xs.dims3()?;
         let heads = self.config.num_attention_heads;
         let kv_heads = self.config.num_key_value_heads;
@@ -334,20 +437,26 @@ impl Backbone {
         let k = rope(&k.transpose(1, 2)?, cos, sin)?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let k = repeat_kv(&k, heads / kv_heads)?;
-        let v = repeat_kv(&v, heads / kv_heads)?;
+        let (keys, values) = match past {
+            None => (k.clone(), v.clone()),
+            Some((past_k, past_v)) => (
+                Tensor::cat(&[past_k, &k], 2)?.contiguous()?,
+                Tensor::cat(&[past_v, &v], 2)?.contiguous()?,
+            ),
+        };
 
+        let repeats = heads / kv_heads;
         let scale = 1.0 / (dim as f64).sqrt();
-        let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let scores = (q.matmul(&repeat_kv(&keys, repeats)?.transpose(2, 3)?)? * scale)?;
         let scores = scores.broadcast_add(mask)?;
         let weights = candle_nn::ops::softmax_last_dim(&scores)?;
 
         let out = weights
-            .matmul(&v)?
+            .matmul(&repeat_kv(&values, repeats)?)?
             .transpose(1, 2)?
             .reshape((1, len, heads * dim))?;
         let out = (out * candle_nn::ops::sigmoid(&gate)?)?;
-        Ok(linear(&out, &layer.o_proj)?)
+        Ok((linear(&out, &layer.o_proj)?, k, v))
     }
 
     /// The gated delta rule, token by token.
@@ -362,24 +471,39 @@ impl Backbone {
     /// S <- S + k_t^T delta                 write it back
     /// out_t <- q_t S
     /// ```
-    fn recurrence(&self, layer: &DeltaNet, xs: &Tensor) -> Result<Tensor> {
+    fn recurrence(
+        &self,
+        layer: &DeltaNet,
+        xs: &Tensor,
+        past: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (_, len, _) = xs.dims3()?;
         let config = &self.config;
         let (key_heads, value_heads) = (config.linear_num_key_heads, config.linear_num_value_heads);
         let (key_dim, value_dim) = (config.linear_key_head_dim, config.linear_value_head_dim);
         let keys = key_heads * key_dim;
         let values = value_heads * value_dim;
+        let channels = 2 * keys + values;
+        let kernel = config.linear_conv_kernel_dim;
 
         // Queries, keys and values share one projection and one depthwise
         // convolution over time, which is what makes this a *short* convolution
         // in front of the recurrence rather than an attention.
-        let mixed = linear(xs, &layer.in_proj_qkv)?
+        let projected = linear(xs, &layer.in_proj_qkv)?
             .transpose(1, 2)?
             .contiguous()?;
-        let kernel = config.linear_conv_kernel_dim;
-        let mixed = mixed.conv1d(&layer.conv1d, kernel - 1, 1, 1, 2 * keys + values)?;
-        // The convolution is padded on both ends; only the causal part is kept.
-        let mixed = candle_nn::ops::silu(&mixed.narrow(2, 0, len)?)?.transpose(1, 2)?;
+        // The convolution reaches `kernel - 1` tokens back. At the start of a
+        // sequence that is zeros, which is the same as the reference's padding;
+        // continuing from a state, it is the tail the prefix kept.
+        let window = match past {
+            Some((window, _)) => window.clone(),
+            None => Tensor::zeros((1, channels, kernel - 1), DType::F32, &self.device)?,
+        };
+        let inputs = Tensor::cat(&[&window, &projected], 2)?.contiguous()?;
+        let mixed = inputs.conv1d(&layer.conv1d, 0, 1, 1, channels)?;
+        let mixed = candle_nn::ops::silu(&mixed)?.transpose(1, 2)?;
+        // What the next branch, or the next request, reaches back into.
+        let kept_window = inputs.narrow(2, len, kernel - 1)?.contiguous()?;
 
         let q = mixed
             .narrow(2, 0, keys)?
@@ -407,7 +531,10 @@ impl Backbone {
         // The reference scales the query by the key width, not the value width.
         let q = (q / (key_dim as f64).sqrt())?;
 
-        let mut state = Tensor::zeros((value_heads, key_dim, value_dim), DType::F32, &self.device)?;
+        let mut state = match past {
+            Some((_, state)) => state.clone(),
+            None => Tensor::zeros((value_heads, key_dim, value_dim), DType::F32, &self.device)?,
+        };
         let mut out = Vec::with_capacity(len);
         for step in 0..len {
             let at = |tensor: &Tensor, width: usize| -> Result<Tensor> {
@@ -437,7 +564,7 @@ impl Backbone {
         // The output norm is gated by z, and normalises one head at a time.
         let out = rms_norm(&out, &layer.norm, config.rms_norm_eps)?;
         let out = (out * candle_nn::ops::silu(&z)?)?.reshape((1, len, values))?;
-        Ok(linear(&out, &layer.out_proj)?)
+        Ok((linear(&out, &layer.out_proj)?, kept_window, state))
     }
 
     fn feed_forward(&self, layer: &Layer, xs: &Tensor) -> Result<Tensor> {

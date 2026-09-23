@@ -20,7 +20,9 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::weights::{linear, repeat_kv, rms_norm, rope, rotary_tables, Weights};
+use crate::weights::{
+    attention_mask, branch_mask, linear, repeat_kv, rms_norm, rope, rotary_tables, Weights,
+};
 
 /// The parts of a Qwen3 `config.json` this backbone needs.
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +153,22 @@ impl Config {
     }
 }
 
+/// A prefilled state: what every question of a request continues from.
+///
+/// Holds one layer's worth of keys and values per layer, for the state tokens
+/// only. Cheap to share — the tensors are read, never written.
+pub struct Prefix {
+    tokens: Vec<u32>,
+    layers: Vec<(Tensor, Tensor)>,
+}
+
+impl Prefix {
+    /// The state tokens this was prefilled from; the cache key.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+}
+
 /// A Qwen3 backbone with the checkpoint's LoRA adapter already merged.
 pub struct Backbone {
     config: Config,
@@ -231,12 +249,55 @@ impl Backbone {
     /// `[1, 1, n, n]`: `0.0` where a token may read another, very negative
     /// where it may not.
     pub fn forward(&self, ids: &[u32], positions: &[u32], mask: &Tensor) -> Result<Tensor> {
+        Ok(self.run(ids, positions, mask, None)?.0)
+    }
+
+    /// Run the state tokens and keep what a branch needs to continue from them.
+    ///
+    /// The state never attends to a branch (it comes first, and attention is
+    /// causal), so its keys and values do not depend on the questions: one
+    /// prefill serves every question, and serves the next request with the same
+    /// state too. This is the same reuse `kev.serve` does, and exact for the
+    /// same reason.
+    pub fn prefill(&self, ids: &[u32], positions: &[u32]) -> Result<Prefix> {
+        let mask = attention_mask(ids.len(), |query, key| key <= query, &self.device)?;
+        let (_, layers) = self.run(ids, positions, &mask, None)?;
+        Ok(Prefix {
+            tokens: ids.to_vec(),
+            layers,
+        })
+    }
+
+    /// The hidden states of one branch, continuing from a prefilled state.
+    ///
+    /// The branch sees the whole state and its own tokens up to each position,
+    /// which is exactly what the packed mask would allow it.
+    pub fn forward_from(&self, prefix: &Prefix, ids: &[u32], positions: &[u32]) -> Result<Tensor> {
+        let state = prefix.tokens.len();
+        let mask = branch_mask(state, ids.len(), &self.device)?;
+        Ok(self.run(ids, positions, &mask, Some(prefix))?.0)
+    }
+
+    fn run(
+        &self,
+        ids: &[u32],
+        positions: &[u32],
+        mask: &Tensor,
+        prefix: Option<&Prefix>,
+    ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
         if ids.len() != positions.len() {
             return Err(Error::Engine(format!(
                 "{} tokens but {} position ids",
                 ids.len(),
                 positions.len()
             )));
+        }
+        if let Some(prefix) = prefix {
+            if prefix.layers.len() != self.layers.len() {
+                return Err(Error::Engine(String::from(
+                    "this prefix was prefilled by another model",
+                )));
+            }
         }
         let tokens = Tensor::from_slice(ids, ids.len(), &self.device)?;
         let mut xs = self
@@ -251,19 +312,32 @@ impl Backbone {
             self.config.rope_theta()?,
             &self.device,
         )?;
-        for layer in &self.layers {
+        let mut kept = Vec::with_capacity(self.layers.len());
+        for (index, layer) in self.layers.iter().enumerate() {
+            let past = prefix.map(|prefix| {
+                let (k, v) = &prefix.layers[index];
+                (k, v)
+            });
             let residual = xs.clone();
             let normed = rms_norm(&xs, &layer.input_norm, self.config.rms_norm_eps)?;
-            xs = (residual + self.attention(layer, &normed, &cos, &sin, mask)?)?;
+            let (attended, k, v) = self.attention(layer, &normed, &cos, &sin, mask, past)?;
+            kept.push((k, v));
+            xs = (residual + attended)?;
 
             let residual = xs.clone();
             let normed = rms_norm(&xs, &layer.post_attention_norm, self.config.rms_norm_eps)?;
             xs = (residual + self.feed_forward(layer, &normed)?)?;
         }
 
-        Ok(rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?.i(0)?)
+        Ok((
+            rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?.i(0)?,
+            kept,
+        ))
     }
 
+    /// Attention over the branch tokens, optionally continuing from a state's
+    /// keys and values. Returns the output and this pass's keys and values, so a
+    /// prefill can keep them.
     fn attention(
         &self,
         layer: &Layer,
@@ -271,7 +345,8 @@ impl Backbone {
         cos: &Tensor,
         sin: &Tensor,
         mask: &Tensor,
-    ) -> Result<Tensor> {
+        past: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (_, len, _) = xs.dims3()?;
         let heads = self.config.num_attention_heads;
         let kv_heads = self.config.num_key_value_heads;
@@ -288,20 +363,28 @@ impl Backbone {
         let k = rope(&k.transpose(1, 2)?, cos, sin)?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let k = repeat_kv(&k, heads / kv_heads)?;
-        let v = repeat_kv(&v, heads / kv_heads)?;
+        // The state's keys and values sit in front of this pass's, which is what
+        // makes a branch see the whole state and nothing of another branch.
+        let (keys, values) = match past {
+            None => (k.clone(), v.clone()),
+            Some((past_k, past_v)) => (
+                Tensor::cat(&[past_k, &k], 2)?.contiguous()?,
+                Tensor::cat(&[past_v, &v], 2)?.contiguous()?,
+            ),
+        };
 
+        let repeats = heads / kv_heads;
         let scale = 1.0 / (dim as f64).sqrt();
-        let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let scores = (q.matmul(&repeat_kv(&keys, repeats)?.transpose(2, 3)?)? * scale)?;
         // The mask is what keeps one question from reading another.
         let scores = scores.broadcast_add(mask)?;
         let weights = candle_nn::ops::softmax_last_dim(&scores)?;
 
         let out = weights
-            .matmul(&v)?
+            .matmul(&repeat_kv(&values, repeats)?)?
             .transpose(1, 2)?
             .reshape((1, len, heads * dim))?;
-        Ok(linear(&out, &layer.o_proj)?)
+        Ok((linear(&out, &layer.o_proj)?, k, v))
     }
 
     fn feed_forward(&self, layer: &Layer, xs: &Tensor) -> Result<Tensor> {
