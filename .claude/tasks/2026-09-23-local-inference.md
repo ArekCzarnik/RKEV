@@ -609,6 +609,49 @@ only prints the 4B numbers beside its own.
 What this does *not* establish is parity: whether the Python answers `kev-0.6b`
 with these same numbers. That still needs the server once.
 
+## Done: the measurements, on a real checkpoint
+
+Commit "Add a measure example". `examples/measure.rs` asks the performance
+questions of real weights instead of the fixtures, and `scripts/local.sh
+--measure` now runs it before the `#[ignore]`d fixture measurements:
+
+```bash
+cargo run --release --features candle --example measure -- \
+    --base <base> --checkpoint <kev> [--words 400] [--repeat 3] [--batch 4]
+```
+
+Rows: the packed path, the prefix with nothing kept, the prefix with a cache hit,
+f16 against f32 in time *and* in largest answer difference, the delta rule
+sequential against chunked on a hybrid base, and several requests prefilled
+together against one at a time. Then the ratios, which are the only part worth
+quoting.
+
+Four decisions, all of them about not fooling ourselves — the bogus f16/f32
+comparison earlier in this task is the reason:
+
+- **`with_prefix_min_tokens(0)`.** An attention-only base skips the prefix below
+  384 state tokens, so without this both prefix rows would measure the packed path
+  and agree beautifully.
+- **A control row with the cache off.** The cached row is only evidence if it sits
+  far below the same configuration keeping nothing.
+- **f16's largest difference from f32, in the same run.** A speed-up that moves
+  the probabilities is not a speed-up, and quoting a difference measured elsewhere
+  is how that gets missed.
+- **A failed pass is an error, not a fast one.** The first draft of `times()`
+  discarded the result, which would have printed an excellent number for a
+  request that never answered.
+
+Each cold pass gets its own state, so it is a real miss rather than the same state
+twice; each row is a median with min and max printed beside it.
+
+Verified here on both synthetic fixtures — the harness runs, and the numbers
+reproduce what the fixture measurements already said: at toy widths the prefix
+pays on a recurrent base (2.2x) and not on an attention-only one, chunking does
+not pay (0.87x), f16 is roughly neutral. **The numbers that matter are the ones
+from the real checkpoint, and only the user's Mac can produce them** — with a
+400-word state the container's hybrid fixture shows the shape (cache 3.6x, f16
+1.15x) but not the magnitudes.
+
 ## Left to do
 
 1. **Parity — the only thing left that needs the server.** The loading, the real

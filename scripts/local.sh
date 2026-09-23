@@ -291,7 +291,14 @@ step "one request end to end (example decide)" \
     --state "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card."
 
 if [ "$measure" -eq 1 ]; then
-    step "the timing measurements (#[ignore]d tests)" \
+    # On the real checkpoint: what f16 buys, and what the prefix cache buys, with
+    # the controls that keep a cache hit from being read as a precision win.
+    step "the timings on this checkpoint (example measure)" \
+        cargo run --release --no-default-features --features candle --example measure -- \
+        "${model[@]}"
+    # And on the synthetic fixtures, which is where the released checkpoints'
+    # layer widths are reproduced without their weights.
+    step "the timings on the fixtures (#[ignore]d tests)" \
         cargo test --release --no-default-features --features candle -- --ignored --nocapture
 fi
 

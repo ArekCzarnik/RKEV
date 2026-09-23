@@ -286,6 +286,21 @@ What the measurements say, for five questions:
 `Backend::with_prefix(false)` keeps the packed path, which is what the
 transcription tests compare against, so leave those calling it.
 
+`examples/measure.rs` (feature `candle`) is the same set of questions asked of a
+real checkpoint: the packed path, the prefix with nothing kept, the prefix with a
+cache hit, f16 against f32 both in time and in largest answer difference, the
+delta rule sequential against chunked on a hybrid base, and several requests
+prefilled together against one at a time. `scripts/local.sh --measure` runs it and
+then the `#[ignore]`d fixture measurements.
+
+Three things in there are deliberate, and are the difference between a measurement
+and a story: `with_prefix_min_tokens(0)`, without which an attention-only base
+below 384 state tokens skips the prefix and both prefix rows measure the packed
+path; a control row with the cache off, so a cached row that is not far below it
+cannot be read as the cache working; and f16's largest difference from f32 taken
+in the same run, because a speed-up that moves the probabilities is not a win. A
+failed pass is an error rather than a fast one, for the same reason.
+
 ### Precision
 
 The backbone runs in whatever `Backend::open_as` is given; `open_on` picks it the

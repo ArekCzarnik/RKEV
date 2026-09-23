@@ -205,6 +205,23 @@ That is worth something while the states are short — eight 20-token states ran
 about 1.4x faster batched here — and nothing when each state already fills the
 machine, so measure before reaching for it.
 
+All of this is measurable on your own checkpoint rather than on the fixtures —
+what the prefix, its cache and f16 are worth on the weights you will serve:
+
+```bash
+cargo run --release --features candle --example measure -- \
+    --base <base> --checkpoint <kev> [--words 400] [--repeat 3] [--batch 4]
+```
+
+Every row is a median over `--repeat` passes, each cold pass over its own state so
+it is a real cache miss. Two of the rows are controls: the same configuration with
+nothing kept between requests, so a cached row that is not far below it is not
+measuring the cache, and f16's largest difference from f32 on the same answers, so
+a speed-up that costs the probabilities is visible in the same table. The prefix
+threshold is forced to zero, since an attention-only base otherwise skips the
+prefix below 384 state tokens and both prefix rows would quietly measure the
+packed path.
+
 Precision follows the device, as the Python server does it: bf16 on a GPU, f32 on
 the CPU, which is the path every published number was measured at. The LoRA is
 merged in f32 before the cast, and the delta rule, the gated norm and the pointer
