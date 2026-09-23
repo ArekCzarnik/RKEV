@@ -141,8 +141,14 @@ let backend = Backend::open(base, Some(checkpoint))?
 let (hits, misses) = backend.prefix_hits();
 ```
 
-It is still not fast: CPU by default, f32, no batching, and the recurrence runs
-one token at a time.
+The questions' branches then run as one padded batch, and on a recurrent base the
+delta rule runs in chunks of 64 tokens rather than token by token. Both are exact;
+between them and the prefix, a five-question request over a 500-token state went
+from about two seconds to under half of one here — on a model with the released
+checkpoints' widths, but made-up weights, so take it as a ratio.
+
+It is still CPU and f32 unless you hand `Backend::open_on` a device, and nothing
+is quantised.
 
 Both forward passes are checked against transcriptions of Hugging Face's
 `modeling_qwen3.py` and `modeling_qwen3_5.py`, so the arithmetic is the

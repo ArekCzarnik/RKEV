@@ -199,6 +199,16 @@ impl Backend {
         self
     }
 
+    /// Force the chunked form of the delta rule on or off, on a hybrid
+    /// checkpoint. Left alone it is chosen per request; see
+    /// [`qwen3_5::Backbone::with_chunked_recurrence`].
+    pub fn with_chunked_recurrence(mut self, chunked: bool) -> Self {
+        if let Model::Hybrid(model) = self.model {
+            self.model = Model::Hybrid(model.with_chunked_recurrence(chunked));
+        }
+        self
+    }
+
     /// How often a request's state was found already prefilled, and how often it
     /// had to be run — what `/v1/models` reports on the Python side.
     pub fn prefix_hits(&self) -> (usize, usize) {
@@ -308,23 +318,29 @@ impl Forward for Backend {
             let branches = pass.branches();
             if !branches.is_empty() {
                 let prefix = self.prefilled(&pass.state())?;
+                // Every question at once: the rows are padded to the longest and
+                // run as one batch, which on a CPU is most of what a short branch
+                // costs.
+                let rows: Vec<(&[u32], &[u32])> = branches
+                    .iter()
+                    .map(|branch| (branch.ids.as_slice(), branch.positions.as_slice()))
+                    .collect();
+                let hidden = match (&self.model, &prefix) {
+                    (Model::Attention(model), Prefilled::Attention(prefix)) => {
+                        model.forward_from_batch(prefix, &rows)?
+                    }
+                    (Model::Hybrid(model), Prefilled::Hybrid(prefix)) => {
+                        model.forward_from_batch(prefix, &rows)?
+                    }
+                    _ => {
+                        return Err(Error::Engine(String::from(
+                            "this prefix was prefilled by another backbone",
+                        )))
+                    }
+                };
                 let mut states = Vec::with_capacity(pass.readout.len());
-                for branch in &branches {
-                    let branch = branch.as_pass();
-                    let hidden = match (&self.model, &prefix) {
-                        (Model::Attention(model), Prefilled::Attention(prefix)) => {
-                            model.forward_from(prefix, branch.ids, branch.positions)?
-                        }
-                        (Model::Hybrid(model), Prefilled::Hybrid(prefix)) => {
-                            model.forward_from(prefix, branch.ids, branch.positions)?
-                        }
-                        _ => {
-                            return Err(Error::Engine(String::from(
-                                "this prefix was prefilled by another backbone",
-                            )))
-                        }
-                    };
-                    states.extend(self.pick(&hidden, branch.readout)?);
+                for (hidden, branch) in hidden.iter().zip(&branches) {
+                    states.extend(self.pick(hidden, &branch.readout)?);
                 }
                 return Ok(states);
             }

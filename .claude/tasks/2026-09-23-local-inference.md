@@ -279,6 +279,45 @@ transcription tests compare against. Both backbones have a test asserting that
 the prefix path answers identically, and the cache has one for hits, misses and
 eviction.
 
+## Done: batched branches, and the delta rule in chunks
+
+Commit "Batch the branches, chunk the delta rule".
+
+**Batching.** The branches of one request are padded to the longest and run as one
+pass (`forward_from_batch`, `pad_rows`, `branch_batch_mask`). Both backbones took
+a batch dimension for it; a pad key is closed to every real query by the mask, a
+pad query is left the state to look at so no softmax row is empty, and pads are
+never read back. Worth a lot where a pass is short and per-call overhead
+dominates (the toy model: branches 11 ms to 4.5 ms), and little where the
+arithmetic already fills the CPU (the wide model: 409 to 375 ms).
+
+**Chunks.** `torch_chunk_gated_delta_rule`, transcribed: within a chunk of 64
+tokens the updates are condensed into matmuls through a UT transform — pairwise
+decays, a unit lower triangular system — and the sequential scan is left one step
+per chunk. The inverse of that system is built block by block, recursing on the
+two diagonal blocks at once (they are independent, so they go in the batch
+dimension): `log2(64)` levels of two matmuls, against `12` matmuls of `64^3` for
+the obvious `I + A + A^2 + ...`, which measured 8% of the whole request.
+
+Whether chunking pays depends on shape, and the toy model says the opposite of the
+released one, so `chunking_pays` decides per request: more than a chunk of tokens,
+and `key * value` above `chunk^2 / 6`. The released checkpoints (128 by 128) are
+far above it; the test fixtures far below. `with_chunked_recurrence` forces either
+form, which is how the test compares them.
+
+| recurrent base, 128-wide heads, 511 state tokens, 5 questions | |
+|---|---|
+| token by token | 1930 ms |
+| in chunks | 940 ms |
+| in chunks, state cached | 375 ms |
+
+`tests/qwen3_5.rs` runs the transcription against both forms — a long row where
+the chunked path is exercised properly, and a short one where the padding is
+nearly everything. Four deliberate mistakes in the chunked path were caught and
+none of them by the short-row test, which is what says the long one earns its
+place: no causal mask on the pairwise decays, the inverse truncated, the keys not
+decayed to the chunk end, and the strict lower triangle taken inclusive.
+
 ## Left to do
 
 1. **Parity — the tool is there, it has not been run.** `examples/parity.rs`
@@ -292,11 +331,11 @@ eviction.
    thing. Run it with `KEV_TOKENIZER` set too, so the opt-in tokenizer checks
    come along. A real `head.pt` is part of what it exercises: the fixture here is
    in torch's shape, but only torch writes the real thing.
-2. **Performance, what is left of it.** The state prefix is in (below). Still
-   open: rows are run one at a time rather than batched into one padded pass
-   (`rows_per_pass` on the Python side), the recurrence steps token by token
-   rather than in chunks (`torch_chunk_gated_delta_rule`), everything is f32 on
-   the CPU unless a caller passes a device, and nothing is quantised.
+2. **Performance, what is left of it.** The prefix, the batched branches and the
+   chunked delta rule are in (below). Still open: everything is f32 on the CPU
+   unless a caller passes a device, nothing is quantised, the prefill itself is a
+   single row (batching across *requests* would need a queue), and the chunk size
+   is fixed at 64.
 3. `permute`, and `option_isolation` if a checkpoint ever serves with it.
 
 ## Design decisions

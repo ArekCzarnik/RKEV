@@ -25,7 +25,8 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::qwen3::{read_config, supported_rope, RopeParameters};
 use crate::weights::{
-    attention_mask, branch_mask, linear, repeat_kv, rms_norm, rope, rotary_tables, Weights,
+    attention_mask, branch_batch_mask, linear, pad_rows, repeat_kv, rms_norm, rope, rotary_tables,
+    Weights,
 };
 
 /// Hugging Face's default when a Qwen3.5 config does not state one.
@@ -193,6 +194,9 @@ pub struct Backbone {
     layers: Vec<Layer>,
     norm: Tensor,
     device: Device,
+    /// Whether the delta rule runs in chunks; `None` decides per request. See
+    /// [`Backbone::with_chunked_recurrence`].
+    chunked: Option<bool>,
 }
 
 struct Layer {
@@ -286,7 +290,21 @@ impl Backbone {
             layers,
             config,
             device: device.clone(),
+            chunked: None,
         })
+    }
+
+    /// Force the chunked form of the delta rule on or off.
+    ///
+    /// Left alone, it is chosen per request: chunks over 64 tokens, and only when
+    /// the value heads are wide enough to pay for the per-chunk algebra. On the
+    /// released checkpoints (128-wide keys and values) they are, by a wide
+    /// margin; on a toy model they are not, and chunking costs more than it
+    /// saves. Both forms produce the same numbers — the difference is measured,
+    /// not assumed, and `tests/qwen3_5.rs` has the measurement.
+    pub fn with_chunked_recurrence(mut self, chunked: bool) -> Self {
+        self.chunked = Some(chunked);
+        self
     }
 
     pub fn config(&self) -> &Config {
@@ -304,13 +322,14 @@ impl Backbone {
     /// the tokens its question may read, in order, which is what
     /// [`Pass::rows`](crate::Pass::rows) produces.
     pub fn forward(&self, ids: &[u32], positions: &[u32], mask: &Tensor) -> Result<Tensor> {
-        Ok(self.run(ids, positions, mask, None)?.0)
+        let (hidden, _) = self.run(&[(ids, positions)], mask, None)?;
+        Ok(hidden.i(0)?)
     }
 
     /// Run the state tokens and keep what a branch needs to continue from them.
     pub fn prefill(&self, ids: &[u32], positions: &[u32]) -> Result<Prefix> {
         let mask = attention_mask(ids.len(), |query, key| key <= query, &self.device)?;
-        let (_, layers) = self.run(ids, positions, &mask, None)?;
+        let (_, layers) = self.run(&[(ids, positions)], &mask, None)?;
         Ok(Prefix {
             tokens: ids.to_vec(),
             layers,
@@ -319,23 +338,58 @@ impl Backbone {
 
     /// The hidden states of one branch, continuing from a prefilled state.
     pub fn forward_from(&self, prefix: &Prefix, ids: &[u32], positions: &[u32]) -> Result<Tensor> {
-        let mask = branch_mask(prefix.tokens.len(), ids.len(), &self.device)?;
-        Ok(self.run(ids, positions, &mask, Some(prefix))?.0)
+        Ok(self
+            .forward_from_batch(prefix, &[(ids, positions)])?
+            .remove(0))
     }
 
+    /// The hidden states of several branches at once, all continuing from the
+    /// same prefilled state.
+    ///
+    /// The rows are padded to the longest and run as one batch: the same
+    /// arithmetic as one call each, in a fifth of the calls when there are five
+    /// questions, which on a CPU is most of what a short branch costs. Pads sit
+    /// after every real token, are closed to every real query by the mask, and
+    /// are never read back.
+    pub fn forward_from_batch(
+        &self,
+        prefix: &Prefix,
+        rows: &[(&[u32], &[u32])],
+    ) -> Result<Vec<Tensor>> {
+        let (ids, positions, lengths, padded) = pad_rows(rows);
+        let state = prefix.tokens.len();
+        let mask = branch_batch_mask(state, &lengths, padded, &self.device)?;
+        let batched: Vec<(&[u32], &[u32])> = (0..rows.len())
+            .map(|row| {
+                (
+                    &ids[row * padded..(row + 1) * padded],
+                    &positions[row * padded..(row + 1) * padded],
+                )
+            })
+            .collect();
+        let (hidden, _) = self.run(&batched, &mask, Some(prefix))?;
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(row, length)| Ok(hidden.i(row)?.narrow(0, 0, *length)?))
+            .collect()
+    }
+
+    /// One pass over a batch of rows: `[rows, tokens, hidden]` out.
     fn run(
         &self,
-        ids: &[u32],
-        positions: &[u32],
+        rows: &[(&[u32], &[u32])],
         mask: &Tensor,
         prefix: Option<&Prefix>,
     ) -> Result<(Tensor, Vec<LayerPrefix>)> {
-        if ids.len() != positions.len() {
-            return Err(Error::Engine(format!(
-                "{} tokens but {} position ids",
-                ids.len(),
-                positions.len()
-            )));
+        let batch = rows.len();
+        let len = rows.first().map(|(ids, _)| ids.len()).unwrap_or(0);
+        for (ids, positions) in rows {
+            if ids.len() != positions.len() || ids.len() != len {
+                return Err(Error::Engine(String::from(
+                    "the rows of a batch must be the same length, with one position id each",
+                )));
+            }
         }
         if let Some(prefix) = prefix {
             if prefix.layers.len() != self.layers.len() {
@@ -344,19 +398,34 @@ impl Backbone {
                 )));
             }
         }
-        let tokens = Tensor::from_slice(ids, ids.len(), &self.device)?;
+
+        let ids: Vec<u32> = rows
+            .iter()
+            .flat_map(|(ids, _)| ids.iter().copied())
+            .collect();
+        let positions: Vec<u32> = rows
+            .iter()
+            .flat_map(|(_, positions)| positions.iter().copied())
+            .collect();
+        let tokens = Tensor::from_slice(&ids, ids.len(), &self.device)?;
         let mut xs = self
             .embed_tokens
             .index_select(&tokens, 0)?
-            .unsqueeze(0)?
+            .reshape((batch, len, self.config.hidden_size))?
             .to_dtype(DType::F32)?;
 
+        // Every row carries its own position ids, so the tables are built per
+        // row and the rotary embedding broadcasts over the heads only.
         let (cos, sin) = rotary_tables(
-            positions,
+            &positions,
             self.config.rotary_dim(),
             self.config.rope_theta()?,
             &self.device,
         )?;
+        let rotary = self.config.rotary_dim() / 2;
+        let cos = cos.reshape((batch, len, rotary))?;
+        let sin = sin.reshape((batch, len, rotary))?;
+
         let eps = self.config.rms_norm_eps;
         let mut kept = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
@@ -401,12 +470,12 @@ impl Backbone {
             xs = (residual + self.feed_forward(layer, &normed)?)?;
         }
 
-        Ok((rms_norm(&xs, &self.norm, eps)?.i(0)?, kept))
+        Ok((rms_norm(&xs, &self.norm, eps)?, kept))
     }
 
     /// Attention as Qwen3 does it, plus the output gate that comes out of the
-    /// second half of `q_proj`, and optionally continuing from a state's keys
-    /// and values.
+    /// second half of `q_proj`, over a batch of rows and optionally continuing
+    /// from a state's keys and values.
     fn attention(
         &self,
         layer: &Attention,
@@ -416,20 +485,20 @@ impl Backbone {
         mask: &Tensor,
         past: Option<(&Tensor, &Tensor)>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (_, len, _) = xs.dims3()?;
+        let (batch, len, _) = xs.dims3()?;
         let heads = self.config.num_attention_heads;
         let kv_heads = self.config.num_key_value_heads;
         let dim = self.config.head_dim();
         let eps = self.config.rms_norm_eps;
 
-        let projected = linear(xs, &layer.q_proj)?.reshape((1, len, heads, 2 * dim))?;
+        let projected = linear(xs, &layer.q_proj)?.reshape((batch, len, heads, 2 * dim))?;
         let q = projected.narrow(3, 0, dim)?;
         let gate = projected
             .narrow(3, dim, dim)?
-            .reshape((1, len, heads * dim))?;
+            .reshape((batch, len, heads * dim))?;
 
-        let k = linear(xs, &layer.k_proj)?.reshape((1, len, kv_heads, dim))?;
-        let v = linear(xs, &layer.v_proj)?.reshape((1, len, kv_heads, dim))?;
+        let k = linear(xs, &layer.k_proj)?.reshape((batch, len, kv_heads, dim))?;
+        let v = linear(xs, &layer.v_proj)?.reshape((batch, len, kv_heads, dim))?;
 
         let q = rms_norm(&q, &layer.q_norm, eps)?;
         let k = rms_norm(&k, &layer.k_norm, eps)?;
@@ -437,12 +506,20 @@ impl Backbone {
         let k = rope(&k.transpose(1, 2)?, cos, sin)?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
+        // The state was prefilled once; every row of this batch reads the same
+        // keys and values in front of its own.
         let (keys, values) = match past {
             None => (k.clone(), v.clone()),
-            Some((past_k, past_v)) => (
-                Tensor::cat(&[past_k, &k], 2)?.contiguous()?,
-                Tensor::cat(&[past_v, &v], 2)?.contiguous()?,
-            ),
+            Some((past_k, past_v)) => {
+                let widen = |t: &Tensor| -> Result<Tensor> {
+                    let (_, heads, state, dim) = t.dims4()?;
+                    Ok(t.expand((batch, heads, state, dim))?.contiguous()?)
+                };
+                (
+                    Tensor::cat(&[widen(past_k)?, k.clone()], 2)?.contiguous()?,
+                    Tensor::cat(&[widen(past_v)?, v.clone()], 2)?.contiguous()?,
+                )
+            }
         };
 
         let repeats = heads / kv_heads;
@@ -454,30 +531,18 @@ impl Backbone {
         let out = weights
             .matmul(&repeat_kv(&values, repeats)?)?
             .transpose(1, 2)?
-            .reshape((1, len, heads * dim))?;
+            .reshape((batch, len, heads * dim))?;
         let out = (out * candle_nn::ops::sigmoid(&gate)?)?;
         Ok((linear(&out, &layer.o_proj)?, k, v))
     }
 
-    /// The gated delta rule, token by token.
-    ///
-    /// `torch_recurrent_gated_delta_rule`, which the reference uses for single
-    /// tokens and whose chunked twin it uses for prefill; they compute the same
-    /// thing. One state per value head, `[key dim, value dim]`:
-    ///
-    /// ```text
-    /// S <- S * exp(g_t)                    decay
-    /// delta <- (v_t - k_t S) * beta_t      how much the memory is off by
-    /// S <- S + k_t^T delta                 write it back
-    /// out_t <- q_t S
-    /// ```
     fn recurrence(
         &self,
         layer: &DeltaNet,
         xs: &Tensor,
         past: Option<(&Tensor, &Tensor)>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (_, len, _) = xs.dims3()?;
+        let (batch, len, _) = xs.dims3()?;
         let config = &self.config;
         let (key_heads, value_heads) = (config.linear_num_key_heads, config.linear_num_value_heads);
         let (key_dim, value_dim) = (config.linear_key_head_dim, config.linear_value_head_dim);
@@ -485,6 +550,7 @@ impl Backbone {
         let values = value_heads * value_dim;
         let channels = 2 * keys + values;
         let kernel = config.linear_conv_kernel_dim;
+        let rows = batch * value_heads;
 
         // Queries, keys and values share one projection and one depthwise
         // convolution over time, which is what makes this a *short* convolution
@@ -496,8 +562,8 @@ impl Backbone {
         // sequence that is zeros, which is the same as the reference's padding;
         // continuing from a state, it is the tail the prefix kept.
         let window = match past {
-            Some((window, _)) => window.clone(),
-            None => Tensor::zeros((1, channels, kernel - 1), DType::F32, &self.device)?,
+            Some((window, _)) => window.expand((batch, channels, kernel - 1))?.contiguous()?,
+            None => Tensor::zeros((batch, channels, kernel - 1), DType::F32, &self.device)?,
         };
         let inputs = Tensor::cat(&[&window, &projected], 2)?.contiguous()?;
         let mixed = inputs.conv1d(&layer.conv1d, 0, 1, 1, channels)?;
@@ -507,14 +573,14 @@ impl Backbone {
 
         let q = mixed
             .narrow(2, 0, keys)?
-            .reshape((1, len, key_heads, key_dim))?;
+            .reshape((batch, len, key_heads, key_dim))?;
         let k = mixed
             .narrow(2, keys, keys)?
-            .reshape((1, len, key_heads, key_dim))?;
+            .reshape((batch, len, key_heads, key_dim))?;
         let v = mixed
             .narrow(2, 2 * keys, values)?
-            .reshape((1, len, value_heads, value_dim))?;
-        let z = linear(xs, &layer.in_proj_z)?.reshape((1, len, value_heads, value_dim))?;
+            .reshape((batch, len, value_heads, value_dim))?;
+        let z = linear(xs, &layer.in_proj_z)?.reshape((batch, len, value_heads, value_dim))?;
 
         // beta: how strongly this token overwrites the memory. g: how much of
         // the memory survives it, per head.
@@ -531,39 +597,45 @@ impl Backbone {
         // The reference scales the query by the key width, not the value width.
         let q = (q / (key_dim as f64).sqrt())?;
 
-        let mut state = match past {
-            Some((_, state)) => state.clone(),
-            None => Tensor::zeros((value_heads, key_dim, value_dim), DType::F32, &self.device)?,
+        // Rows and heads both index independent states, so they become one
+        // dimension: [rows * heads, tokens, width].
+        let heads_first = |x: &Tensor, width: usize| -> candle_core::Result<Tensor> {
+            x.transpose(1, 2)?.contiguous()?.reshape((rows, len, width))
         };
-        let mut out = Vec::with_capacity(len);
-        for step in 0..len {
-            let at = |tensor: &Tensor, width: usize| -> Result<Tensor> {
-                Ok(tensor
-                    .narrow(1, step, 1)?
-                    .reshape((value_heads, 1, width))?
-                    .contiguous()?)
-            };
-            let q_t = at(&q, key_dim)?;
-            let k_t = at(&k, key_dim)?;
-            let v_t = at(&v, value_dim)?;
-            let decay_t = decay
-                .narrow(1, step, 1)?
-                .reshape((value_heads, 1, 1))?
-                .exp()?;
-            let beta_t = beta.narrow(1, step, 1)?.reshape((value_heads, 1, 1))?;
+        let flatten = |x: &Tensor| -> candle_core::Result<Tensor> {
+            x.transpose(1, 2)?.contiguous()?.reshape((rows, len))
+        };
+        let q = heads_first(&q, key_dim)?;
+        let k = heads_first(&k, key_dim)?;
+        let v = heads_first(&v, value_dim)?;
+        let beta = flatten(&beta)?;
+        let decay = flatten(&decay)?;
 
-            state = state.broadcast_mul(&decay_t)?;
-            let remembered = k_t.matmul(&state)?;
-            let delta = (v_t - remembered)?.broadcast_mul(&beta_t)?;
-            state = (state + k_t.transpose(1, 2)?.matmul(&delta)?)?;
-            out.push(q_t.matmul(&state)?);
-        }
+        let start = match past {
+            // Every row starts from the same prefilled state.
+            Some((_, state)) => state
+                .unsqueeze(0)?
+                .expand((batch, value_heads, key_dim, value_dim))?
+                .reshape((rows, key_dim, value_dim))?
+                .contiguous()?,
+            None => Tensor::zeros((rows, key_dim, value_dim), DType::F32, &self.device)?,
+        };
+        let (out, state) = if self
+            .chunked
+            .unwrap_or_else(|| chunking_pays(len, key_dim, value_dim))
+        {
+            delta_rule_chunked(&q, &k, &v, &decay, &beta, start, CHUNK)?
+        } else {
+            delta_rule_sequential(&q, &k, &v, &decay, &beta, start)?
+        };
+        // [rows * heads, tokens, value dim] -> [rows, tokens, heads, value dim]
+        let out = out
+            .reshape((batch, value_heads, len, value_dim))?
+            .transpose(1, 2)?;
 
-        // [value heads, len, value dim] -> [1, len, value heads, value dim]
-        let out = Tensor::cat(&out, 1)?.transpose(0, 1)?.unsqueeze(0)?;
         // The output norm is gated by z, and normalises one head at a time.
         let out = rms_norm(&out, &layer.norm, config.rms_norm_eps)?;
-        let out = (out * candle_nn::ops::silu(&z)?)?.reshape((1, len, values))?;
+        let out = (out * candle_nn::ops::silu(&z)?)?.reshape((batch, len, values))?;
         Ok((linear(&out, &layer.out_proj)?, kept_window, state))
     }
 
@@ -572,6 +644,197 @@ impl Backbone {
         let up = linear(xs, &layer.up_proj)?;
         Ok(linear(&(gate * up)?, &layer.down_proj)?)
     }
+}
+
+/// How many tokens a chunk of the delta rule covers. 64 is what the reference
+/// uses, and the arithmetic below assumes it is a power of two.
+const CHUNK: usize = 64;
+
+/// Whether to run the delta rule in chunks for this shape.
+///
+/// Two conditions. There has to be more than a chunk of tokens, or there is
+/// nothing to condense. And a chunk's own algebra — a triangular inverse and a
+/// few `chunk x chunk` matmuls, so about `chunk^3 / 2` — has to cost less than
+/// the `3 * chunk * key * value` the token-by-token form spends over the same
+/// span. That puts the crossover at `key * value ~ chunk^2 / 6`: the released
+/// checkpoints (128 by 128) are far above it, a toy model far below.
+fn chunking_pays(len: usize, key_dim: usize, value_dim: usize) -> bool {
+    len > CHUNK && key_dim * value_dim > CHUNK * CHUNK / 6
+}
+
+/// The gated delta rule, one token at a time.
+///
+/// `torch_recurrent_gated_delta_rule`: one state per value head, `[key, value]`.
+///
+/// ```text
+/// S <- S * exp(g_t)                    decay
+/// delta <- (v_t - k_t S) * beta_t      how much the memory is off by
+/// S <- S + k_t^T delta                 write it back
+/// out_t <- q_t S
+/// ```
+///
+/// Exact and obvious, and the form everything else here is checked against.
+fn delta_rule_sequential(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    decay: &Tensor,
+    beta: &Tensor,
+    mut state: Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let (heads, len, _) = q.dims3()?;
+    let mut out = Vec::with_capacity(len);
+    for step in 0..len {
+        let q_t = q.narrow(1, step, 1)?;
+        let k_t = k.narrow(1, step, 1)?;
+        let v_t = v.narrow(1, step, 1)?;
+        let decay_t = decay.narrow(1, step, 1)?.reshape((heads, 1, 1))?.exp()?;
+        let beta_t = beta.narrow(1, step, 1)?.reshape((heads, 1, 1))?;
+
+        state = state.broadcast_mul(&decay_t)?;
+        let remembered = k_t.matmul(&state)?;
+        let delta = (v_t - remembered)?.broadcast_mul(&beta_t)?;
+        state = (state + k_t.transpose(1, 2)?.matmul(&delta)?)?;
+        out.push(q_t.matmul(&state)?);
+    }
+    Ok((Tensor::cat(&out, 1)?, state))
+}
+
+/// The same rule, a chunk of tokens at a time.
+///
+/// `torch_chunk_gated_delta_rule`, which is what the reference runs for prefill.
+/// Within a chunk the updates are condensed into matmuls through the UT
+/// transform — the inverse of a unit lower triangular system — so the sequential
+/// scan is left with one step per chunk instead of one per token. Same numbers,
+/// and on a long state the difference is the difference between usable and not.
+///
+/// The inverse is built as `I + A + A^2 + ...` for `A = -strict_lower(system)`,
+/// which terminates because `A` is nilpotent, and by doubling — so
+/// `log2(chunk)` matmuls rather than `chunk` substitutions.
+fn delta_rule_chunked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    decay: &Tensor,
+    beta: &Tensor,
+    mut state: Tensor,
+    chunk: usize,
+) -> Result<(Tensor, Tensor)> {
+    let device = q.device().clone();
+    let (heads, len, key_dim) = q.dims3()?;
+    let value_dim = v.dim(2)?;
+    // The tail is padded with zeros, where a decay of 0 leaves the state alone
+    // (exp(0) = 1) and a beta of 0 writes nothing, so the padding cannot change
+    // either the outputs or the state it hands on.
+    let pad = (chunk - len % chunk) % chunk;
+    let chunks = (len + pad) / chunk;
+    let pad_time = |x: &Tensor| x.pad_with_zeros(1, 0, pad);
+
+    let q = pad_time(q)?.reshape((heads, chunks, chunk, key_dim))?;
+    let k = pad_time(k)?.reshape((heads, chunks, chunk, key_dim))?;
+    let v = pad_time(v)?;
+    let beta = pad_time(beta)?;
+    let decay = pad_time(decay)?.reshape((heads, chunks, chunk))?;
+
+    // beta is how much of the new value is written: apply it to k and v once.
+    let v_beta = v
+        .broadcast_mul(&beta.unsqueeze(2)?)?
+        .reshape((heads, chunks, chunk, value_dim))?;
+    let k_beta = k.broadcast_mul(&beta.reshape((heads, chunks, chunk))?.unsqueeze(3)?)?;
+
+    // Decay accumulated from the start of a chunk, and between any two positions
+    // in it. In the lower triangle the difference is a sum of decays and so at
+    // most zero; the upper triangle is masked away, and clamping keeps its
+    // exponential from overflowing on the way.
+    let cumulative = decay.cumsum(2)?;
+    let pairwise = cumulative
+        .unsqueeze(3)?
+        .broadcast_sub(&cumulative.unsqueeze(2)?)?
+        .clamp(f32::NEG_INFINITY, 0.0)?
+        .exp()?;
+    let causal = Tensor::tril2(chunk, DType::F32, &device)?.reshape((1, 1, chunk, chunk))?;
+    let pairwise = pairwise.broadcast_mul(&causal)?;
+
+    let system = k_beta.matmul(&k.transpose(2, 3)?)?.mul(&pairwise)?;
+    let intra = q.matmul(&k.transpose(2, 3)?)?.mul(&pairwise)?;
+    let decayed_k_beta = k_beta.broadcast_mul(&cumulative.exp()?.unsqueeze(3)?)?;
+
+    // The UT transform: solve the unit lower triangular system for the values
+    // and for what the old state already predicts.
+    let strict = Tensor::tril2(chunk, DType::F32, &device)?
+        .sub(&Tensor::eye(chunk, DType::F32, &device)?)?
+        .reshape((1, 1, chunk, chunk))?;
+    let identity = Tensor::eye(chunk, DType::F32, &device)?.reshape((1, 1, chunk, chunk))?;
+    let lower = system.broadcast_mul(&strict)?.broadcast_add(&identity)?;
+    let inverse = unit_lower_inverse(&lower)?.reshape((heads, chunks, chunk, chunk))?;
+
+    let values = inverse.matmul(&v_beta)?;
+    let reads = inverse.matmul(&decayed_k_beta)?;
+    // Fold the decays into the queries and keys once, rather than per chunk.
+    let q = q.broadcast_mul(&cumulative.exp()?.unsqueeze(3)?)?;
+    let last = cumulative.narrow(2, chunk - 1, 1)?;
+    let k = k.broadcast_mul(&last.broadcast_sub(&cumulative)?.exp()?.unsqueeze(3)?)?;
+    let chunk_decay = last.exp()?;
+
+    let mut out = Vec::with_capacity(chunks);
+    for index in 0..chunks {
+        let values = values.i((.., index))?;
+        let reads = reads.i((.., index))?;
+        // What this chunk writes, minus what the state already predicted.
+        let corrected = (values - reads.matmul(&state)?)?;
+        let between = q.i((.., index))?.matmul(&state)?;
+        out.push((between + intra.i((.., index))?.matmul(&corrected)?)?);
+        state = (state.broadcast_mul(&chunk_decay.i((.., index))?.reshape((heads, 1, 1))?)?
+            + k.i((.., index))?.transpose(1, 2)?.matmul(&corrected)?)?;
+    }
+
+    let out = Tensor::cat(&out, 1)?.narrow(1, 0, len)?;
+    Ok((out, state))
+}
+
+/// The inverse of a unit lower triangular matrix, block by block.
+///
+/// ```text
+/// inv([[A, 0], [B, C]]) = [[inv A, 0], [-inv C * B * inv A, inv C]]
+/// ```
+///
+/// The two diagonal blocks are independent, so they go into the batch dimension
+/// and one recursive call does both: `log2(n)` levels, a handful of matmuls each.
+/// Building the inverse as `I + A + A^2 + ...` instead would be simpler and cost
+/// six times the arithmetic — which on the released checkpoints' widths is the
+/// difference between chunking being worth it and not.
+///
+/// `n` has to be a power of two, which [`CHUNK`] is.
+fn unit_lower_inverse(l: &Tensor) -> candle_core::Result<Tensor> {
+    let dims = l.dims();
+    let n = dims[dims.len() - 1];
+    let batch: usize = dims[..dims.len() - 2].iter().product();
+    let l = l.reshape((batch, n, n))?;
+    if n == 1 {
+        // A one-by-one unit lower triangular matrix is its own inverse.
+        return Tensor::ones((batch, 1, 1), l.dtype(), l.device());
+    }
+
+    let half = n / 2;
+    let top_left = l.narrow(1, 0, half)?.narrow(2, 0, half)?;
+    let bottom_left = l.narrow(1, half, half)?.narrow(2, 0, half)?.contiguous()?;
+    let bottom_right = l.narrow(1, half, half)?.narrow(2, half, half)?;
+
+    let blocks = Tensor::cat(&[top_left.unsqueeze(1)?, bottom_right.unsqueeze(1)?], 1)?
+        .reshape((batch * 2, half, half))?;
+    let inverses = unit_lower_inverse(&blocks.contiguous()?)?.reshape((batch, 2, half, half))?;
+    let upper = inverses.i((.., 0))?.contiguous()?;
+    let lower = inverses.i((.., 1))?.contiguous()?;
+    let corner = lower.matmul(&bottom_left)?.matmul(&upper)?.neg()?;
+
+    let zeros = Tensor::zeros((batch, half, half), l.dtype(), l.device())?;
+    Tensor::cat(
+        &[
+            Tensor::cat(&[upper, zeros], 2)?,
+            Tensor::cat(&[corner, lower], 2)?,
+        ],
+        1,
+    )
 }
 
 /// `x / sqrt(sum(x^2) + eps)` over the last dimension, the way the FLA library

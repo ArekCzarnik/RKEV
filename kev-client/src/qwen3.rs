@@ -21,7 +21,8 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::weights::{
-    attention_mask, branch_mask, linear, repeat_kv, rms_norm, rope, rotary_tables, Weights,
+    attention_mask, branch_batch_mask, linear, pad_rows, repeat_kv, rms_norm, rope, rotary_tables,
+    Weights,
 };
 
 /// The parts of a Qwen3 `config.json` this backbone needs.
@@ -249,7 +250,8 @@ impl Backbone {
     /// `[1, 1, n, n]`: `0.0` where a token may read another, very negative
     /// where it may not.
     pub fn forward(&self, ids: &[u32], positions: &[u32], mask: &Tensor) -> Result<Tensor> {
-        Ok(self.run(ids, positions, mask, None)?.0)
+        let (hidden, _) = self.run(&[(ids, positions)], mask, None)?;
+        Ok(hidden.i(0)?)
     }
 
     /// Run the state tokens and keep what a branch needs to continue from them.
@@ -261,7 +263,7 @@ impl Backbone {
     /// same reason.
     pub fn prefill(&self, ids: &[u32], positions: &[u32]) -> Result<Prefix> {
         let mask = attention_mask(ids.len(), |query, key| key <= query, &self.device)?;
-        let (_, layers) = self.run(ids, positions, &mask, None)?;
+        let (_, layers) = self.run(&[(ids, positions)], &mask, None)?;
         Ok(Prefix {
             tokens: ids.to_vec(),
             layers,
@@ -273,24 +275,55 @@ impl Backbone {
     /// The branch sees the whole state and its own tokens up to each position,
     /// which is exactly what the packed mask would allow it.
     pub fn forward_from(&self, prefix: &Prefix, ids: &[u32], positions: &[u32]) -> Result<Tensor> {
-        let state = prefix.tokens.len();
-        let mask = branch_mask(state, ids.len(), &self.device)?;
-        Ok(self.run(ids, positions, &mask, Some(prefix))?.0)
+        Ok(self
+            .forward_from_batch(prefix, &[(ids, positions)])?
+            .remove(0))
     }
 
+    /// The hidden states of several branches at once, all continuing from the
+    /// same prefilled state.
+    ///
+    /// Padded to the longest row and run as one batch: the same arithmetic as one
+    /// call each, in a fraction of the calls, which is most of what a short
+    /// branch costs on a CPU.
+    pub fn forward_from_batch(
+        &self,
+        prefix: &Prefix,
+        rows: &[(&[u32], &[u32])],
+    ) -> Result<Vec<Tensor>> {
+        let (ids, positions, lengths, padded) = pad_rows(rows);
+        let mask = branch_batch_mask(prefix.tokens.len(), &lengths, padded, &self.device)?;
+        let batched: Vec<(&[u32], &[u32])> = (0..rows.len())
+            .map(|row| {
+                (
+                    &ids[row * padded..(row + 1) * padded],
+                    &positions[row * padded..(row + 1) * padded],
+                )
+            })
+            .collect();
+        let (hidden, _) = self.run(&batched, &mask, Some(prefix))?;
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(row, length)| Ok(hidden.i(row)?.narrow(0, 0, *length)?))
+            .collect()
+    }
+
+    /// One pass over a batch of rows: `[rows, tokens, hidden]` out.
     fn run(
         &self,
-        ids: &[u32],
-        positions: &[u32],
+        rows: &[(&[u32], &[u32])],
         mask: &Tensor,
         prefix: Option<&Prefix>,
     ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
-        if ids.len() != positions.len() {
-            return Err(Error::Engine(format!(
-                "{} tokens but {} position ids",
-                ids.len(),
-                positions.len()
-            )));
+        let batch = rows.len();
+        let len = rows.first().map(|(ids, _)| ids.len()).unwrap_or(0);
+        for (ids, positions) in rows {
+            if ids.len() != positions.len() || ids.len() != len {
+                return Err(Error::Engine(String::from(
+                    "the rows of a batch must be the same length, with one position id each",
+                )));
+            }
         }
         if let Some(prefix) = prefix {
             if prefix.layers.len() != self.layers.len() {
@@ -299,19 +332,27 @@ impl Backbone {
                 )));
             }
         }
-        let tokens = Tensor::from_slice(ids, ids.len(), &self.device)?;
+
+        let ids: Vec<u32> = rows
+            .iter()
+            .flat_map(|(ids, _)| ids.iter().copied())
+            .collect();
+        let positions: Vec<u32> = rows
+            .iter()
+            .flat_map(|(_, positions)| positions.iter().copied())
+            .collect();
+        let tokens = Tensor::from_slice(&ids, ids.len(), &self.device)?;
         let mut xs = self
             .embed_tokens
             .index_select(&tokens, 0)?
-            .unsqueeze(0)?
+            .reshape((batch, len, self.config.hidden_size))?
             .to_dtype(DType::F32)?;
 
-        let (cos, sin) = rotary_tables(
-            positions,
-            self.config.head_dim(),
-            self.config.rope_theta()?,
-            &self.device,
-        )?;
+        let dim = self.config.head_dim();
+        let (cos, sin) = rotary_tables(&positions, dim, self.config.rope_theta()?, &self.device)?;
+        let cos = cos.reshape((batch, len, dim / 2))?;
+        let sin = sin.reshape((batch, len, dim / 2))?;
+
         let mut kept = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
             let past = prefix.map(|prefix| {
@@ -329,14 +370,11 @@ impl Backbone {
             xs = (residual + self.feed_forward(layer, &normed)?)?;
         }
 
-        Ok((
-            rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?.i(0)?,
-            kept,
-        ))
+        Ok((rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?, kept))
     }
 
-    /// Attention over the branch tokens, optionally continuing from a state's
-    /// keys and values. Returns the output and this pass's keys and values, so a
+    /// Attention over a batch of rows, optionally continuing from a state's keys
+    /// and values. Returns the output and this pass's keys and values, so a
     /// prefill can keep them.
     fn attention(
         &self,
@@ -347,14 +385,14 @@ impl Backbone {
         mask: &Tensor,
         past: Option<(&Tensor, &Tensor)>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (_, len, _) = xs.dims3()?;
+        let (batch, len, _) = xs.dims3()?;
         let heads = self.config.num_attention_heads;
         let kv_heads = self.config.num_key_value_heads;
         let dim = self.config.head_dim();
 
-        let q = linear(xs, &layer.q_proj)?.reshape((1, len, heads, dim))?;
-        let k = linear(xs, &layer.k_proj)?.reshape((1, len, kv_heads, dim))?;
-        let v = linear(xs, &layer.v_proj)?.reshape((1, len, kv_heads, dim))?;
+        let q = linear(xs, &layer.q_proj)?.reshape((batch, len, heads, dim))?;
+        let k = linear(xs, &layer.k_proj)?.reshape((batch, len, kv_heads, dim))?;
+        let v = linear(xs, &layer.v_proj)?.reshape((batch, len, kv_heads, dim))?;
 
         // Per-head normalisation, then the rotary embedding, in that order.
         let q = rms_norm(&q, &layer.q_norm, self.config.rms_norm_eps)?;
@@ -367,10 +405,16 @@ impl Backbone {
         // makes a branch see the whole state and nothing of another branch.
         let (keys, values) = match past {
             None => (k.clone(), v.clone()),
-            Some((past_k, past_v)) => (
-                Tensor::cat(&[past_k, &k], 2)?.contiguous()?,
-                Tensor::cat(&[past_v, &v], 2)?.contiguous()?,
-            ),
+            Some((past_k, past_v)) => {
+                let widen = |t: &Tensor| -> Result<Tensor> {
+                    let (_, heads, state, dim) = t.dims4()?;
+                    Ok(t.expand((batch, heads, state, dim))?.contiguous()?)
+                };
+                (
+                    Tensor::cat(&[widen(past_k)?, k.clone()], 2)?.contiguous()?,
+                    Tensor::cat(&[widen(past_v)?, v.clone()], 2)?.contiguous()?,
+                )
+            }
         };
 
         let repeats = heads / kv_heads;
@@ -383,7 +427,7 @@ impl Backbone {
         let out = weights
             .matmul(&repeat_kv(&values, repeats)?)?
             .transpose(1, 2)?
-            .reshape((1, len, heads * dim))?;
+            .reshape((batch, len, heads * dim))?;
         Ok((linear(&out, &layer.o_proj)?, k, v))
     }
 

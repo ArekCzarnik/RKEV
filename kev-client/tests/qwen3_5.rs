@@ -558,23 +558,26 @@ fn a_hybrid_config_gets_the_hybrid_backbone() {
     assert_eq!(backend.hidden_size(), HIDDEN);
 }
 
-#[test]
-fn the_forward_pass_matches_a_transcription_of_modeling_qwen3_5() {
-    // One row, since that is what a hybrid base ever runs: the state followed by
-    // one question's branch. Every hidden unit of every token is compared, not
-    // just the ones the readout looks at.
-    let fixture = checkpoint("reference", false, false);
+/// One row: a state of `state` tokens, then a branch of `branch`, compared
+/// against the transcription at every hidden unit of every token.
+fn compare_with_the_reference(name: &str, state: usize, branch: usize, chunked: bool) {
+    let fixture = checkpoint(name, false, false);
+    // The packed path: the one being transcribed, and the only one that returns
+    // hidden states for the state tokens as well as the branches.
     let mut backend = Backend::open(&fixture.dir, None)
         .unwrap()
-        .with_prefix(false);
+        .with_prefix(false)
+        .with_chunked_recurrence(chunked);
 
-    let ids: Vec<u32> = vec![1, 6, 7, 2, 12, 3, 14, 4, 5];
-    let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1];
+    // Any tokens will do, as long as they are in the toy vocabulary.
+    let ids: Vec<u32> = (0..state + branch)
+        .map(|index| 6 + (index % (vocab_size() - 6)) as u32)
+        .collect();
+    let segments: Vec<u32> = (0..state + branch)
+        .map(|index| if index < state { 0 } else { 1 })
+        .collect();
     let positions: Vec<u32> = (0..ids.len() as u32).collect();
-    // Every position of the question's branch: `Pass::rows` returns readout
-    // positions inside a branch, not ones in the state, and the readout only
-    // ever points at a branch anyway.
-    let readout: Vec<usize> = (3..ids.len()).collect();
+    let readout: Vec<usize> = (state..ids.len()).collect();
     let pass = Pass {
         ids: &ids,
         positions: &positions,
@@ -588,7 +591,7 @@ fn the_forward_pass_matches_a_transcription_of_modeling_qwen3_5() {
             pass.attends(query, key)
         })
         .into_iter()
-        .skip(3)
+        .skip(state)
         .collect();
 
     // They agree to about 1e-6, f32 accumulation order; 1e-5 leaves room for
@@ -598,10 +601,26 @@ fn the_forward_pass_matches_a_transcription_of_modeling_qwen3_5() {
         for (i, (ours, reference)) in ours.iter().zip(reference).enumerate() {
             assert!(
                 (ours - reference).abs() <= 1e-5,
-                "token {token}, hidden unit {i}: {ours} vs {reference}"
+                "{name}: token {token}, hidden unit {i}: {ours} vs {reference}"
             );
         }
     }
+}
+
+#[test]
+fn the_forward_pass_matches_a_transcription_of_modeling_qwen3_5() {
+    compare_with_the_reference("reference", 3, 6, false);
+}
+
+#[test]
+fn the_chunked_delta_rule_matches_the_sequential_one() {
+    // Chunking condenses the updates within a chunk into matmuls through a UT
+    // transform, and leaves the sequential scan one step per chunk. The
+    // transcription is token-by-token whatever the length, so this is the chunked
+    // form against the obvious one — two chunks' worth, plus a tail that has to
+    // be padded, and a short one where the padding is nearly everything.
+    compare_with_the_reference("chunked", 100, 35, true);
+    compare_with_the_reference("chunked-short", 3, 6, true);
 }
 
 #[test]
@@ -755,6 +774,196 @@ fn how_much_the_prefix_saves() {
         println!(
             "{label}: {:>7.1} ms  ({} state tokens, 5 questions)",
             started.elapsed().as_secs_f64() * 1000.0 / runs as f64,
+            state.split_whitespace().count() + 1
+        );
+    }
+}
+
+/// A checkpoint with the widths the released checkpoints have, for measuring
+/// against. The weights are still noise; only the shapes matter here.
+fn wide_checkpoint(name: &str) -> PathBuf {
+    const HIDDEN: usize = 512;
+    const INTERMEDIATE: usize = 1024;
+    const HEADS: usize = 8;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 64;
+    const KEY_HEADS: usize = 8;
+    const VALUE_HEADS: usize = 16;
+    const KEY_DIM: usize = 128;
+    const VALUE_DIM: usize = 128;
+    const CONV: usize = 4;
+    let keys = KEY_HEADS * KEY_DIM;
+    let values = VALUE_HEADS * VALUE_DIM;
+
+    let dir = fresh_dir(&format!("qwen3_5-{name}"));
+    fs::write(
+        dir.join("config.json"),
+        format!(
+            r#"{{"hidden_size":{HIDDEN},"intermediate_size":{INTERMEDIATE},
+                "num_hidden_layers":2,"num_attention_heads":{HEADS},
+                "num_key_value_heads":{KV_HEADS},"head_dim":{HEAD_DIM},
+                "layer_types":["linear_attention","full_attention"],
+                "linear_num_key_heads":{KEY_HEADS},"linear_num_value_heads":{VALUE_HEADS},
+                "linear_key_head_dim":{KEY_DIM},"linear_value_head_dim":{VALUE_DIM},
+                "linear_conv_kernel_dim":{CONV},
+                "rms_norm_eps":1e-06,"rope_parameters":{{"rope_type":"default","rope_theta":10000.0}},
+                "vocab_size":{}}}"#,
+            vocab_size()
+        ),
+    )
+    .unwrap();
+    fs::write(dir.join("tokenizer.json"), tokenizer_json()).unwrap();
+
+    let mut noise = Noise(5);
+    let mut tensors = Tensors::new();
+    let mut put = |name: String, shape: Vec<usize>, values: Vec<f32>| {
+        tensors.insert(name, (shape, values));
+    };
+    put(
+        String::from("model.embed_tokens.weight"),
+        vec![vocab_size(), HIDDEN],
+        noise.values(vocab_size() * HIDDEN),
+    );
+    put(
+        String::from("model.norm.weight"),
+        vec![HIDDEN],
+        noise.values(HIDDEN),
+    );
+    for layer in 0..2 {
+        let prefix = format!("model.layers.{layer}");
+        for norm in ["input_layernorm", "post_attention_layernorm"] {
+            put(
+                format!("{prefix}.{norm}.weight"),
+                vec![HIDDEN],
+                noise.values(HIDDEN),
+            );
+        }
+        for name in ["mlp.gate_proj", "mlp.up_proj"] {
+            put(
+                format!("{prefix}.{name}.weight"),
+                vec![INTERMEDIATE, HIDDEN],
+                noise.values(INTERMEDIATE * HIDDEN),
+            );
+        }
+        put(
+            format!("{prefix}.mlp.down_proj.weight"),
+            vec![HIDDEN, INTERMEDIATE],
+            noise.values(HIDDEN * INTERMEDIATE),
+        );
+        if layer == 0 {
+            let linear = format!("{prefix}.linear_attn");
+            put(
+                format!("{linear}.in_proj_qkv.weight"),
+                vec![2 * keys + values, HIDDEN],
+                noise.values((2 * keys + values) * HIDDEN),
+            );
+            put(
+                format!("{linear}.in_proj_z.weight"),
+                vec![values, HIDDEN],
+                noise.values(values * HIDDEN),
+            );
+            for name in ["in_proj_b", "in_proj_a"] {
+                put(
+                    format!("{linear}.{name}.weight"),
+                    vec![VALUE_HEADS, HIDDEN],
+                    noise.values(VALUE_HEADS * HIDDEN),
+                );
+            }
+            put(
+                format!("{linear}.out_proj.weight"),
+                vec![HIDDEN, values],
+                noise.values(HIDDEN * values),
+            );
+            put(
+                format!("{linear}.conv1d.weight"),
+                vec![2 * keys + values, 1, CONV],
+                noise.values((2 * keys + values) * CONV),
+            );
+            put(
+                format!("{linear}.dt_bias"),
+                vec![VALUE_HEADS],
+                noise.around_one(VALUE_HEADS),
+            );
+            put(
+                format!("{linear}.A_log"),
+                vec![VALUE_HEADS],
+                noise.values(VALUE_HEADS),
+            );
+            put(
+                format!("{linear}.norm.weight"),
+                vec![VALUE_DIM],
+                noise.around_one(VALUE_DIM),
+            );
+        } else {
+            let attention = format!("{prefix}.self_attn");
+            put(
+                format!("{attention}.q_proj.weight"),
+                vec![HEADS * HEAD_DIM * 2, HIDDEN],
+                noise.values(HEADS * HEAD_DIM * 2 * HIDDEN),
+            );
+            for name in ["k_proj", "v_proj"] {
+                put(
+                    format!("{attention}.{name}.weight"),
+                    vec![KV_HEADS * HEAD_DIM, HIDDEN],
+                    noise.values(KV_HEADS * HEAD_DIM * HIDDEN),
+                );
+            }
+            put(
+                format!("{attention}.o_proj.weight"),
+                vec![HIDDEN, HEADS * HEAD_DIM],
+                noise.values(HIDDEN * HEADS * HEAD_DIM),
+            );
+            for name in ["q_norm", "k_norm"] {
+                put(
+                    format!("{attention}.{name}.weight"),
+                    vec![HEAD_DIM],
+                    noise.values(HEAD_DIM),
+                );
+            }
+        }
+    }
+    write_safetensors(&dir.join("model.safetensors"), &tensors);
+    write_head(&dir, HIDDEN, 256);
+    dir
+}
+
+#[test]
+#[ignore = "a measurement, not an assertion: cargo test --release -- --ignored --nocapture"]
+fn how_much_chunking_saves() {
+    use std::time::Instant;
+
+    // The widths that decide this are the value heads': 128 by 128 on the
+    // released checkpoints, against a chunk's own 64 by 64 algebra. The toy model
+    // the other tests use is far below that crossover, which is why its numbers
+    // say the opposite of these.
+    let dir = wide_checkpoint("wide");
+    let state = "a ticket about money late shoes ".repeat(85); // ~510 tokens
+    let mut request = SystemOneRequest::new(state.clone());
+    for id in ["a", "b", "c", "d", "e"] {
+        request = request.ask(id, Noul::new("is this about money ?"));
+    }
+
+    for (label, chunked, cache) in [
+        ("in chunks     ", true, 0),
+        ("token by token", false, 0),
+        // With the state cached, what is left is the questions' branches: how
+        // much a batched branch pass could still be worth.
+        ("branches only ", true, 4),
+    ] {
+        let backend = Backend::open(&dir, None)
+            .unwrap()
+            .with_chunked_recurrence(chunked)
+            .with_prefix_cache(cache);
+        let engine = LocalEngine::new(
+            backend,
+            pointer_head(&dir.join("head.safetensors")).unwrap(),
+        );
+        engine.system_one_blocking(&request).unwrap(); // warm up
+        let started = Instant::now();
+        engine.system_one_blocking(&request).unwrap();
+        println!(
+            "delta rule {label}: {:>8.1} ms  ({} state tokens, 5 questions, 128-wide heads)",
+            started.elapsed().as_secs_f64() * 1000.0,
             state.split_whitespace().count() + 1
         );
     }

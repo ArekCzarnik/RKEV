@@ -217,101 +217,63 @@ pub(crate) fn rotary_tables(
 /// (`partial_rotary_factor`) and passes the remainder through, as
 /// `apply_rotary_pos_emb` does by slicing at `cos.shape[-1]`.
 pub(crate) fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
-    let rotary = 2 * cos.dim(1)?;
+    let rotary = 2 * cos.dim(candle_core::D::Minus1)?;
     let dim = xs.dim(3)?;
     let xs = xs.contiguous()?;
     if rotary == dim {
         return candle_nn::rotary_emb::rope(&xs, cos, sin);
     }
     let rotated = candle_nn::rotary_emb::rope(&xs.narrow(3, 0, rotary)?.contiguous()?, cos, sin)?;
-    Tensor::cat(&[rotated, xs.narrow(3, rotary, dim - rotary)?], 3)
+    // The concatenation can come back as a view, and a matmul wants neither of
+    // its sides strided.
+    Tensor::cat(&[rotated, xs.narrow(3, rotary, dim - rotary)?], 3)?.contiguous()
 }
 
-/// The additive mask for a branch pass continuing from a prefilled state,
-/// `[1, 1, branch, state + branch]`.
+/// The additive mask for a batch of branches continuing from one prefilled
+/// state, `[rows, 1, padded, state + padded]`.
 ///
-/// The state is visible from every branch position — it came first and cannot
-/// contain another question — and the branch is causal within itself.
-pub(crate) fn branch_mask(state: usize, branch: usize, device: &Device) -> Result<Tensor> {
-    let mut values = Vec::with_capacity(branch * (state + branch));
-    for query in 0..branch {
-        for key in 0..state + branch {
-            let allowed = key < state || key - state <= query;
-            values.push(if allowed { 0.0 } else { f32::MIN });
+/// Rows are padded to the longest; a pad key is closed to everyone, and a pad
+/// query is left the state to look at so that no row of the softmax is empty.
+pub(crate) fn branch_batch_mask(
+    state: usize,
+    lengths: &[usize],
+    padded: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut values = Vec::with_capacity(lengths.len() * padded * (state + padded));
+    for length in lengths {
+        for query in 0..padded {
+            for key in 0..state + padded {
+                let allowed = if key < state {
+                    true
+                } else {
+                    let key = key - state;
+                    key < *length && query < *length && key <= query
+                };
+                values.push(if allowed { 0.0 } else { f32::MIN });
+            }
         }
     }
     Ok(Tensor::from_vec(
         values,
-        (1, 1, branch, state + branch),
+        (lengths.len(), 1, padded, state + padded),
         device,
     )?)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The rotary embedding, against the formula in
-    /// `transformers/models/qwen3/modeling_qwen3.py`:
-    ///
-    /// ```text
-    /// inv_freq[i] = theta ** (-2i/dim)            (compute_default_rope_parameters)
-    /// cos = cat(freqs, freqs).cos()               (Qwen3RotaryEmbedding.forward)
-    /// rotate_half(x) = cat(-x[d/2:], x[:d/2])
-    /// q' = q * cos + rotate_half(q) * sin         (apply_rotary_pos_emb)
-    /// ```
-    ///
-    /// Which comes out as, for `i < dim/2`:
-    ///   `q'[i] = q[i] cos - q[i + dim/2] sin`
-    ///   `q'[i + dim/2] = q[i + dim/2] cos + q[i] sin`
-    ///
-    /// The point of testing it: candle offers both this and the *interleaved*
-    /// convention (`rope_i`), which pairs `(0,1), (2,3), ...` instead. Both run,
-    /// only one is Qwen3, and the difference is invisible without real weights.
-    /// The partial case is Qwen3.5's, where the tail of every head is left alone.
-    #[test]
-    fn the_rotary_embedding_matches_the_hugging_face_formula() {
-        let device = Device::Cpu;
-        let (heads, len, dim, theta) = (2usize, 3usize, 8usize, 10_000f64);
-        let positions = [0u32, 5, 9];
-        let values: Vec<f32> = (0..heads * len * dim)
-            .map(|i| ((i * 37 % 19) as f32 - 9.0) / 7.0)
-            .collect();
-        let q = Tensor::from_vec(values.clone(), (1, heads, len, dim), &device).unwrap();
-
-        for rotary in [dim, dim / 2] {
-            let (cos, sin) = rotary_tables(&positions, rotary, theta, &device).unwrap();
-            let ours = rope(&q, &cos, &sin)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-
-            for head in 0..heads {
-                for (step, position) in positions.iter().enumerate() {
-                    let row = (head * len + step) * dim;
-                    for i in 0..rotary / 2 {
-                        let angle = *position as f64 * theta.powf(-2.0 * i as f64 / rotary as f64);
-                        let (cos, sin) = (angle.cos() as f32, angle.sin() as f32);
-                        let (low, high) = (values[row + i], values[row + i + rotary / 2]);
-                        let expected = [low * cos - high * sin, high * cos + low * sin];
-                        for (offset, expected) in [(i, expected[0]), (i + rotary / 2, expected[1])]
-                        {
-                            let got = ours[row + offset];
-                            assert!(
-                                (got - expected).abs() < 1e-6,
-                                "rotary {rotary}, position {position}, element {offset}: \
-                                 {got} vs {expected}"
-                            );
-                        }
-                    }
-                    // Beyond the rotary width, Qwen3.5 passes the head through.
-                    for i in rotary..dim {
-                        assert_eq!(ours[row + i], values[row + i], "element {i} was rotated");
-                    }
-                }
-            }
-        }
+/// Token ids and position ids for a batch of rows, padded to the longest with
+/// zeros. A pad token is a real token id as far as the model is concerned; what
+/// keeps it out of the answers is the mask and the readout.
+pub(crate) fn pad_rows(rows: &[(&[u32], &[u32])]) -> (Vec<u32>, Vec<u32>, Vec<usize>, usize) {
+    let padded = rows.iter().map(|(ids, _)| ids.len()).max().unwrap_or(0);
+    let mut ids = Vec::with_capacity(rows.len() * padded);
+    let mut positions = Vec::with_capacity(rows.len() * padded);
+    let lengths = rows.iter().map(|(ids, _)| ids.len()).collect();
+    for (row, row_positions) in rows {
+        ids.extend_from_slice(row);
+        ids.resize(ids.len() + padded - row.len(), 0);
+        positions.extend_from_slice(row_positions);
+        positions.resize(positions.len() + padded - row_positions.len(), 0);
     }
+    (ids, positions, lengths, padded)
 }

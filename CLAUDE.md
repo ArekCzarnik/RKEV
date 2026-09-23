@@ -193,29 +193,54 @@ assert on JSON shape and public accessor behaviour, never on internals — keep
 new tests in that style, and update the README example and these fixtures
 together whenever the wire format legitimately changes.
 
-### The state prefix
+### Making it fast enough
 
-Every question of a request shares the state, so the state is run once and each
-question continues from it: attention layers keep the state's keys and values, a
-recurrent layer keeps its state matrix and the tail of its convolution window.
-Exact, because the state comes first and neither layer kind looks forward — the
-same reuse `kev.serve` does, for the same reason. `Backend` also keeps the last
-few states across requests, keyed by their token ids.
+Three things, in the order they were worth doing. All of them are exact — the
+tests assert identical answers, and the measurements are `#[ignore]`d tests
+(`cargo test --release --features candle -- --ignored --nocapture`).
 
-The defaults differ by backbone, and the reason is measured, not assumed
-(`cargo test --features candle -- --ignored --nocapture` prints it):
+**The state prefix.** Every question of a request shares the state, so the state
+runs once and each question continues from it: attention layers keep its keys and
+values, a recurrent layer keeps its state matrix and the tail of its convolution
+window. Exact because the state comes first and neither layer kind looks forward.
+`Backend` also keeps the last four states across requests, keyed by their token
+ids, as `kev.serve` does. On a recurrent base this always pays — it would
+otherwise run the whole state per question. On an attention-only base the packed
+pass already runs the state once, so a miss buys nothing and costs a few percent,
+while a hit skips the state: there the prefix path starts at 384 state tokens
+(`with_prefix_min_tokens`), the same threshold the Python uses.
 
-- A **recurrent** base would otherwise run the whole state through every layer
-  once per question, so the reuse always pays: 57 ms to 24 ms for five questions
-  on a 241-token state, and 14 ms when the state is a cache hit.
-- An **attention-only** base already runs the state once in the packed pass. A
-  cache *miss* is then a few percent slower (several small passes instead of one
-  big one), a *hit* skips the state altogether: on a 1200-token state, 129 ms to
-  20 ms. So the prefix path starts at 384 state tokens there, which is what
-  `kev.serve` uses too.
+**Batched branches.** The questions' branches are padded to the longest and run
+as one pass rather than one each. That is worth most where a pass is short and
+per-call overhead dominates, and little where the arithmetic already fills the
+CPU.
 
-`Backend::with_prefix(false)` turns it off and takes the packed path. That is the
-path the transcription tests compare against, so leave those calling it.
+**The chunked delta rule.** `torch_chunk_gated_delta_rule`: within a chunk of 64
+tokens the updates are condensed into matmuls through a UT transform, leaving the
+sequential scan one step per chunk instead of one per token. The triangular
+inverse is built block by block (`log2(chunk)` levels, two matmuls each) rather
+than as `I + A + A²+ …`, which costs six times the arithmetic. Whether it pays
+depends on the value heads' width against a chunk's own `64 x 64` algebra, so
+`chunking_pays` decides per request: the released checkpoints (128 by 128) are
+far above the crossover, a toy model far below. `with_chunked_recurrence` forces
+either form.
+
+What the measurements say, for five questions:
+
+| recurrent base, 128-wide heads, 511-token state | |
+|---|---|
+| token by token | 1930 ms |
+| in chunks | 940 ms |
+| in chunks, state cached | 375 ms |
+
+| recurrent base, toy widths, 241-token state | |
+|---|---|
+| state per question | 57 ms |
+| state once | 13 ms |
+| state cached | 4.5 ms |
+
+`Backend::with_prefix(false)` keeps the packed path, which is what the
+transcription tests compare against, so leave those calling it.
 
 ### Checking the engine against the server
 
