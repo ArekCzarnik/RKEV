@@ -21,6 +21,11 @@ pub enum Error {
     /// forward pass itself.
     #[cfg(feature = "local")]
     Engine(String),
+    /// A question did not fit the context: the state plus that one question
+    /// exceeded the row limit. The HTTP server answers `422` for this, so
+    /// [`Error::is_validation`] is true here too.
+    #[cfg(feature = "local")]
+    ContextOverflow(String),
     /// The response was 2xx but did not match the expected shape.
     Decode {
         source: serde_json::Error,
@@ -31,12 +36,22 @@ pub enum Error {
 impl Error {
     /// `true` for the `422` that Kev returns for a malformed request body.
     pub fn is_validation(&self) -> bool {
+        #[cfg(feature = "local")]
+        if matches!(self, Error::ContextOverflow(_)) {
+            return true;
+        }
         matches!(self, Error::Api { status: 422, .. })
     }
 
     /// `true` when the server demands a bearer token (`KEV_API_KEY` is set).
     pub fn is_unauthorized(&self) -> bool {
-        matches!(self, Error::Api { status: 401 | 403, .. })
+        matches!(
+            self,
+            Error::Api {
+                status: 401 | 403,
+                ..
+            }
+        )
     }
 
     /// The server-side request id, for correlating with the server log.
@@ -52,7 +67,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::InvalidBaseUrl(url) => {
-                write!(f, "base url must start with http:// or https://, got {url:?}")
+                write!(
+                    f,
+                    "base url must start with http:// or https://, got {url:?}"
+                )
             }
             #[cfg(feature = "http")]
             Error::Transport(e) => write!(f, "request to the kev server failed: {e}"),
@@ -69,6 +87,10 @@ impl fmt::Display for Error {
             }
             #[cfg(feature = "local")]
             Error::Engine(message) => write!(f, "the local kev engine failed: {message}"),
+            #[cfg(feature = "local")]
+            Error::ContextOverflow(message) => {
+                write!(f, "the request does not fit the model context: {message}")
+            }
             Error::Decode { source, body } => {
                 write!(f, "could not decode the kev response ({source}): {body}")
             }

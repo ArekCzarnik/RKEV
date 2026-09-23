@@ -53,9 +53,15 @@
 
 #[cfg(feature = "http")]
 mod client;
+#[cfg(feature = "local")]
+mod encode;
 mod error;
 #[cfg(feature = "local")]
 mod local;
+#[cfg(feature = "local")]
+mod prompt;
+#[cfg(feature = "local")]
+mod readout;
 mod system_one;
 mod types;
 
@@ -65,9 +71,15 @@ pub const DEFAULT_MODEL: &str = "kev-latest";
 
 #[cfg(feature = "http")]
 pub use client::{Client, DEFAULT_BASE_URL};
+#[cfg(feature = "local")]
+pub use encode::{Limits, DECIDE, OPTION, OPTION_END, QUESTION, SPECIAL, STATE};
 pub use error::{Error, Result};
 #[cfg(feature = "local")]
-pub use local::{Forward, LocalEngine};
+pub use local::{Forward, LocalEngine, OwnedPass, Pass};
+#[cfg(feature = "local")]
+pub use prompt::render;
+#[cfg(feature = "local")]
+pub use readout::{softmax, Linear, PointerHead};
 pub use system_one::SystemOne;
 pub use types::{
     Answer, Choice, Noul, NoulCriteria, Question, Score, SystemOneRequest, SystemOneResponse, Usage,

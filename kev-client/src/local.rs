@@ -1,40 +1,152 @@
 //! A local inference engine: the model runs in this process, no HTTP.
 //!
-//! **Skeleton.** [`LocalEngine`] knows the shape of the work — blocking on the
-//! inside, the [`SystemOne`] seam on the outside — but not yet how to do it.
-//! The prompt build and the logit readout are still missing; see
-//! `.claude/tasks/2026-09-23-local-inference.md`.
+//! [`LocalEngine`] owns everything Kev-specific — the prompt layout
+//! ([`crate::encode`]) and the pointer-head readout ([`crate::readout`]) — and
+//! leaves exactly one job to an inference backend behind [`Forward`]: run the
+//! backbone and hand back hidden states. That split is deliberate. Kev's
+//! checkpoints are a LoRA adapter plus a pointer head over a Qwen base, and the
+//! head reads *hidden states*, never vocabulary logits, so a backend needs to
+//! expose the backbone rather than a text-generation API.
 //!
-//! The inference backend sits behind [`Forward`]. mistral.rs is the chosen
-//! engine and will implement that trait; keeping it to one impl means the
-//! choice can still be revisited without touching anything else.
+//! See `.claude/tasks/2026-09-23-local-inference.md` for which engines can do
+//! that.
 
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use indexmap::IndexMap;
+
+use crate::encode::{self, Delimiters, Encoding, Limits, SPECIAL};
 use crate::error::{Error, Result};
+use crate::prompt::{self, Plan, Record};
+use crate::readout::{self, PointerHead};
 use crate::system_one::SystemOne;
-use crate::types::{SystemOneRequest, SystemOneResponse};
+use crate::types::{Answer, SystemOneRequest, SystemOneResponse, Usage};
+
+/// One forward pass, described to a backend.
+///
+/// The token ids, where each token sits, which question it belongs to, and
+/// which positions the readout will want back. `positions` is not `0..n`: each
+/// question's branch restarts just after the state, which is how one state
+/// serves every question.
+#[derive(Debug, Clone, Copy)]
+pub struct Pass<'a> {
+    /// Token ids to run.
+    pub ids: &'a [u32],
+    /// Position id per token.
+    pub positions: &'a [u32],
+    /// `0` for state tokens, `k` for the tokens of question `k`.
+    pub segments: &'a [u32],
+    /// The positions whose hidden states to return, in order.
+    pub readout: &'a [usize],
+}
+
+impl Pass<'_> {
+    /// Whether the token at `query` may read the token at `key`.
+    ///
+    /// Causal *and* blind across questions. Questions sharing one pass must not
+    /// see each other, so this is not a plain causal mask: a backend that
+    /// cannot express it must run [`Pass::rows`] instead.
+    pub fn attends(&self, query: usize, key: usize) -> bool {
+        key <= query && (self.segments[key] == 0 || self.segments[key] == self.segments[query])
+    }
+
+    /// `true` when a plain causal mask is enough — one question, or none.
+    pub fn is_causal(&self) -> bool {
+        self.segments.iter().all(|segment| *segment <= 1)
+    }
+
+    /// The same work as one independent causal row per question: the state
+    /// tokens followed by that question's branch, at the positions they already
+    /// carry.
+    ///
+    /// For backbones whose layers ignore attention masks — Qwen3.5's Gated
+    /// DeltaNet layers, and so every current Kev checkpoint — this is the only
+    /// exact form, and it is what the Python model runs there. Concatenating
+    /// the rows' hidden states in order yields exactly what [`Forward::hidden`]
+    /// must return.
+    pub fn rows(&self) -> Vec<OwnedPass> {
+        let state: Vec<usize> = (0..self.ids.len())
+            .filter(|index| self.segments[*index] == 0)
+            .collect();
+        let mut rows = Vec::new();
+        let mut segment = 1;
+        while self.segments.contains(&segment) {
+            let indices: Vec<usize> = state
+                .iter()
+                .copied()
+                .chain((0..self.ids.len()).filter(|index| self.segments[*index] == segment))
+                .collect();
+            // Where each packed index ended up in this row, so the readout
+            // positions can follow the tokens they point at.
+            let mut moved = vec![usize::MAX; self.ids.len()];
+            for (row_index, packed) in indices.iter().enumerate() {
+                moved[*packed] = row_index;
+            }
+            rows.push(OwnedPass {
+                ids: indices.iter().map(|i| self.ids[*i]).collect(),
+                positions: indices.iter().map(|i| self.positions[*i]).collect(),
+                segments: indices.iter().map(|i| self.segments[*i]).collect(),
+                readout: self
+                    .readout
+                    .iter()
+                    .filter(|position| self.segments[**position] == segment)
+                    .map(|position| moved[*position])
+                    .collect(),
+            });
+            segment += 1;
+        }
+        rows
+    }
+}
+
+/// A [`Pass`] that owns its tokens, as [`Pass::rows`] hands them back.
+#[derive(Debug, Clone)]
+pub struct OwnedPass {
+    pub ids: Vec<u32>,
+    pub positions: Vec<u32>,
+    pub segments: Vec<u32>,
+    pub readout: Vec<usize>,
+}
+
+impl OwnedPass {
+    /// Borrow it as a [`Pass`], to run it like any other.
+    pub fn as_pass(&self) -> Pass<'_> {
+        Pass {
+            ids: &self.ids,
+            positions: &self.positions,
+            segments: &self.segments,
+            readout: &self.readout,
+        }
+    }
+}
 
 /// Everything the engine needs from an inference backend.
 ///
-/// Deliberately narrow: tokenise, and run one forward pass. No generation —
-/// Kev generates nothing, it reads probabilities off the logits.
+/// Deliberately narrow, and deliberately not a generation API: Kev generates
+/// nothing. One forward pass over a backbone (the base model with the
+/// checkpoint's LoRA adapter applied, no vocabulary head), and the hidden states
+/// at the positions the readout asks for.
 pub trait Forward: Send {
-    /// Token ids for a piece of text.
+    /// Token ids for a piece of caller text.
     ///
-    /// Needed twice over: to build the prompt, and to look up the candidate
-    /// tokens a readout compares (the yes/no pair, one per choice option, the
-    /// level indices).
+    /// Must never return a special token: the text is escaped before it gets
+    /// here, so a tokenizer that treats `<|...|>` as ordinary text is enough.
     fn tokenise(&mut self, text: &str) -> Result<Vec<u32>>;
 
-    /// Logits at each requested position, in the order asked for.
+    /// The token id of one of Kev's five delimiters ([`SPECIAL`]).
+    fn delimiter(&mut self, token: &str) -> Result<u32>;
+
+    /// Hidden states at `pass.readout`, in that order, one vector of the
+    /// backbone's hidden size each.
     ///
-    /// `positions` index into `tokens`. A backend that can only report the
-    /// final position can still serve a single-position request; whether Kev
-    /// needs more than one is the open question that decides this signature.
-    fn logits(&mut self, tokens: &[u32], positions: &[usize]) -> Result<Vec<Vec<f32>>>;
+    /// The mask is [`Pass::attends`], the position ids are `pass.positions`, and
+    /// the last layer's output is what the pointer head reads — not logits over
+    /// the vocabulary. A backend that cannot honour the mask runs
+    /// [`Pass::rows`].
+    fn hidden(&mut self, pass: &Pass<'_>) -> Result<Vec<Vec<f32>>>;
 }
 
 /// Kev run in-process, over some [`Forward`] backend.
@@ -45,14 +157,33 @@ pub trait Forward: Send {
 #[derive(Clone)]
 pub struct LocalEngine {
     backend: Arc<Mutex<dyn Forward>>,
+    head: Arc<PointerHead>,
+    model: String,
+    limits: Limits,
 }
 
 impl LocalEngine {
-    /// An engine over an inference backend.
-    pub fn new(backend: impl Forward + 'static) -> Self {
+    /// An engine over an inference backend and a checkpoint's pointer head.
+    pub fn new(backend: impl Forward + 'static, head: PointerHead) -> Self {
         Self {
             backend: Arc::new(Mutex::new(backend)),
+            head: Arc::new(head),
+            model: String::from(crate::DEFAULT_MODEL),
+            limits: Limits::serving(),
         }
+    }
+
+    /// The name reported in responses that do not pin a model themselves.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    /// Shorten the context. The default is [`Limits::serving`]; the released
+    /// checkpoints were trained on [`Limits::training`].
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Answer a request on the calling thread.
@@ -61,29 +192,130 @@ impl LocalEngine {
     /// business on an async runtime thread. The [`SystemOne`] impl wraps this
     /// in `spawn_blocking`; callers on a runtime other than tokio can call it
     /// from their own blocking context.
-    pub fn system_one_blocking(&self, _request: &SystemOneRequest) -> Result<SystemOneResponse> {
+    pub fn system_one_blocking(&self, request: &SystemOneRequest) -> Result<SystemOneResponse> {
+        let started = Instant::now();
+        let (record, plans) = prompt::plan(request);
         let mut backend = self.locked()?;
 
-        // TODO(PR 4-7): serialise state + questions into a prompt, tokenise it
-        // here, one `logits` call, then read a distribution per question type.
-        // Blocked on the prompt template and the readout - see the task file.
-        // An error rather than a panic, so callers can be written and tested
-        // against the seam today.
-        let _ = backend.tokenise("");
+        let encoding = self.encode(&mut *backend, &record)?;
+        let probabilities = self.probabilities(&mut *backend, &encoding)?;
+        let answers = self.answers(&probabilities, &plans)?;
 
-        Err(Error::Engine(String::from(
-            "the local engine has no forward pass yet: the prompt template and \
-             logit readout still have to be taken from the Python kev",
-        )))
+        self.respond(request, &mut *backend, answers, encoding.ids.len(), started)
     }
 
     /// Answer a request with one forward pass per question.
+    ///
+    /// Each question is asked on its own, against the same state, the way
+    /// `/v1/systemone/separate` does it: the state is encoded once per question,
+    /// so `usage.input_tokens` counts it once per question too. Questions are
+    /// already isolated in the packed call — this exists to verify that.
     pub fn system_one_separate_blocking(
         &self,
         request: &SystemOneRequest,
     ) -> Result<SystemOneResponse> {
-        // TODO(PR 8): one pass per question. Same blocker.
-        self.system_one_blocking(request)
+        let started = Instant::now();
+        let (record, plans) = prompt::plan(request);
+        let mut backend = self.locked()?;
+
+        let mut answers = IndexMap::with_capacity(plans.len());
+        let mut input_tokens = 0;
+        for (question, plan) in record.questions.iter().zip(&plans) {
+            let alone = Record {
+                state: record.state.clone(),
+                questions: vec![question.clone()],
+            };
+            let encoding = self.encode(&mut *backend, &alone)?;
+            let probabilities = self.probabilities(&mut *backend, &encoding)?;
+            input_tokens += encoding.ids.len();
+            answers.insert(plan.id.clone(), readout::answer(&probabilities[0], plan)?);
+        }
+
+        self.respond(request, &mut *backend, answers, input_tokens, started)
+    }
+
+    fn encode(&self, backend: &mut dyn Forward, record: &Record) -> Result<Encoding> {
+        let delimiters = Delimiters {
+            state: backend.delimiter(SPECIAL[0])?,
+            question: backend.delimiter(SPECIAL[1])?,
+            option: backend.delimiter(SPECIAL[2])?,
+            option_end: backend.delimiter(SPECIAL[3])?,
+            decide: backend.delimiter(SPECIAL[4])?,
+        };
+        encode::encode(record, &delimiters, self.limits, |text| {
+            backend.tokenise(text)
+        })
+    }
+
+    /// One forward pass, then the pointer head: a distribution per question.
+    fn probabilities(
+        &self,
+        backend: &mut dyn Forward,
+        encoding: &Encoding,
+    ) -> Result<Vec<Vec<f32>>> {
+        let readout = encoding.readout();
+        let pass = Pass {
+            ids: &encoding.ids,
+            positions: &encoding.positions,
+            segments: &encoding.segments,
+            readout: &readout,
+        };
+        let hidden = backend.hidden(&pass)?;
+        if hidden.len() != readout.len() {
+            return Err(Error::Engine(format!(
+                "the backend returned {} hidden states for {} readout positions",
+                hidden.len(),
+                readout.len()
+            )));
+        }
+
+        let mut hidden = hidden.into_iter();
+        (0..encoding.decide.len())
+            .map(|question| {
+                // The readout is laid out per question: <decide> first, then
+                // one `</opt>` per option.
+                let mut states = hidden.by_ref().take(encoding.readout_width(question));
+                let decide = states.next().expect("readout width is at least one");
+                let options: Vec<Vec<f32>> = states.collect();
+                Ok(readout::softmax(&self.head.logits(&decide, &options)?))
+            })
+            .collect()
+    }
+
+    fn answers(
+        &self,
+        probabilities: &[Vec<f32>],
+        plans: &[Plan],
+    ) -> Result<IndexMap<String, Answer>> {
+        probabilities
+            .iter()
+            .zip(plans)
+            .map(|(p, plan)| Ok((plan.id.clone(), readout::answer(p, plan)?)))
+            .collect()
+    }
+
+    fn respond(
+        &self,
+        request: &SystemOneRequest,
+        backend: &mut dyn Forward,
+        answers: IndexMap<String, Answer>,
+        input_tokens: usize,
+        started: Instant,
+    ) -> Result<SystemOneResponse> {
+        // Not generated tokens - there are none. The server bills the
+        // serialised answers, so this counts the same string.
+        let output_tokens = backend.tokenise(&readout::answers_json(&answers))?.len();
+        Ok(SystemOneResponse {
+            model: request.model.clone().unwrap_or_else(|| self.model.clone()),
+            answers,
+            usage: Usage {
+                input_tokens: input_tokens as u64,
+                output_tokens: output_tokens as u64,
+            },
+            latency_ms: Some((started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0),
+            // A header the HTTP server sets; there is no server here.
+            request_id: None,
+        })
     }
 
     /// A panic in one forward pass must not wedge every later call, so say so
@@ -104,7 +336,9 @@ impl LocalEngine {
 impl fmt::Debug for LocalEngine {
     // The backend is an opaque model handle; there is nothing useful to print.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LocalEngine").finish_non_exhaustive()
+        f.debug_struct("LocalEngine")
+            .field("model", &self.model)
+            .finish_non_exhaustive()
     }
 }
 
