@@ -21,8 +21,8 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::weights::{
-    attention_mask, branch_batch_mask, linear, pad_rows, repeat_kv, rms_norm, rope, rotary_tables,
-    Weights,
+    attention_mask, branch_batch_mask, linear, pad_rows, prefill_batch_mask, repeat_kv, rms_norm,
+    rope, rotary_tables, Weights,
 };
 
 /// The parts of a Qwen3 `config.json` this backbone needs.
@@ -268,6 +268,52 @@ impl Backbone {
             tokens: ids.to_vec(),
             layers,
         })
+    }
+
+    /// Prefill several states in one pass, padded to the longest.
+    ///
+    /// Only worth it when the states are short enough that a pass costs more in
+    /// overhead than in arithmetic; a long state fills the machine on its own.
+    pub fn prefill_batch(&self, rows: &[(&[u32], &[u32])]) -> Result<Vec<Prefix>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (ids, positions, lengths, padded) = pad_rows(rows);
+        let mask = prefill_batch_mask(&lengths, padded, &self.device)?;
+        let batched: Vec<(&[u32], &[u32])> = (0..rows.len())
+            .map(|row| {
+                (
+                    &ids[row * padded..(row + 1) * padded],
+                    &positions[row * padded..(row + 1) * padded],
+                )
+            })
+            .collect();
+        let (_, layers) = self.run(&batched, &mask, None)?;
+
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(row, length)| {
+                let layers = layers
+                    .iter()
+                    .map(|(keys, values)| {
+                        Ok((
+                            keys.narrow(0, row, 1)?
+                                .narrow(2, 0, *length)?
+                                .contiguous()?,
+                            values
+                                .narrow(0, row, 1)?
+                                .narrow(2, 0, *length)?
+                                .contiguous()?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Prefix {
+                    tokens: rows[row].0.to_vec(),
+                    layers,
+                })
+            })
+            .collect()
     }
 
     /// The hidden states of one branch, continuing from a prefilled state.

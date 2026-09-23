@@ -318,6 +318,47 @@ none of them by the short-row test, which is what says the long one earns its
 place: no causal mask on the pairwise decays, the inverse truncated, the keys not
 decayed to the chunk end, and the strict lower triangle taken inclusive.
 
+## Done: batched prefills, and a chunk size that can be chosen
+
+Commit "Batch the prefills, make the chunk size a knob".
+
+`Forward` gained `hidden_batch`, whose default answers passes one at a time, so a
+backend that cannot share anything keeps working.
+`LocalEngine::system_one_batch_blocking` takes several requests and hands their
+passes over together; `Backend` overrides `hidden_batch` to prefill the distinct
+states in one pass and then answer each request's questions as its own batch — the
+branches cannot be shared, since every one of them reads its own state.
+
+On a recurrent base, padding a batch of states is not a matter of masking: a
+recurrence walks the tokens, and a pad would decay the state and write to it. So
+the decay and the write strength are zeroed at pads (`real_mask`), which makes a
+short row hand on exactly the state it had at its last real token, and the
+convolution window is taken at each row's own end. Removing that masking makes
+`answering_several_requests_at_once_gives_the_same_answers` fail, which is how it
+is known to matter.
+
+What it is worth, measured:
+
+| eight requests, 20-token states, toy widths | |
+|---|---|
+| prefilled one by one | 44 ms |
+| prefilled together | 32 ms |
+
+| four requests, 200-token states, 128-wide heads | |
+|---|---|
+| prefilled one by one | 1564 ms |
+| prefilled together | 1567 ms |
+
+Which is the expected shape: batching saves per-pass overhead, and a long state
+has none worth saving. The first measurement of this said the opposite — batched
+prefills 70% *slower* — and the reason was a bug it found: a batch bigger than the
+cache evicted the states it had just prefilled and ran them again, one at a time.
+The cache now keeps a floor of one batch's worth while the batch is in flight.
+
+The chunk size is `with_chunk_size` now, default 64, a power of two because the
+block-by-block triangular inverse halves it down to one. The transcription test
+runs at 2, 8 and 64, on a long row and a short one.
+
 ## Left to do
 
 1. **Parity — the tool is there, it has not been run.** `examples/parity.rs`
@@ -331,11 +372,12 @@ decayed to the chunk end, and the strict lower triangle taken inclusive.
    thing. Run it with `KEV_TOKENIZER` set too, so the opt-in tokenizer checks
    come along. A real `head.pt` is part of what it exercises: the fixture here is
    in torch's shape, but only torch writes the real thing.
-2. **Performance, what is left of it.** The prefix, the batched branches and the
-   chunked delta rule are in (below). Still open: everything is f32 on the CPU
-   unless a caller passes a device, nothing is quantised, the prefill itself is a
-   single row (batching across *requests* would need a queue), and the chunk size
-   is fixed at 64.
+2. **Performance, what is left of it.** The prefix, the batched branches, the
+   chunked delta rule and the batched prefills are in (below). Still open:
+   everything is f32 on the CPU unless a caller passes a device, nothing is
+   quantised, and a *server* would want to collect concurrent requests into a
+   batch itself — `system_one_batch_blocking` is the call it would make, not the
+   queue in front of it.
 3. `permute`, and `option_isolation` if a checkpoint ever serves with it.
 
 ## Design decisions

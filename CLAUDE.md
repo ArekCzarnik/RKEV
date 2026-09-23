@@ -215,6 +215,16 @@ as one pass rather than one each. That is worth most where a pass is short and
 per-call overhead dominates, and little where the arithmetic already fills the
 CPU.
 
+**Batched prefills.** `LocalEngine::system_one_batch_blocking` takes several
+requests and prefills their states in one pass (`Forward::hidden_batch`, whose
+default answers them one at a time, so other backends keep working). Their
+questions cannot be shared — every branch reads its own state — so those stay one
+batch per request. Worth about 1.4x for eight short states, and nothing at all
+for four long ones: a long state already fills the machine. On a recurrent base
+the padding is not a matter of masking, since a recurrence walks the tokens, so
+the decay and the write strength are zeroed at pads and the convolution window is
+taken at each row's own end.
+
 **The chunked delta rule.** `torch_chunk_gated_delta_rule`: within a chunk of 64
 tokens the updates are condensed into matmuls through a UT transform, leaving the
 sequential scan one step per chunk instead of one per token. The triangular
@@ -223,7 +233,8 @@ than as `I + A + A²+ …`, which costs six times the arithmetic. Whether it pay
 depends on the value heads' width against a chunk's own `64 x 64` algebra, so
 `chunking_pays` decides per request: the released checkpoints (128 by 128) are
 far above the crossover, a toy model far below. `with_chunked_recurrence` forces
-either form.
+either form, and `with_chunk_size` changes the 64 (a power of two, since the
+triangular inverse halves it down to one).
 
 What the measurements say, for five questions:
 
@@ -238,6 +249,11 @@ What the measurements say, for five questions:
 | state per question | 57 ms |
 | state once | 13 ms |
 | state cached | 4.5 ms |
+
+| eight requests, 20-token states, toy widths | |
+|---|---|
+| prefilled one by one | 44 ms |
+| prefilled together | 32 ms |
 
 `Backend::with_prefix(false)` keeps the packed path, which is what the
 transcription tests compare against, so leave those calling it.

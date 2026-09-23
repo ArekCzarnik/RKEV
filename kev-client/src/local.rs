@@ -191,6 +191,15 @@ pub trait Forward: Send {
     /// The token id of one of Kev's five delimiters ([`SPECIAL`]).
     fn delimiter(&mut self, token: &str) -> Result<u32>;
 
+    /// Hidden states for several passes at once.
+    ///
+    /// The default answers them one at a time. A backend overrides it when it
+    /// can share work between them: several requests each have a state of their
+    /// own, and prefilling them together is one pass instead of one each.
+    fn hidden_batch(&mut self, passes: &[Pass<'_>]) -> Result<Vec<Vec<Vec<f32>>>> {
+        passes.iter().map(|pass| self.hidden(pass)).collect()
+    }
+
     /// Hidden states at `pass.readout`, in that order, one vector of the
     /// backbone's hidden size each.
     ///
@@ -256,6 +265,59 @@ impl LocalEngine {
         self.respond(request, &mut *backend, answers, encoding.ids.len(), started)
     }
 
+    /// Answer several requests, prefilling their states together.
+    ///
+    /// Each request still gets its own answers; what is shared is the pass that
+    /// runs the states. That is worth it when the states are short enough that a
+    /// pass costs more in overhead than in arithmetic, and worth little when each
+    /// state already fills the machine — measure before reaching for it.
+    ///
+    /// All or nothing: a request that does not fit the context fails the call,
+    /// rather than leaving the caller to work out which answers belong to whom.
+    pub fn system_one_batch_blocking(
+        &self,
+        requests: &[SystemOneRequest],
+    ) -> Result<Vec<SystemOneResponse>> {
+        let started = Instant::now();
+        let planned: Vec<(Record, Vec<Plan>)> = requests.iter().map(prompt::plan).collect();
+        let mut backend = self.locked()?;
+
+        let encodings = planned
+            .iter()
+            .map(|(record, _)| self.encode(&mut *backend, record))
+            .collect::<Result<Vec<_>>>()?;
+        let readouts: Vec<Vec<usize>> = encodings.iter().map(Encoding::readout).collect();
+        let passes: Vec<Pass<'_>> = encodings
+            .iter()
+            .zip(&readouts)
+            .map(|(encoding, readout)| Pass {
+                ids: &encoding.ids,
+                positions: &encoding.positions,
+                segments: &encoding.segments,
+                readout,
+            })
+            .collect();
+
+        let hidden = backend.hidden_batch(&passes)?;
+        if hidden.len() != requests.len() {
+            return Err(Error::Engine(format!(
+                "the backend answered {} of {} passes",
+                hidden.len(),
+                requests.len()
+            )));
+        }
+
+        hidden
+            .into_iter()
+            .zip(encodings.iter().zip(planned.iter().zip(requests)))
+            .map(|(hidden, (encoding, ((_, plans), request)))| {
+                let probabilities = self.distributions(hidden, encoding)?;
+                let answers = self.answers(&probabilities, plans)?;
+                self.respond(request, &mut *backend, answers, encoding.ids.len(), started)
+            })
+            .collect()
+    }
+
     /// Answer a request with one forward pass per question.
     ///
     /// Each question is asked on its own, against the same state, the way
@@ -313,11 +375,17 @@ impl LocalEngine {
             readout: &readout,
         };
         let hidden = backend.hidden(&pass)?;
-        if hidden.len() != readout.len() {
+        self.distributions(hidden, encoding)
+    }
+
+    /// The pointer head, over the hidden states one pass came back with: a
+    /// distribution per question.
+    fn distributions(&self, hidden: Vec<Vec<f32>>, encoding: &Encoding) -> Result<Vec<Vec<f32>>> {
+        let wanted = encoding.readout().len();
+        if hidden.len() != wanted {
             return Err(Error::Engine(format!(
-                "the backend returned {} hidden states for {} readout positions",
+                "the backend returned {} hidden states for {wanted} readout positions",
                 hidden.len(),
-                readout.len()
             )));
         }
 

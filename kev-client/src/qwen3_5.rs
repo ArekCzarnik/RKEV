@@ -25,8 +25,8 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::qwen3::{read_config, supported_rope, RopeParameters};
 use crate::weights::{
-    attention_mask, branch_batch_mask, linear, pad_rows, repeat_kv, rms_norm, rope, rotary_tables,
-    Weights,
+    attention_mask, branch_batch_mask, linear, pad_rows, prefill_batch_mask, real_mask, repeat_kv,
+    rms_norm, rope, rotary_tables, Weights,
 };
 
 /// Hugging Face's default when a Qwen3.5 config does not state one.
@@ -197,6 +197,8 @@ pub struct Backbone {
     /// Whether the delta rule runs in chunks; `None` decides per request. See
     /// [`Backbone::with_chunked_recurrence`].
     chunked: Option<bool>,
+    /// How many tokens a chunk covers. See [`Backbone::with_chunk_size`].
+    chunk: usize,
 }
 
 struct Layer {
@@ -291,6 +293,7 @@ impl Backbone {
             config,
             device: device.clone(),
             chunked: None,
+            chunk: CHUNK,
         })
     }
 
@@ -305,6 +308,24 @@ impl Backbone {
     pub fn with_chunked_recurrence(mut self, chunked: bool) -> Self {
         self.chunked = Some(chunked);
         self
+    }
+
+    /// How many tokens one chunk of the delta rule covers. [`CHUNK`] by default,
+    /// which is what the reference uses.
+    ///
+    /// Bigger chunks mean fewer steps in the scan and more work inside each one
+    /// — the per-chunk algebra grows with the square of the chunk, the triangular
+    /// inverse with its cube — so the best size depends on the checkpoint's
+    /// widths and the machine. It has to be a power of two, and at least two:
+    /// the block-by-block inverse halves it down to one.
+    pub fn with_chunk_size(mut self, tokens: usize) -> Result<Self> {
+        if tokens < 2 || !tokens.is_power_of_two() {
+            return Err(Error::Engine(format!(
+                "a chunk has to be a power of two and at least two tokens, not {tokens}"
+            )));
+        }
+        self.chunk = tokens;
+        Ok(self)
     }
 
     pub fn config(&self) -> &Config {
@@ -322,18 +343,75 @@ impl Backbone {
     /// the tokens its question may read, in order, which is what
     /// [`Pass::rows`](crate::Pass::rows) produces.
     pub fn forward(&self, ids: &[u32], positions: &[u32], mask: &Tensor) -> Result<Tensor> {
-        let (hidden, _) = self.run(&[(ids, positions)], mask, None)?;
+        let (hidden, _) = self.run(&[(ids, positions)], mask, None, None)?;
         Ok(hidden.i(0)?)
     }
 
     /// Run the state tokens and keep what a branch needs to continue from them.
     pub fn prefill(&self, ids: &[u32], positions: &[u32]) -> Result<Prefix> {
         let mask = attention_mask(ids.len(), |query, key| key <= query, &self.device)?;
-        let (_, layers) = self.run(&[(ids, positions)], &mask, None)?;
+        let (_, layers) = self.run(&[(ids, positions)], &mask, None, None)?;
         Ok(Prefix {
             tokens: ids.to_vec(),
             layers,
         })
+    }
+
+    /// Prefill several states in one pass.
+    ///
+    /// Rows are padded to the longest. What a recurrence does with padding is not
+    /// a matter of masking — it walks the tokens — so the decay and the write
+    /// strength are zeroed there, which makes a short row hand on exactly the
+    /// state it had at its last real token, and the convolution window is taken
+    /// at each row's own end.
+    pub fn prefill_batch(&self, rows: &[(&[u32], &[u32])]) -> Result<Vec<Prefix>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (ids, positions, lengths, padded) = pad_rows(rows);
+        let mask = prefill_batch_mask(&lengths, padded, &self.device)?;
+        let batched: Vec<(&[u32], &[u32])> = (0..rows.len())
+            .map(|row| {
+                (
+                    &ids[row * padded..(row + 1) * padded],
+                    &positions[row * padded..(row + 1) * padded],
+                )
+            })
+            .collect();
+        let (_, layers) = self.run(&batched, &mask, None, Some(&lengths))?;
+
+        let heads = self.config.linear_num_value_heads;
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(row, length)| {
+                let layers = layers
+                    .iter()
+                    .map(|layer| {
+                        Ok(match layer {
+                            LayerPrefix::Attention { keys, values } => LayerPrefix::Attention {
+                                keys: keys
+                                    .narrow(0, row, 1)?
+                                    .narrow(2, 0, *length)?
+                                    .contiguous()?,
+                                values: values
+                                    .narrow(0, row, 1)?
+                                    .narrow(2, 0, *length)?
+                                    .contiguous()?,
+                            },
+                            LayerPrefix::Recurrence { window, state } => LayerPrefix::Recurrence {
+                                window: window.narrow(0, row, 1)?.contiguous()?,
+                                state: state.narrow(0, row * heads, heads)?.contiguous()?,
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Prefix {
+                    tokens: rows[row].0.to_vec(),
+                    layers,
+                })
+            })
+            .collect()
     }
 
     /// The hidden states of one branch, continuing from a prefilled state.
@@ -367,7 +445,7 @@ impl Backbone {
                 )
             })
             .collect();
-        let (hidden, _) = self.run(&batched, &mask, Some(prefix))?;
+        let (hidden, _) = self.run(&batched, &mask, Some(prefix), None)?;
         lengths
             .iter()
             .enumerate()
@@ -381,6 +459,7 @@ impl Backbone {
         rows: &[(&[u32], &[u32])],
         mask: &Tensor,
         prefix: Option<&Prefix>,
+        lengths: Option<&[usize]>,
     ) -> Result<(Tensor, Vec<LayerPrefix>)> {
         let batch = rows.len();
         let len = rows.first().map(|(ids, _)| ids.len()).unwrap_or(0);
@@ -458,7 +537,8 @@ impl Backbone {
                         }
                         None => None,
                     };
-                    let (mixed, window, state) = self.recurrence(recurrence, &normed, past)?;
+                    let (mixed, window, state) =
+                        self.recurrence(recurrence, &normed, past, lengths)?;
                     kept.push(LayerPrefix::Recurrence { window, state });
                     mixed
                 }
@@ -541,6 +621,7 @@ impl Backbone {
         layer: &DeltaNet,
         xs: &Tensor,
         past: Option<(&Tensor, &Tensor)>,
+        lengths: Option<&[usize]>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (batch, len, _) = xs.dims3()?;
         let config = &self.config;
@@ -568,8 +649,21 @@ impl Backbone {
         let inputs = Tensor::cat(&[&window, &projected], 2)?.contiguous()?;
         let mixed = inputs.conv1d(&layer.conv1d, 0, 1, 1, channels)?;
         let mixed = candle_nn::ops::silu(&mixed)?.transpose(1, 2)?;
-        // What the next branch, or the next request, reaches back into.
-        let kept_window = inputs.narrow(2, len, kernel - 1)?.contiguous()?;
+        // What the next branch, or the next request, reaches back into — at each
+        // row's own end, not at the padded one.
+        let kept_window = match lengths {
+            None => inputs.narrow(2, len, kernel - 1)?.contiguous()?,
+            Some(lengths) => {
+                let windows = lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(row, length)| {
+                        Ok(inputs.narrow(0, row, 1)?.narrow(2, *length, kernel - 1)?)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Tensor::cat(&windows, 0)?.contiguous()?
+            }
+        };
 
         let q = mixed
             .narrow(2, 0, keys)?
@@ -589,6 +683,16 @@ impl Backbone {
         let decay = (softplus(&a.broadcast_add(&layer.dt_bias)?)?
             .broadcast_mul(&layer.a_log.exp()?)?
             * -1.0)?;
+
+        // Padding is only harmless to a recurrence if it neither decays the
+        // state nor writes to it.
+        let (beta, decay) = match lengths {
+            None => (beta, decay),
+            Some(lengths) => {
+                let real = real_mask(lengths, len, &self.device)?.unsqueeze(2)?;
+                (beta.broadcast_mul(&real)?, decay.broadcast_mul(&real)?)
+            }
+        };
 
         // The key heads are shared: each one serves several value heads.
         let group = value_heads / key_heads;
@@ -646,9 +750,9 @@ impl Backbone {
     }
 }
 
-/// How many tokens a chunk of the delta rule covers. 64 is what the reference
-/// uses, and the arithmetic below assumes it is a power of two.
-const CHUNK: usize = 64;
+/// How many tokens a chunk of the delta rule covers by default. 64 is what the
+/// reference uses; [`Backbone::with_chunk_size`] changes it.
+pub const CHUNK: usize = 64;
 
 /// Whether to run the delta rule in chunks for this shape.
 ///

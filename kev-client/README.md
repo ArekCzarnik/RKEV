@@ -147,6 +147,16 @@ between them and the prefix, a five-question request over a 500-token state went
 from about two seconds to under half of one here — on a model with the released
 checkpoints' widths, but made-up weights, so take it as a ratio.
 
+Several requests at once share the pass that runs their states:
+
+```rust
+let answers = engine.system_one_batch_blocking(&requests)?;
+```
+
+That is worth something while the states are short — eight 20-token states ran
+about 1.4x faster batched here — and nothing when each state already fills the
+machine, so measure before reaching for it.
+
 It is still CPU and f32 unless you hand `Backend::open_on` a device, and nothing
 is quantised.
 

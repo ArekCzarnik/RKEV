@@ -522,3 +522,43 @@ async fn the_engine_answers_through_the_same_seam_as_the_http_client() {
 
     assert_eq!(ask(&engine).await.unwrap(), 0.8);
 }
+
+#[test]
+fn a_batch_of_requests_is_answered_like_a_sequence_of_them() {
+    // Over a backend that does not override `hidden_batch`, the batch API is the
+    // loop it would have been - which is what keeps it usable for any backend,
+    // not just the one that can share a prefill.
+    let (engine, _, passes) = engine(vec![vec![0.3, 0.7], vec![0.6, 0.4], vec![0.55, 0.45]]);
+    let requests: Vec<SystemOneRequest> = ["a ticket", "another ticket", "a third"]
+        .iter()
+        .map(|state| SystemOneRequest::new(*state).ask("q", Noul::new("about money?")))
+        .collect();
+
+    let answers = engine.system_one_batch_blocking(&requests).unwrap();
+
+    assert_eq!(answers.len(), 3);
+    assert_eq!(answers[0].answer("q").unwrap().as_noul(), Some(0.7));
+    assert_eq!(answers[1].answer("q").unwrap().as_noul(), Some(0.4));
+    assert_eq!(answers[2].answer("q").unwrap().as_noul(), Some(0.45));
+    assert_eq!(passes.load(Ordering::SeqCst), 3, "one pass per request");
+}
+
+#[test]
+fn a_request_that_does_not_fit_fails_the_whole_batch() {
+    let (stub, _, _) = Stub::new(vec![vec![0.5, 0.5]]);
+    let engine = LocalEngine::new(stub, identity_head()).with_limits(Limits {
+        max_state: 16,
+        max_branch: 32,
+    });
+    let long = Choice::new("Pick one")
+        .options((0..20).map(|i| (format!("option-{i}"), "a description that costs tokens")));
+
+    let error = engine
+        .system_one_batch_blocking(&[
+            SystemOneRequest::new("fine").ask("q", Noul::new("?")),
+            SystemOneRequest::new("a ticket").ask("q", long),
+        ])
+        .unwrap_err();
+
+    assert!(error.is_validation(), "got {error:?}");
+}

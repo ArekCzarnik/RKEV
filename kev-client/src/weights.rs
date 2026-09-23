@@ -277,3 +277,49 @@ pub(crate) fn pad_rows(rows: &[(&[u32], &[u32])]) -> (Vec<u32>, Vec<u32>, Vec<us
     }
     (ids, positions, lengths, padded)
 }
+
+/// The additive mask for a batch of states prefilled together,
+/// `[rows, 1, padded, padded]`: causal within each row's own length.
+///
+/// A pad key is closed to every real query. A pad query keeps its diagonal, so
+/// that no row of the softmax is empty — what it computes is discarded.
+pub(crate) fn prefill_batch_mask(
+    lengths: &[usize],
+    padded: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut values = Vec::with_capacity(lengths.len() * padded * padded);
+    for length in lengths {
+        for query in 0..padded {
+            for key in 0..padded {
+                let allowed = if query < *length {
+                    key <= query && key < *length
+                } else {
+                    key == query
+                };
+                values.push(if allowed { 0.0 } else { f32::MIN });
+            }
+        }
+    }
+    Ok(Tensor::from_vec(
+        values,
+        (lengths.len(), 1, padded, padded),
+        device,
+    )?)
+}
+
+/// `1.0` at a row's real tokens and `0.0` at its padding, `[rows, padded]`.
+///
+/// A recurrence has no mask to hide padding behind: it walks the tokens. Zeroing
+/// the decay and the write strength there is what makes a padded row hand on the
+/// state it had at its last real token — decay `0` means `exp(0) = 1`, and a
+/// write strength of `0` writes nothing.
+pub(crate) fn real_mask(lengths: &[usize], padded: usize, device: &Device) -> Result<Tensor> {
+    let mut values = Vec::with_capacity(lengths.len() * padded);
+    for length in lengths {
+        for token in 0..padded {
+            values.push(if token < *length { 1.0f32 } else { 0.0 });
+        }
+    }
+    Ok(Tensor::from_vec(values, (lengths.len(), padded), device)?)
+}

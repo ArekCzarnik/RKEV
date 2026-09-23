@@ -560,14 +560,22 @@ fn a_hybrid_config_gets_the_hybrid_backbone() {
 
 /// One row: a state of `state` tokens, then a branch of `branch`, compared
 /// against the transcription at every hidden unit of every token.
-fn compare_with_the_reference(name: &str, state: usize, branch: usize, chunked: bool) {
+fn compare_with_the_reference(
+    name: &str,
+    state: usize,
+    branch: usize,
+    chunked: bool,
+    chunk: usize,
+) {
     let fixture = checkpoint(name, false, false);
     // The packed path: the one being transcribed, and the only one that returns
     // hidden states for the state tokens as well as the branches.
     let mut backend = Backend::open(&fixture.dir, None)
         .unwrap()
         .with_prefix(false)
-        .with_chunked_recurrence(chunked);
+        .with_chunked_recurrence(chunked)
+        .with_chunk_size(chunk)
+        .unwrap();
 
     // Any tokens will do, as long as they are in the toy vocabulary.
     let ids: Vec<u32> = (0..state + branch)
@@ -609,7 +617,7 @@ fn compare_with_the_reference(name: &str, state: usize, branch: usize, chunked: 
 
 #[test]
 fn the_forward_pass_matches_a_transcription_of_modeling_qwen3_5() {
-    compare_with_the_reference("reference", 3, 6, false);
+    compare_with_the_reference("reference", 3, 6, false, 64);
 }
 
 #[test]
@@ -619,8 +627,22 @@ fn the_chunked_delta_rule_matches_the_sequential_one() {
     // transcription is token-by-token whatever the length, so this is the chunked
     // form against the obvious one — two chunks' worth, plus a tail that has to
     // be padded, and a short one where the padding is nearly everything.
-    compare_with_the_reference("chunked", 100, 35, true);
-    compare_with_the_reference("chunked-short", 3, 6, true);
+    // And at every chunk size, since the size changes how much padding there is
+    // and how deep the block-by-block inverse recurses.
+    for chunk in [2, 8, 64] {
+        compare_with_the_reference(&format!("chunked-{chunk}"), 100, 35, true, chunk);
+        compare_with_the_reference(&format!("chunked-short-{chunk}"), 3, 6, true, chunk);
+    }
+}
+
+#[test]
+fn a_chunk_has_to_be_a_power_of_two() {
+    let fixture = checkpoint("chunk-size", false, false);
+    let backend = Backend::open(&fixture.dir, None).unwrap();
+
+    let error = backend.with_chunk_size(48).unwrap_err();
+
+    assert!(error.to_string().contains("power of two"), "{error}");
 }
 
 #[test]
@@ -966,5 +988,111 @@ fn how_much_chunking_saves() {
             started.elapsed().as_secs_f64() * 1000.0,
             state.split_whitespace().count() + 1
         );
+    }
+}
+
+#[test]
+fn answering_several_requests_at_once_gives_the_same_answers() {
+    // The states are prefilled together, padded to the longest. On a recurrent
+    // base that is where padding stops being a matter of masking: a pad token
+    // would decay the state and write to it, so a short row would hand on the
+    // wrong memory. Different lengths are the whole point of this test.
+    let fixture = checkpoint("batch", false, false);
+    let head = || pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
+    let requests: Vec<SystemOneRequest> = [
+        "a ticket about money",
+        "a ticket about money late shoes a ticket about money late shoes a ticket",
+        "late",
+    ]
+    .iter()
+    .map(|state| {
+        SystemOneRequest::new(*state)
+            .ask("money", Noul::new("is this about money ?"))
+            .ask("late", Noul::new("is this late ?"))
+    })
+    .collect();
+
+    let together = LocalEngine::new(Backend::open(&fixture.dir, None).unwrap(), head())
+        .system_one_batch_blocking(&requests)
+        .unwrap();
+    let apart: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            LocalEngine::new(Backend::open(&fixture.dir, None).unwrap(), head())
+                .system_one_blocking(request)
+                .unwrap()
+        })
+        .collect();
+
+    assert_eq!(together.len(), 3);
+    for (index, (together, apart)) in together.iter().zip(&apart).enumerate() {
+        for id in ["money", "late"] {
+            assert!(
+                (probability(together, id) - probability(apart, id)).abs() < 1e-5,
+                "request {index}, {id}: {} batched, {} alone",
+                probability(together, id),
+                probability(apart, id)
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "a measurement, not an assertion: cargo test --release -- --ignored --nocapture"]
+fn how_much_batching_the_prefills_saves() {
+    use std::time::Instant;
+
+    // Several requests, each with a state of its own. What they can share is the
+    // pass that runs those states - which is worth something only while a state
+    // is short enough that a pass costs more in overhead than in arithmetic.
+    for (label, dir, words, count) in [
+        (
+            "toy widths,  20-token states",
+            checkpoint("batch-bench", false, false).dir,
+            20,
+            8,
+        ),
+        (
+            "128-wide,   200-token states",
+            wide_checkpoint("batch-bench-wide"),
+            200,
+            4,
+        ),
+    ] {
+        let head = || pointer_head(&dir.join("head.safetensors")).unwrap();
+        let requests: Vec<SystemOneRequest> = (0..count)
+            .map(|index| {
+                // Distinct states, so none of them is a cache hit.
+                let state = format!("{} money", "a ticket about late shoes ".repeat(words / 5))
+                    + &" the".repeat(index);
+                SystemOneRequest::new(state)
+                    .ask("money", Noul::new("is this about money ?"))
+                    .ask("late", Noul::new("is this late ?"))
+            })
+            .collect();
+
+        for batched in [true, false] {
+            let engine = LocalEngine::new(
+                Backend::open(&dir, None).unwrap().with_prefix_cache(0),
+                head(),
+            );
+            let run = || {
+                if batched {
+                    engine.system_one_batch_blocking(&requests).unwrap();
+                } else {
+                    for request in &requests {
+                        engine.system_one_blocking(request).unwrap();
+                    }
+                }
+            };
+            run(); // warm up
+            let started = Instant::now();
+            run();
+            println!(
+                "{label}, {count} requests, prefills {}: {:>7.1} ms",
+                if batched { "together" } else { "one by one" },
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
 }

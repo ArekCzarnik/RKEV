@@ -35,6 +35,9 @@ pub struct Backend {
     /// [`Backend::with_prefix_min_tokens`].
     prefix_min: usize,
     cache: PrefixCache,
+    /// States this batch prefilled itself: found in the cache afterwards, but
+    /// not a hit — they were run, just not one at a time.
+    batched: Vec<Vec<u32>>,
 }
 
 /// A prefilled state, whichever backbone made it.
@@ -60,12 +63,29 @@ impl Prefilled {
 /// what a playground, or a chess board full of moves, does all day.
 struct PrefixCache {
     keep: usize,
+    /// What one batch's prefills need room for, whatever `keep` says. Without
+    /// it a batch bigger than the cache would evict states it is about to ask
+    /// for, and prefill them a second time, one at a time.
+    floor: usize,
     entries: Vec<Prefilled>,
     hits: usize,
     misses: usize,
 }
 
 impl PrefixCache {
+    fn holds(&self, tokens: &[u32]) -> bool {
+        self.entries.iter().any(|entry| entry.tokens() == tokens)
+    }
+
+    /// Keep a state the cache is not otherwise meant to hold: a batch that
+    /// prefilled it is about to ask for it back.
+    fn insert_forced(&mut self, prefix: Prefilled) {
+        self.entries.push(prefix);
+        while self.entries.len() > self.keep.max(self.floor) {
+            self.entries.remove(0);
+        }
+    }
+
     fn get(&mut self, tokens: &[u32]) -> Option<Prefilled> {
         let at = self
             .entries
@@ -160,10 +180,12 @@ impl Backend {
             prefix_min: if hybrid { 0 } else { 384 },
             cache: PrefixCache {
                 keep: 4,
+                floor: 0,
                 entries: Vec::new(),
                 hits: 0,
                 misses: 0,
             },
+            batched: Vec::new(),
         })
     }
 
@@ -209,6 +231,15 @@ impl Backend {
         self
     }
 
+    /// How many tokens one chunk of the delta rule covers, on a hybrid
+    /// checkpoint. See [`qwen3_5::Backbone::with_chunk_size`].
+    pub fn with_chunk_size(mut self, tokens: usize) -> Result<Self> {
+        if let Model::Hybrid(model) = self.model {
+            self.model = Model::Hybrid(model.with_chunk_size(tokens)?);
+        }
+        Ok(self)
+    }
+
     /// How often a request's state was found already prefilled, and how often it
     /// had to be run — what `/v1/models` reports on the Python side.
     pub fn prefix_hits(&self) -> (usize, usize) {
@@ -234,7 +265,14 @@ impl Backend {
     /// through before.
     fn prefilled(&mut self, state: &OwnedPass) -> Result<Prefilled> {
         if let Some(prefix) = self.cache.get(&state.ids) {
-            self.cache.hits += 1;
+            // A state this batch prefilled is already counted as a miss; the
+            // second request to ask for it is a hit like any other.
+            match self.batched.iter().position(|tokens| tokens == &state.ids) {
+                Some(at) => {
+                    self.batched.remove(at);
+                }
+                None => self.cache.hits += 1,
+            }
             return Ok(prefix);
         }
         self.cache.misses += 1;
@@ -301,6 +339,66 @@ impl Forward for Backend {
                 "this tokenizer has no {token}, so it is not a Qwen tokenizer Kev can use"
             ))
         })
+    }
+
+    fn hidden_batch(&mut self, passes: &[Pass<'_>]) -> Result<Vec<Vec<Vec<f32>>>> {
+        // What several requests can share is the pass that runs their states:
+        // one prefill for all of them, rather than one each. Their questions
+        // cannot be shared — every branch reads its own state — so those stay one
+        // batch per request.
+        if self.prefix {
+            let states: Vec<OwnedPass> = passes.iter().map(Pass::state).collect();
+            let wanted: Vec<&OwnedPass> = states
+                .iter()
+                .filter(|state| {
+                    state.ids.len() >= self.prefix_min.max(1) && !self.cache.holds(&state.ids)
+                })
+                .collect();
+            // Prefilling the same state twice in one batch would be wasted work
+            // as surely as prefilling it twice in two requests.
+            let mut fresh: Vec<&OwnedPass> = Vec::new();
+            for state in wanted {
+                if !fresh.iter().any(|kept| kept.ids == state.ids) {
+                    fresh.push(state);
+                }
+            }
+            if fresh.len() > 1 {
+                let rows: Vec<(&[u32], &[u32])> = fresh
+                    .iter()
+                    .map(|state| (state.ids.as_slice(), state.positions.as_slice()))
+                    .collect();
+                let prefilled = match &self.model {
+                    Model::Attention(model) => model
+                        .prefill_batch(&rows)?
+                        .into_iter()
+                        .map(|prefix| Prefilled::Attention(Arc::new(prefix)))
+                        .collect::<Vec<_>>(),
+                    Model::Hybrid(model) => model
+                        .prefill_batch(&rows)?
+                        .into_iter()
+                        .map(|prefix| Prefilled::Hybrid(Arc::new(prefix)))
+                        .collect::<Vec<_>>(),
+                };
+                self.cache.misses += prefilled.len();
+                self.cache.floor = prefilled.len();
+                self.batched = prefilled
+                    .iter()
+                    .map(|prefix| prefix.tokens().to_vec())
+                    .collect();
+                for prefix in prefilled {
+                    self.cache.insert_forced(prefix);
+                }
+            }
+        }
+
+        let answers: Result<Vec<Vec<Vec<f32>>>> =
+            passes.iter().map(|pass| self.hidden(pass)).collect();
+        self.batched.clear();
+        self.cache.floor = 0;
+        while self.cache.entries.len() > self.cache.keep {
+            self.cache.entries.remove(0);
+        }
+        answers
     }
 
     fn hidden(&mut self, pass: &Pass<'_>) -> Result<Vec<Vec<f32>>> {

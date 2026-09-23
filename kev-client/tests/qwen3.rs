@@ -857,3 +857,74 @@ fn how_much_the_prefix_saves() {
         );
     }
 }
+
+#[test]
+fn several_requests_share_one_prefill_and_still_answer_for_themselves() {
+    let fixture = checkpoint("batch", false, false);
+    let backend = Backend::open(&fixture.dir, None)
+        .unwrap()
+        .with_prefix_min_tokens(0);
+    let head = pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
+    let engine = LocalEngine::new(backend, head);
+    let requests: Vec<SystemOneRequest> = ["a ticket about money", "late shoes", "money money"]
+        .iter()
+        .map(|state| SystemOneRequest::new(*state).ask("money", Noul::new("is this about money ?")))
+        .collect();
+
+    let together = engine.system_one_batch_blocking(&requests).unwrap();
+    let apart: Vec<_> = requests
+        .iter()
+        .map(|request| engine.system_one_blocking(request).unwrap())
+        .collect();
+
+    assert_eq!(together.len(), 3);
+    for (index, (together, apart)) in together.iter().zip(&apart).enumerate() {
+        assert_eq!(
+            format!("{:?}", together.answer("money").unwrap()),
+            format!("{:?}", apart.answer("money").unwrap()),
+            "request {index} differs between the batch and the single call"
+        );
+    }
+}
+
+#[test]
+fn a_batch_prefills_each_state_once_however_many_requests_want_it() {
+    let fixture = checkpoint("batch-cache", false, false);
+    let mut backend = Backend::open(&fixture.dir, None)
+        .unwrap()
+        .with_prefix_min_tokens(0);
+    // Three passes over two states: the third repeats the first.
+    let states: [&[u32]; 3] = [&[1, 6, 7], &[1, 6, 9], &[1, 6, 7]];
+    let branch: [u32; 6] = [2, 12, 3, 14, 4, 5];
+    let ids: Vec<Vec<u32>> = states
+        .iter()
+        .map(|state| state.iter().chain(&branch).copied().collect())
+        .collect();
+    let segments: Vec<u32> = vec![0, 0, 0, 1, 1, 1, 1, 1, 1];
+    let positions: Vec<u32> = (0..9).collect();
+    let readout: Vec<usize> = vec![8, 7];
+    let passes: Vec<Pass<'_>> = ids
+        .iter()
+        .map(|ids| Pass {
+            ids,
+            positions: &positions,
+            segments: &segments,
+            readout: &readout,
+        })
+        .collect();
+
+    let batched = backend.hidden_batch(&passes).unwrap();
+
+    assert_eq!(batched.len(), 3);
+    // Two states were run, together; the third pass found one of them waiting.
+    assert_eq!(backend.prefix_hits(), (1, 2));
+    assert_eq!(
+        batched[0], batched[2],
+        "the same state answered differently"
+    );
+    assert_ne!(batched[0], batched[1]);
+
+    // And a second round finds both.
+    backend.hidden_batch(&passes).unwrap();
+    assert_eq!(backend.prefix_hits(), (4, 2));
+}
