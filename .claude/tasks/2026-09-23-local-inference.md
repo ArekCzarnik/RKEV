@@ -574,20 +574,53 @@ should on noise weights, and the script's exit code follows it. The error paths
 were run too: no head, no such directory, unknown argument, `--skip-suite` with
 no checkpoint.
 
+## Done: a real checkpoint, for the first time
+
+Run by the user on their Mac on 2026-09-23 (`scripts/local.sh --fetch
+jaredpalmer/kev-0.6b`, cargo 1.97.1, f32 on an Apple CPU), which is the first
+time this code has ever seen real weights — the container cannot reach the hub.
+What came back:
+
+- **7 of 7 obvious cases** in `examples/sanity.rs`: `shipping` 1.00 for a lost
+  parcel, `returns` 1.00 for a wrong size, `billing` 0.94 for a double charge,
+  `p(yes)` 0.71 on "THIRD time writing" against 0.01 on a thank-you note,
+  frustration 1.94 and urgency 0.08. On noise weights the same run scores 2 of 7
+  with every distribution flat at 0.33, so this is the discriminating result:
+  a wrong rotary convention, token layout, LoRA merge or head would not
+  saturate.
+- `head.pt says option_isolation = false` — the real torch pickle parsed,
+  projections, temperature and metadata included, and the released checkpoints do
+  leave isolation off as the Python says.
+- `hidden_size: 1024` with the head agreeing: weight names and shapes are right.
+- `largest difference 0.00000` for packed against separate and for prefilled
+  against per-question, now over a real layer stack rather than a two-layer toy.
+- The suite passed again with `KEV_TOKENIZER` set to the checkpoint's own
+  `tokenizer.json`, `a_real_qwen_tokenizer_carries_the_five_delimiters` included.
+- One request through `decide`: 101 tokens in, 1671 ms, model loaded in 1.0 s.
+
+The one difference is the README's worked example: this checkpoint answers
+`billing` 0.51 (shipping 0.25, returns 0.24), `escalate` 0.41, frustration 1.04,
+where the README publishes `returns` 0.47, 0.93 and 1.44. That is **Kev-4B in
+bf16 against Kev-0.6B in f32** on a ticket that deliberately names all three
+departments at once, so a smaller model disagreeing there is expected and is not
+evidence of a bug — which is exactly why `sanity` judges on unambiguous cases and
+only prints the 4B numbers beside its own.
+
+What this does *not* establish is parity: whether the Python answers `kev-0.6b`
+with these same numbers. That still needs the server once.
+
 ## Left to do
 
-1. **Parity — the tool is there, it has not been run.** (`examples/sanity.rs`
-   is the half of it that needs no server; this is the other half.) `examples/parity.rs`
+1. **Parity — the only thing left that needs the server.** The loading, the real
+   vocabulary and the real `head.pt` are now checked (above): `kev-0.6b` loads and
+   answers sensibly, so what is unverified is narrower than it was — whether the
+   Python gives the *same* numbers for the same request. `examples/parity.rs`
    answers a recorded request in process and compares every probability with a
-   recorded server response (`--tolerance`, non-zero exit past it). What is left
-   is running it on a machine that can hold `jaredpalmer/kev-4b` (or
-   `kev-0.8b`, which is small) with `KEV_DTYPE=fp32` on the server side, and
-   turning the recordings into offline fixtures afterwards. The arithmetic and the
-   tokenizer call are now checked against Hugging Face's definitions of them;
-   this is what checks the loading and the real vocabulary against the real
-   thing. Run it with `KEV_TOKENIZER` set too, so the opt-in tokenizer checks
-   come along. A real `head.pt` is part of what it exercises: the fixture here is
-   in torch's shape, but only torch writes the real thing.
+   recorded server response (`--tolerance`, non-zero exit past it). What is left is
+   starting `kev.serve` once with `KEV_DTYPE=fp32` on the same checkpoint the local
+   run used, recording request and response, and turning that pair into an offline
+   fixture so it never needs starting again. Expect small differences from the
+   server's own dtype, and read the argmax and the ordering before the decimals.
 2. **Performance, what is left of it.** The prefix, the batched branches, the
    chunked delta rule, the batched prefills and the precision knob are in
    (below). Still open: nothing is quantised, no device other than the CPU has

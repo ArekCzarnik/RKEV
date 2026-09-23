@@ -224,10 +224,15 @@ quantised, and no device other than the CPU has been exercised.
 Both forward passes are checked against transcriptions of Hugging Face's
 `modeling_qwen3.py` and `modeling_qwen3_5.py`, so the arithmetic is the
 arithmetic transformers defines.
-What has not happened yet is a run against a published checkpoint and a live Kev
-server, so treat the probabilities as unverified end to end until it has.
-`examples/parity.rs` is that run: it answers a request in process and compares
-every probability with a recorded server response.
+A published checkpoint has been loaded and answered with: `jaredpalmer/kev-0.6b`
+over `Qwen/Qwen3-0.6B-Base` in f32 on an Apple CPU takes all seven of the
+unambiguous tickets in `examples/sanity.rs`, with `shipping` and `returns` at
+1.00 where they belong and `p(yes)` at 0.71 against 0.01 on a thank-you note, and
+the packed and prefilled paths agree to five decimals over the real layer stack.
+What has *not* happened is a comparison with the Python answering the same
+request, so treat the probabilities as unverified against the reference until it
+has. `examples/parity.rs` is that run: it answers a request in process and
+compares every probability with a recorded server response.
 
 ```bash
 KEV_DTYPE=fp32 uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b@qwen3 --port 8009

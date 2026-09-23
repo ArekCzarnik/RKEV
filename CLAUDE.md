@@ -317,6 +317,13 @@ which makes the recording reusable as an offline fixture later. Nothing else in
 this repo compares the engine with the reference *running*, so this is the check
 that decides whether the local numbers mean anything.
 
+**A real checkpoint has been run** — `jaredpalmer/kev-0.6b` over
+`Qwen/Qwen3-0.6B-Base`, f32 on an Apple CPU, by the user on 2026-09-23: 7 of 7
+of `sanity`'s unambiguous tickets, `head.pt`'s metadata parsed, the paths
+agreeing to five decimals. So the loading, the real vocabulary and the real head
+are no longer open questions; parity with the Python is. Do not widen that claim:
+nothing here has ever been compared with the server running.
+
 `examples/sanity.rs` (feature `candle`) is what can be checked without a server
 and without Python: it answers one request along every path the engine has —
 packed against separate, prefilled against not, chunked recurrence against
