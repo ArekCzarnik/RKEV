@@ -173,6 +173,24 @@ crate — the same library this crate uses — as
 Checked for sensitivity the same way as the backbone: with the escaping removed,
 those tests fail and say which delimiter was forged.
 
+**`head.pt` is read whole.** `pointer_head()` takes the two projections *and*
+the temperature the checkpoint was calibrated with; nothing is passed in. Two
+things had to be learned from candle's pickle reader to get there:
+
+- The tensors sit under `head` in `kev.checkpoint.Meta`, so the reader has to be
+  given that key. Without it, it walks the metadata instead and finds **no
+  tensors at all** — silently, which is how this was nearly missed.
+- A temperature is a float, and tensor readers return tensors, so the pickle is
+  walked for it (candle exposes its pickle machine, which is enough). Shallower
+  matches win, so a checkpoint's own value beats anything nested.
+
+A safetensors head carries no temperature and is left raw, which is also what
+`Meta.temperature` defaults to. The tests build a `head.pt` in the shape
+`torch.save` writes — zip, protocol-2 pickle, an `OrderedDict` state dict, one
+zip entry per storage — and assert the loaded head's logits equal a hand-built
+one's divided by the temperature. Drop the `head` key and that test fails with
+"it holds []".
+
 **Still not verified against real weights.** Nothing here has opened a Qwen3
 checkpoint, so what remains open is the loading rather than the arithmetic: the
 tensor names and shapes of a published base (a mismatch fails loudly, at least),
@@ -190,19 +208,15 @@ and the probabilities end to end.
    tokenizer call are now checked against Hugging Face's definitions of them;
    this is what checks the loading and the real vocabulary against the real
    thing. Run it with `KEV_TOKENIZER` set too, so the opt-in tokenizer checks
-   come along.
-2. **The temperature.** `pointer_head()` takes it as an argument because the
-   tensor readers only return tensors; reading it out of `head.pt` itself needs
-   a little pickle work. Until then a caller has to pass the checkpoint's value
-   (`/v1/models` reports it), and passing the wrong one silently miscalibrates
-   every probability without changing any argmax.
-3. **The Qwen3.5 bases** (the current checkpoints): Gated DeltaNet layers, which
+   come along. A real `head.pt` is part of what it exercises: the fixture here is
+   in torch's shape, but only torch writes the real thing.
+2. **The Qwen3.5 bases** (the current checkpoints): Gated DeltaNet layers, which
    means a second backbone and the row form only. mistral.rs has a candle
    implementation of that architecture in `models/qwen3_next.rs` (MIT), which is
    worth reading before writing one.
-4. **Performance.** No KV cache, no state-prefix reuse, CPU by default, f32. A
+3. **Performance.** No KV cache, no state-prefix reuse, CPU by default, f32. A
    repeated state pays for itself every time; the Python caches it.
-5. `permute`, and `option_isolation` if a checkpoint ever serves with it.
+4. `permute`, and `option_isolation` if a checkpoint ever serves with it.
 
 ## Design decisions
 

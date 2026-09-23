@@ -87,6 +87,10 @@ Three modules behind a flat re-export surface in `src/lib.rs`:
   each `</opt>` hidden state against its question's `<decide>` and turns the
   softmax into an `Answer`. Every rule here is copied from the Python rather
   than invented; when one changes, the answers change.
+- `pointer_head()` in `src/backend.rs` loads the other half of a checkpoint from
+  `head.pt`: the projections, which sit under the `head` key (a reader not told
+  that finds no tensors and says nothing), and the calibration temperature,
+  which is a float and so has to be walked out of the pickle by hand.
 - `src/local.rs` — `LocalEngine` (feature `local`), the `Forward` trait and
   `Pass`. The engine owns everything Kev-specific and leaves a backend one job:
   run the backbone, return hidden states at the readout positions. **Not**

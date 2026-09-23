@@ -117,8 +117,8 @@ use kev_client::{pointer_head, LocalEngine, Qwen3Backend};
 
 let backend = Qwen3Backend::open(base_model_dir, Some(checkpoint_dir))?;
 // The other half of a checkpoint: head.pt's two projections, and the
-// temperature it was calibrated with (/v1/models reports it; 1.0 is raw).
-let head = pointer_head(&checkpoint_dir.join("head.pt"), 2.3)?;
+// temperature it was calibrated with.
+let head = pointer_head(&checkpoint_dir.join("head.pt"))?;
 
 let response = LocalEngine::new(backend, head).system_one_blocking(&request)?;
 ```

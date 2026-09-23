@@ -28,6 +28,10 @@ candle-core = { version = "0.9.2", default-features = false, optional = true }
 candle-nn = { version = "0.9.2", default-features = false, optional = true }
 # fancy-regex rather than the default onig, for the same reason.
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"], optional = true }
+# To read the temperature out of head.pt: a torch archive is a zip holding a
+# pickle. candle-core already depends on the same crate, and the entries torch
+# writes are stored, so no compression features are needed.
+zip = { version = "7", default-features = false, optional = true }
 
 [features]
 default = ["http"]
@@ -42,7 +46,7 @@ local = ["dep:tokio"]
 # The attention-only Qwen3 backbone (the `@qwen3` checkpoints) in candle, as a
 # `Forward` backend. The hybrid Qwen3.5 bases need Gated DeltaNet layers and are
 # not implemented. Raises the MSRV to whatever candle needs.
-qwen3 = ["local", "dep:candle-core", "dep:candle-nn", "dep:tokenizers"]
+qwen3 = ["local", "dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:zip"]
 
 [dev-dependencies]
 serde_json = "1"
