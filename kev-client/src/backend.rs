@@ -597,11 +597,7 @@ pub fn pointer_head(path: &Path) -> Result<PointerHead> {
     };
 
     let head = PointerHead::new(projection("q")?, projection("k")?)?;
-    match if is_safetensors {
-        None
-    } else {
-        temperature(path)?
-    } {
+    match temperature(path)? {
         Some(temperature) => head.with_temperature(temperature),
         // `Meta.temperature` defaults to 1.0 for checkpoints that never had one
         // fitted, and 1.0 is the raw head.
@@ -622,7 +618,13 @@ pub fn temperature(path: &Path) -> Result<Option<f32>> {
 }
 
 /// One number out of `head.pt`'s metadata dict.
+///
+/// A head exported as safetensors holds tensors and nothing else, so there is no
+/// dict to walk and no metadata to find — that is not an error, it is the answer.
 fn meta(path: &Path, key: &str) -> Result<Option<f64>> {
+    if path.extension().is_some_and(|e| e == "safetensors") {
+        return Ok(None);
+    }
     let file = std::fs::File::open(path)
         .map_err(|e| Error::Engine(format!("cannot read {}: {e}", path.display())))?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
@@ -753,6 +755,20 @@ mod tests {
         archive.finish().unwrap();
 
         assert_eq!(option_isolation(&path).unwrap(), Some(true));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_head_exported_as_safetensors_carries_no_metadata() {
+        // pointer_head reads such a file happily; the metadata questions have to
+        // answer "none" rather than "that is not a torch archive", because none is
+        // what a safetensors file can hold. Decided by the extension, without
+        // reading: this one is not even a valid safetensors file.
+        let path = std::env::temp_dir().join("kev-head-plain.safetensors");
+        std::fs::write(&path, b"not really").unwrap();
+
+        assert_eq!(temperature(&path).unwrap(), None);
+        assert_eq!(option_isolation(&path).unwrap(), None);
         std::fs::remove_file(&path).ok();
     }
 
