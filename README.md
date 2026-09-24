@@ -340,15 +340,24 @@ Fünf Fragen über 571 State-Tokens, Median aus fünf Pässen, `kev-0.6b` über
 
 | | f32 gepackt | f32 State einmal | f32 State im Cache | f16 State einmal |
 |---|---|---|---|---|
-| CPU | 2952 ms | 3681 ms | **1394 ms** | 2752 ms |
-| CPU, vor dem Fix unten | 4325 ms | 12416 ms | 9112 ms | 9484 ms |
-| Metal, vor dem Fix unten | 874 ms | 3403 ms | 2632 ms | 3315 ms |
+| CPU | 2952 ms | 3681 ms | 1394 ms | 2752 ms |
+| Metal | 605 ms | 998 ms | **529 ms** | 924 ms |
+| *CPU, vor den Fixes* | *4325 ms* | *12416 ms* | *9112 ms* | *9484 ms* |
+| *Metal, vor den Fixes* | *874 ms* | *3403 ms* | *2632 ms* | *3315 ms* |
 
-Vier Befunde, drei davon gegen die Erwartung:
+Von 4325 ms auf 529 ms für dieselbe Anfrage: **8.2×**, davon 4.9× durch Metal und der
+Rest durch die zwei Fehler unten.
 
-- **Metal war fünfmal schneller** als die CPU (874 gegen 4325 ms) — gemessen aber
-  *vor* dem Fix unten, der die CPU auf 2952 ms brachte. Der Abstand ist also kleiner
-  geworden und neu zu messen. Auf der GPU bringt f16 nichts (1.03×), auf der CPU 1.34×.
+Fünf Befunde, drei davon gegen die Erwartung:
+
+- **Metal ist rund fünfmal schneller** als die CPU und bleibt es auch nach den Fixes:
+  605 gegen 2952 ms gepackt, 529 gegen 1394 ms mit Cache-Treffer. f16 bringt dort
+  nichts (1.08×, und 0.0032 Abweichung), auf der CPU 1.34×.
+- **Auf Metal ist die Prefix-Wette eine andere.** Ein Fehlschlag kostet dort 65 %
+  (998 gegen 605 ms), ein Treffer spart nur 13 % (529 ms) — die Schwelle von 384
+  Tokens lohnt sich erst ab etwa 84 % wiederkehrender States, auf der CPU schon ab
+  32 %. Wer auf einer GPU mit lauter neuen Dokumenten arbeitet, setzt
+  `with_prefix_min_tokens(usize::MAX)` und fährt den gepackten Pass.
 - **Ein gebatchter Pass rechnete jede Projektion pro Zeile neu.** candles
   `broadcast_matmul` verteilt nicht die Eingabe, sondern **materialisiert die
   Gewichtsmatrix für jede Batch-Zeile** — bei fünf Fragen also fünf Kopien von 8 MB
