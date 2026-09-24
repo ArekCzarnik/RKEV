@@ -364,7 +364,7 @@ impl Backbone {
     /// the tokens its question may read, in order, which is what
     /// [`Pass::rows`](crate::Pass::rows) produces.
     pub fn forward(&self, ids: &[u32], positions: &[u32], mask: &Tensor) -> Result<Tensor> {
-        let (hidden, _) = self.run(&[(ids, positions)], mask, None, None)?;
+        let (hidden, _) = self.run(&[(ids, positions)], mask, None)?;
         Ok(hidden.i(0)?.to_dtype(DType::F32)?)
     }
 
@@ -376,7 +376,7 @@ impl Backbone {
             &self.device,
             self.dtype,
         )?;
-        let (_, layers) = self.run(&[(ids, positions)], &mask, None, None)?;
+        let layers = self.cache(&[(ids, positions)], &mask, None)?;
         Ok(Prefix {
             tokens: ids.to_vec(),
             layers: layers
@@ -415,7 +415,7 @@ impl Backbone {
                 )
             })
             .collect();
-        let (_, layers) = self.run(&batched, &mask, None, Some(&lengths))?;
+        let layers = self.cache(&batched, &mask, Some(&lengths))?;
 
         let heads = self.config.linear_num_value_heads;
         lengths
@@ -479,7 +479,7 @@ impl Backbone {
                 )
             })
             .collect();
-        let (hidden, _) = self.run(&batched, &mask, Some(prefix), None)?;
+        let (hidden, _) = self.run(&batched, &mask, Some(prefix))?;
         lengths
             .iter()
             .enumerate()
@@ -493,7 +493,38 @@ impl Backbone {
         rows: &[(&[u32], &[u32])],
         mask: &Tensor,
         prefix: Option<&Prefix>,
+    ) -> Result<(Tensor, Vec<LayerPrefix>)> {
+        let (xs, kept) = self.stack(rows, mask, prefix, None, true)?;
+        Ok((rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?, kept))
+    }
+
+    /// What every layer hands on over a batch of rows, and nothing more: what a
+    /// prefill keeps. `lengths` are the rows' own lengths when they are padded.
+    fn cache(
+        &self,
+        rows: &[(&[u32], &[u32])],
+        mask: &Tensor,
         lengths: Option<&[usize]>,
+    ) -> Result<Vec<LayerPrefix>> {
+        Ok(self.stack(rows, mask, None, lengths, false)?.1)
+    }
+
+    /// The layers over a batch of rows: the residual stream, and what each layer
+    /// hands on — keys and values, or a recurrent state and its window.
+    ///
+    /// With `whole` false the last layer stops once it has those, and the stream
+    /// handed back is the one entering it. A prefill reads nothing else — the
+    /// answers come from the branches — so the last layer's output and its
+    /// feed-forward, and the final norm, would be work no answer depends on. A
+    /// recurrent last layer still runs in full, since its state is its output's
+    /// by-product rather than the other way round.
+    fn stack(
+        &self,
+        rows: &[(&[u32], &[u32])],
+        mask: &Tensor,
+        prefix: Option<&Prefix>,
+        lengths: Option<&[usize]>,
+        whole: bool,
     ) -> Result<(Tensor, Vec<LayerPrefix>)> {
         let batch = rows.len();
         let len = rows.first().map(|(ids, _)| ids.len()).unwrap_or(0);
@@ -544,9 +575,15 @@ impl Backbone {
         let mut kept = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
             let past = prefix.map(|prefix| &prefix.layers[index]);
+            let last = !whole && index + 1 == self.layers.len();
             let residual = xs.clone();
             let normed = rms_norm(&xs, &layer.input_norm, eps)?;
             let mixed = match (&layer.mixer, past) {
+                (Mixer::Attention(attention), _) if last => {
+                    let (keys, values) = self.keys_values(attention, &normed, &cos, &sin)?;
+                    kept.push(LayerPrefix::Attention { keys, values });
+                    break;
+                }
                 (Mixer::Attention(attention), past) => {
                     let past = match past {
                         Some(LayerPrefix::Attention { keys, values }) => Some((keys, values)),
@@ -575,6 +612,9 @@ impl Backbone {
                     let (mixed, window, state) =
                         self.recurrence(recurrence, &normed, past, lengths)?;
                     kept.push(LayerPrefix::Recurrence { window, state });
+                    if last {
+                        break;
+                    }
                     mixed
                 }
             };
@@ -585,7 +625,34 @@ impl Backbone {
             xs = (residual + self.feed_forward(layer, &normed)?)?;
         }
 
-        Ok((rms_norm(&xs, &self.norm, eps)?, kept))
+        Ok((xs, kept))
+    }
+
+    /// One attention layer's keys and values, `[batch, kv_heads, tokens, dim]`
+    /// each: the keys normalised per head and partly rotated, as attention reads
+    /// them.
+    fn keys_values(
+        &self,
+        layer: &Attention,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let (batch, len, _) = xs.dims3()?;
+        let kv_heads = self.config.num_key_value_heads;
+        let dim = self.config.head_dim();
+
+        let k = layer
+            .k_proj
+            .forward(xs)?
+            .reshape((batch, len, kv_heads, dim))?;
+        let v = layer
+            .v_proj
+            .forward(xs)?
+            .reshape((batch, len, kv_heads, dim))?;
+        let k = rms_norm(&k, &layer.k_norm, self.config.rms_norm_eps)?;
+        let k = rope(&k.transpose(1, 2)?, cos, sin)?;
+        Ok((k, v.transpose(1, 2)?.contiguous()?))
     }
 
     /// Attention as Qwen3 does it, plus the output gate that comes out of the
@@ -602,9 +669,7 @@ impl Backbone {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (batch, len, _) = xs.dims3()?;
         let heads = self.config.num_attention_heads;
-        let kv_heads = self.config.num_key_value_heads;
         let dim = self.config.head_dim();
-        let eps = self.config.rms_norm_eps;
 
         let projected = layer
             .q_proj
@@ -615,20 +680,9 @@ impl Backbone {
             .narrow(3, dim, dim)?
             .reshape((batch, len, heads * dim))?;
 
-        let k = layer
-            .k_proj
-            .forward(xs)?
-            .reshape((batch, len, kv_heads, dim))?;
-        let v = layer
-            .v_proj
-            .forward(xs)?
-            .reshape((batch, len, kv_heads, dim))?;
-
-        let q = rms_norm(&q, &layer.q_norm, eps)?;
-        let k = rms_norm(&k, &layer.k_norm, eps)?;
+        let q = rms_norm(&q, &layer.q_norm, self.config.rms_norm_eps)?;
         let q = rope(&q.transpose(1, 2)?, cos, sin)?;
-        let k = rope(&k.transpose(1, 2)?, cos, sin)?;
-        let v = v.transpose(1, 2)?.contiguous()?;
+        let (k, v) = self.keys_values(layer, xs, cos, sin)?;
 
         // The state was prefilled once; every row of this batch reads the same keys
         // and values in front of its own. Here the prefix is not optional, since

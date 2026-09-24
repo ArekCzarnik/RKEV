@@ -285,7 +285,7 @@ impl Backbone {
             &self.device,
             self.dtype,
         )?;
-        let (_, layers) = self.run(&[(ids, positions)], &mask, None)?;
+        let layers = self.cache(&[(ids, positions)], &mask)?;
         Ok(Prefix {
             tokens: ids.to_vec(),
             layers: layers
@@ -313,7 +313,7 @@ impl Backbone {
                 )
             })
             .collect();
-        let (_, layers) = self.run(&batched, &mask, None)?;
+        let layers = self.cache(&batched, &mask)?;
 
         lengths
             .iter()
@@ -391,6 +391,31 @@ impl Backbone {
         mask: &Tensor,
         prefix: Option<&Prefix>,
     ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
+        let (xs, kept) = self.stack(rows, mask, prefix, true)?;
+        Ok((rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?, kept))
+    }
+
+    /// Every layer's keys and values over a batch of rows, and nothing more: what
+    /// a prefill keeps.
+    fn cache(&self, rows: &[(&[u32], &[u32])], mask: &Tensor) -> Result<Vec<(Tensor, Tensor)>> {
+        Ok(self.stack(rows, mask, None, false)?.1)
+    }
+
+    /// The layers over a batch of rows: the residual stream, and each layer's
+    /// keys and values.
+    ///
+    /// With `whole` false the last layer stops once it has its keys and values,
+    /// and the stream handed back is the one entering it. A prefill reads nothing
+    /// else — the answers come from the branches — so the last layer's query, its
+    /// attention output and its feed-forward, and the final norm, would be work no
+    /// answer depends on.
+    fn stack(
+        &self,
+        rows: &[(&[u32], &[u32])],
+        mask: &Tensor,
+        prefix: Option<&Prefix>,
+        whole: bool,
+    ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
         let batch = rows.len();
         let len = rows.first().map(|(ids, _)| ids.len()).unwrap_or(0);
         for (ids, positions) in rows {
@@ -440,8 +465,12 @@ impl Backbone {
                 let (k, v) = &prefix.layers[index];
                 (k, v)
             });
-            let residual = xs.clone();
             let normed = rms_norm(&xs, &layer.input_norm, self.config.rms_norm_eps)?;
+            if !whole && index + 1 == self.layers.len() {
+                kept.push(self.keys_values(layer, &normed, &cos, &sin)?);
+                break;
+            }
+            let residual = xs.clone();
             let (attended, k, v) = self.attention(layer, &normed, &cos, &sin, mask, past)?;
             kept.push((k, v));
             xs = (residual + attended)?;
@@ -451,7 +480,33 @@ impl Backbone {
             xs = (residual + self.feed_forward(layer, &normed)?)?;
         }
 
-        Ok((rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?, kept))
+        Ok((xs, kept))
+    }
+
+    /// One layer's keys and values, `[batch, kv_heads, tokens, dim]` each: the
+    /// keys normalised per head and rotated, as attention reads them.
+    fn keys_values(
+        &self,
+        layer: &Layer,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let (batch, len, _) = xs.dims3()?;
+        let kv_heads = self.config.num_key_value_heads;
+        let dim = self.config.head_dim();
+
+        let k = layer
+            .k_proj
+            .forward(xs)?
+            .reshape((batch, len, kv_heads, dim))?;
+        let v = layer
+            .v_proj
+            .forward(xs)?
+            .reshape((batch, len, kv_heads, dim))?;
+        let k = rms_norm(&k, &layer.k_norm, self.config.rms_norm_eps)?;
+        let k = rope(&k.transpose(1, 2)?, cos, sin)?;
+        Ok((k, v.transpose(1, 2)?.contiguous()?))
     }
 
     /// Attention over a batch of rows, optionally continuing from a state's keys
@@ -468,28 +523,16 @@ impl Backbone {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (batch, len, _) = xs.dims3()?;
         let heads = self.config.num_attention_heads;
-        let kv_heads = self.config.num_key_value_heads;
         let dim = self.config.head_dim();
 
         let q = layer
             .q_proj
             .forward(xs)?
             .reshape((batch, len, heads, dim))?;
-        let k = layer
-            .k_proj
-            .forward(xs)?
-            .reshape((batch, len, kv_heads, dim))?;
-        let v = layer
-            .v_proj
-            .forward(xs)?
-            .reshape((batch, len, kv_heads, dim))?;
-
         // Per-head normalisation, then the rotary embedding, in that order.
         let q = rms_norm(&q, &layer.q_norm, self.config.rms_norm_eps)?;
-        let k = rms_norm(&k, &layer.k_norm, self.config.rms_norm_eps)?;
         let q = rope(&q.transpose(1, 2)?, cos, sin)?;
-        let k = rope(&k.transpose(1, 2)?, cos, sin)?;
-        let v = v.transpose(1, 2)?.contiguous()?;
+        let (k, v) = self.keys_values(layer, xs, cos, sin)?;
 
         // The state's keys sit in front of this pass's, which is what makes a branch
         // see the whole state and nothing of another branch.
