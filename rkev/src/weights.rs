@@ -474,7 +474,9 @@ pub(crate) fn shared_matmul(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
 /// from a prefilled state: `[batch, heads, rows, dim]` out.
 ///
 /// `q` is `[batch, heads, rows, dim]`, `k` and `v` are `[batch, kv_heads, len,
-/// dim]`, and `mask` is additive over `[.., rows, state + len]`. A state comes as
+/// dim]`, and `mask` is additive over `[.., rows, len]`: the rows' own keys
+/// only. A state is read in full by every row, so it has no mask — which is also
+/// what keeps a padded query's softmax from being empty. A state comes as
 /// `(keys, values)` from [`state_keys`] and the prefill: `[1, kv_heads, dim,
 /// state]` and `[1, kv_heads, state, dim]`. `rows` is usually `len`; in the last
 /// layer it is only the readout positions ([`select_rows`]).
@@ -518,13 +520,15 @@ pub(crate) fn grouped_attention(
     // bit-identical unless the scale is a power of two, which `1 / sqrt(128)` is
     // not — a rounding step moved, nothing more.
     let queries = grouped(&(q * scale)?)?;
-    let branch = ungrouped(queries.matmul(&k.transpose(2, 3)?)?)?;
+    // The mask is what keeps one question from reading another. It covers the
+    // branch alone: a state column is open to every row. Masking the whole
+    // concatenation instead measured 9-11 ms per layer at kev-0.6b's branch
+    // shapes, masking the branch before it 2.3-2.7 ms.
+    let branch = ungrouped(queries.matmul(&k.transpose(2, 3)?)?)?.broadcast_add(mask)?;
     let scores = match past {
         None => branch,
         Some((keys, _)) => Tensor::cat(&[ungrouped(shared_matmul(&queries, keys)?)?, branch], 3)?,
     };
-    // The mask is what keeps one question from reading another.
-    let scores = scores.broadcast_add(mask)?;
     // The reference takes the softmax in f32 whatever the backbone runs in.
     let weights =
         candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
@@ -663,35 +667,28 @@ pub(crate) fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Resu
 }
 
 /// The additive mask for a batch of branches continuing from one prefilled
-/// state, `[rows, 1, padded, state + padded]`.
+/// state, `[rows, 1, padded, padded]`: over the branches' own keys only, since
+/// every row reads the whole state ([`grouped_attention`]).
 ///
-/// Rows are padded to the longest; a pad key is closed to everyone, and a pad
-/// query is left the state to look at so that no row of the softmax is empty.
+/// Rows are padded to the longest; a pad key is closed to everyone. A pad query
+/// is closed to every branch key as well and still has the state to look at, so
+/// no row of the softmax is empty.
 pub(crate) fn branch_batch_mask(
-    state: usize,
     lengths: &[usize],
     padded: usize,
     device: &Device,
     dtype: DType,
 ) -> Result<Tensor> {
-    let mut values = Vec::with_capacity(lengths.len() * padded * (state + padded));
+    let mut values = Vec::with_capacity(lengths.len() * padded * padded);
     for length in lengths {
         for query in 0..padded {
-            for key in 0..state + padded {
-                let allowed = if key < state {
-                    true
-                } else {
-                    let key = key - state;
-                    key < *length && query < *length && key <= query
-                };
+            for key in 0..padded {
+                let allowed = key < *length && query < *length && key <= query;
                 values.push(if allowed { 0.0 } else { f32::MIN });
             }
         }
     }
-    Ok(
-        Tensor::from_vec(values, (lengths.len(), 1, padded, state + padded), device)?
-            .to_dtype(dtype)?,
-    )
+    Ok(Tensor::from_vec(values, (lengths.len(), 1, padded, padded), device)?.to_dtype(dtype)?)
 }
 
 /// Token ids and position ids for a batch of rows, padded to the longest with
@@ -840,9 +837,13 @@ mod tests {
         })
     }
 
-    /// Branches of `len` tokens continuing from a state of `state` tokens: the
-    /// queries, the branch's keys and values, the state as a prefill keeps it
-    /// (keys untransposed, for the repeated form to transpose), and the mask.
+    /// Branches padded to `len` tokens continuing from a state of `state`
+    /// tokens: the queries, the branch's keys and values, the state as a prefill
+    /// keeps it (keys untransposed, for the repeated form to transpose), and the
+    /// mask — over the branch alone for the grouped form, and with the open state
+    /// columns in front for the repeated one, which masks the whole
+    /// concatenation. Rows fall short of `len` by zero, one or two tokens in turn,
+    /// so there are pad queries with nothing but the state to read.
     struct Case {
         q: Tensor,
         k: Tensor,
@@ -850,6 +851,7 @@ mod tests {
         keys: Tensor,
         values: Tensor,
         mask: Tensor,
+        whole_mask: Tensor,
     }
 
     impl Case {
@@ -865,14 +867,17 @@ mod tests {
             let noise = |shape: (usize, usize, usize, usize)| {
                 Tensor::randn(0f32, 1f32, shape, &device).unwrap()
             };
+            let lengths: Vec<usize> = (0..batch).map(|row| len - row % 3).collect();
+            let mask = branch_batch_mask(&lengths, len, &device, DType::F32).unwrap();
+            let open = Tensor::zeros((batch, 1, len, state), DType::F32, &device).unwrap();
             Self {
                 q: noise((batch, heads, len, dim)),
                 k: noise((batch, kv_heads, len, dim)),
                 v: noise((batch, kv_heads, len, dim)),
                 keys: noise((1, kv_heads, state, dim)),
                 values: noise((1, kv_heads, state, dim)),
-                mask: branch_batch_mask(state, &vec![len; batch], len, &device, DType::F32)
-                    .unwrap(),
+                whole_mask: Tensor::cat(&[&open, &mask], 3).unwrap(),
+                mask,
             }
         }
 
@@ -884,7 +889,7 @@ mod tests {
 
         fn repeated(&self) -> Tensor {
             let past = Some((&self.keys, &self.values));
-            repeated_attention(&self.q, &self.k, &self.v, past, &self.mask, 0.125).unwrap()
+            repeated_attention(&self.q, &self.k, &self.v, past, &self.whole_mask, 0.125).unwrap()
         }
     }
 
