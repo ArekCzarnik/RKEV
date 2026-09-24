@@ -16,7 +16,7 @@ gleich bleiben.
 - ✅ Task 6: Letzter Layer nur an den Readout-Positionen
 - ⬜ Task 7: Projektionen beim Laden zusammenlegen
 - ✅ Task 8: q statt Scores skalieren
-- ⬜ Task 9: Maske nur auf den Branch-Teil der Scores
+- ✅ Task 9: Maske nur auf den Branch-Teil der Scores
 - ⬜ Task 10: Qwen3-Prefix-Messung misst den Packed-Pass
 
 ## Bugs
@@ -163,6 +163,17 @@ sie per Broadcast über `[batch, heads, len, state+len]` addiert — gemessen
 zusammen mit der Skalierung 11 ms pro Schicht bei 571 State-Tokens. Nur auf den
 `[.., len, len]`-Branch-Teil angewendet, vor dem `cat`, ist es exakt dasselbe
 und etwa ein Dreizehntel der Elemente.
+
+**Erledigt.** `branch_batch_mask` baut nur noch `[rows, 1, padded, padded]`, und
+`grouped_attention` legt sie vor dem `cat` auf die Branch-Scores; der Vertrag
+sagt jetzt ausdrücklich, dass ein State für jede Zeile ganz offen ist. Eine
+Maske, die den State sperren wollte, lässt sich damit gar nicht mehr ausdrücken,
+statt still ignoriert zu werden. Im selben Prozess gemessen, 0.6B-Branch-Shapes:
+`cat` + Maske über alles 9–11 ms, Maske auf den Branch + `cat` 2,3–2,7 ms pro
+Schicht. Die ganze Schicht 62–68 → 55–61 ms, gegen die alte Schreibweise im
+selben Prozess 1,4–1,5x, bitgleich. Der Äquivalenztest hat jetzt Zeilen
+unterschiedlicher Länge, also Pad-Queries, die nur den State lesen können.
+Ohne Maske, oder ohne Kausalität in der Maske, schlagen die Tests fehl.
 
 ### Task 10: Qwen3-Prefix-Messung misst den Packed-Pass
 

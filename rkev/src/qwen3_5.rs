@@ -485,8 +485,7 @@ impl Backbone {
         readouts: &[&[usize]],
     ) -> Result<Vec<Tensor>> {
         let (ids, positions, lengths, padded) = pad_rows(rows);
-        let state = prefix.tokens.len();
-        let mask = branch_batch_mask(state, &lengths, padded, &self.device, self.dtype)?;
+        let mask = branch_batch_mask(&lengths, padded, &self.device, self.dtype)?;
         let batched: Vec<(&[u32], &[u32])> = (0..rows.len())
             .map(|row| {
                 (
