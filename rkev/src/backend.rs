@@ -654,6 +654,40 @@ pub fn pointer_head(path: &Path) -> Result<PointerHead> {
     }
 }
 
+/// A device by name: `cpu`, `metal`, or `metal:1` for the second GPU.
+///
+/// Metal needs the `metal` feature, which builds on macOS only. Without it this
+/// refuses rather than falling back to the CPU: the difference in speed is the
+/// whole reason for asking for a device, so a silent fallback would answer the
+/// wrong question.
+///
+/// The precision follows the device unless [`Backend::open_as`] overrides it —
+/// bf16 on a GPU, f32 on a CPU, as `kev.serve` picks it.
+pub fn device(name: &str) -> Result<Device> {
+    let (kind, index) = match name.split_once(':') {
+        Some((kind, index)) => (
+            kind,
+            index
+                .parse::<usize>()
+                .map_err(|e| Error::Engine(format!("{name:?} is not a device: {e}")))?,
+        ),
+        None => (name, 0),
+    };
+    match kind.to_ascii_lowercase().as_str() {
+        "cpu" => Ok(Device::Cpu),
+        #[cfg(feature = "metal")]
+        "metal" => Ok(Device::new_metal(index)?),
+        #[cfg(not(feature = "metal"))]
+        "metal" => Err(Error::Engine(format!(
+            "this build has no Metal support, so metal:{index} is not available; \
+             rebuild with --features metal (macOS only)"
+        ))),
+        other => Err(Error::Engine(format!(
+            "unknown device {other:?}; this crate knows cpu and metal"
+        ))),
+    }
+}
+
 /// The calibration temperature a checkpoint carries in `head.pt`, if it has one.
 ///
 /// `torch.save` writes a zip holding a pickled dict (`kev.checkpoint.Meta`), and

@@ -29,8 +29,8 @@ use std::time::Instant;
 
 use candle_core::{DType, Device};
 use rkev::{
-    answers_json, option_isolation, pointer_head, Answer, Backend, Choice, IndexMap, LocalEngine,
-    Noul, Question, Score, SystemOneRequest, SystemOneResponse,
+    answers_json, device, option_isolation, pointer_head, Answer, Backend, Choice, IndexMap,
+    LocalEngine, Noul, Question, Score, SystemOneRequest, SystemOneResponse,
 };
 
 fn main() -> ExitCode {
@@ -63,8 +63,8 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = options.checkpoint.as_deref();
 
     let mut backend = match options.dtype {
-        Some(dtype) => Backend::open_as(&options.base, checkpoint, Device::Cpu, dtype)?,
-        None => Backend::open(&options.base, checkpoint)?,
+        Some(dtype) => Backend::open_as(&options.base, checkpoint, options.device.clone(), dtype)?,
+        None => Backend::open_on(&options.base, checkpoint, options.device.clone())?,
     };
     // Every state a --lines run has seen stays available to the next one.
     if options.lines {
@@ -312,6 +312,8 @@ struct Options {
     checkpoint: Option<PathBuf>,
     head: Option<PathBuf>,
     dtype: Option<DType>,
+    /// Where the backbone runs. The precision follows it unless --dtype says.
+    device: Device,
     model: Option<String>,
     requests: Vec<PathBuf>,
     state: Option<String>,
@@ -332,7 +334,8 @@ the model
   --base <dir>           the base model: config.json and its safetensors
   --checkpoint <dir>     the Kev checkpoint: LoRA adapter, head.pt, tokenizer
   --head <file>          the pointer head, if not <checkpoint>/head.pt
-  --dtype f32|f16|bf16   default: f32 on a CPU, as kev.serve picks it
+  --dtype f32|f16|bf16   default: f32 on a CPU, bf16 on a GPU, as kev.serve picks it
+  --device cpu|metal     where to run; metal needs --features metal (macOS)
   --model <name>         the name to report back in the answers
 
 what to answer
@@ -357,6 +360,7 @@ fn parse() -> Result<Options, String> {
         checkpoint: None,
         head: None,
         dtype: None,
+        device: Device::Cpu,
         model: None,
         requests: Vec::new(),
         state: None,
@@ -390,6 +394,7 @@ fn parse() -> Result<Options, String> {
                     other => return Err(format!("--dtype {other}: f32, f16 or bf16")),
                 })
             }
+            "--device" => options.device = device(&value()?).map_err(|e| e.to_string())?,
             "--model" => options.model = Some(value()?),
             "--request" => options.requests.push(PathBuf::from(value()?)),
             "--state" => options.state = Some(value()?),

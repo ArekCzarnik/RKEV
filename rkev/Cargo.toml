@@ -44,6 +44,11 @@ local = ["dep:tokio"]
 # The model itself, in candle: both generations of Kev's bases, as a `Forward`
 # backend. Raises the MSRV to whatever candle needs.
 candle = ["local", "dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:zip"]
+# Metal, for an Apple GPU. Opt-in and macOS-only: candle's metal backend brings
+# kernels and a `metal` crate that do not build anywhere else, which is why this
+# cannot be part of `candle`. With it, `device("metal")` resolves; without it, it
+# says so rather than quietly running on the CPU.
+metal = ["candle", "candle-core/metal", "candle-nn/metal"]
 
 [dev-dependencies]
 serde_json = "1"

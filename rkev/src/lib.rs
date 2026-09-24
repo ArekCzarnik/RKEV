@@ -84,7 +84,7 @@ mod weights;
 pub const DEFAULT_MODEL: &str = "kev-latest";
 
 #[cfg(feature = "candle")]
-pub use backend::{option_isolation, pointer_head, temperature, Backend};
+pub use backend::{device, option_isolation, pointer_head, temperature, Backend};
 #[cfg(feature = "local")]
 pub use encode::{Limits, OptionSlot, DECIDE, OPTION, OPTION_END, QUESTION, SPECIAL, STATE};
 pub use error::{Error, Result};

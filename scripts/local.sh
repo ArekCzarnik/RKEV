@@ -20,6 +20,8 @@
 #   --questions <f>   the questions map they are labelled against
 #   --request <file>  take the questions out of a whole request instead
 #   --min-accuracy    0.8 for every question, or id=0.8 for one; repeatable
+#   --device <name>   cpu (default) or metal; metal also adds --features metal,
+#                     which only builds on macOS
 #
 # A low accuracy on your records fails the run only if you say what low means, with
 # --min-accuracy; otherwise it is reported and that is all. A question with a
@@ -43,6 +45,7 @@ records=""
 questions=""
 request=""
 minimum=()
+device=""
 checkpoint=""
 fetch=""
 measure=0
@@ -58,16 +61,29 @@ while [ $# -gt 0 ]; do
         --dir)        MODEL_DIR="${2:-}"; shift 2 ;;
         --records)    records="${2:-}"; shift 2 ;;
         --min-accuracy) minimum+=(--min-accuracy "${2:-}"); shift 2 ;;
+        --device)     device="${2:-}"; shift 2 ;;
         --questions)  questions="${2:-}"; shift 2 ;;
         --request)    request="${2:-}"; shift 2 ;;
         --measure)    measure=1; shift ;;
         --skip-suite) skip_suite=1; shift ;;
         --force)      force=1; shift ;;
         --release)    release="--release"; shift ;;
-        -h|--help)    sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '3,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            echo "error: unknown argument $1 (try --help)" >&2; exit 1 ;;
     esac
 done
+
+# A device other than the CPU needs candle's backend compiled in, so the feature
+# travels with the flag - otherwise the examples would refuse at runtime and the
+# whole run would look broken for no reason.
+features=()
+chosen=()
+if [ -n "$device" ]; then
+    chosen=(--device "$device")
+    case "$device" in
+        metal*) features=(--features metal) ;;
+    esac
+fi
 
 # Every path the caller gave is made absolute before anything else: the checks below
 # run from inside the crate directory, where a relative path means something else.
@@ -328,19 +344,19 @@ echo "==> tokenizer  $tokenizer"
 # Always --release: a real checkpoint under a debug build is minutes per pass.
 # The model is the crate's default feature, so there is nothing to pass here.
 step "the engine against itself and against obvious cases (example sanity)" \
-    cargo run --release --example sanity -- \
-    "${model[@]}"
+    cargo run --release ${features[@]+"${features[@]}"} --example sanity -- \
+    "${model[@]}" ${chosen[@]+"${chosen[@]}"}
 
 # KEV_TOKENIZER turns on the checks that need a real Qwen vocabulary: the
 # specials Kev reuses as delimiters have to be single known ids, and text that
 # looks like one must not become one.
 step "the suite again with the real tokenizer (KEV_TOKENIZER)" \
-    env KEV_TOKENIZER="$tokenizer" cargo test --release
+    env KEV_TOKENIZER="$tokenizer" cargo test --release ${features[@]+"${features[@]}"}
 
 # One answer through the front end, which is the thing you would actually run.
 step "one request end to end (example decide)" \
-    cargo run --release --example decide -- \
-    "${model[@]}" \
+    cargo run --release ${features[@]+"${features[@]}"} --example decide -- \
+    "${model[@]}" ${chosen[@]+"${chosen[@]}"} \
     --state "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card."
 
 # Whether it is any use on your own tickets, which is a different question from
@@ -350,8 +366,8 @@ if [ -n "$records" ]; then
     asked=(--questions "$questions")
     [ -n "$request" ] && asked=(--request "$request")
     step "how often it is right on your records (example eval)" \
-        cargo run --release --example eval -- \
-        "${model[@]}" "${asked[@]}" --records "$records" \
+        cargo run --release ${features[@]+"${features[@]}"} --example eval -- \
+        "${model[@]}" "${asked[@]}" ${chosen[@]+"${chosen[@]}"} --records "$records" \
         ${minimum[@]+"${minimum[@]}"}
 fi
 
@@ -359,12 +375,12 @@ if [ "$measure" -eq 1 ]; then
     # On the real checkpoint: what f16 buys, and what the prefix cache buys, with
     # the controls that keep a cache hit from being read as a precision win.
     step "the timings on this checkpoint (example measure)" \
-        cargo run --release --example measure -- \
-        "${model[@]}"
+        cargo run --release ${features[@]+"${features[@]}"} --example measure -- \
+        "${model[@]}" ${chosen[@]+"${chosen[@]}"}
     # And on the synthetic fixtures, which is where the released checkpoints'
     # layer widths are reproduced without their weights.
     step "the timings on the fixtures (#[ignore]d tests)" \
-        cargo test --release -- --ignored --nocapture
+        cargo test --release ${features[@]+"${features[@]}"} -- --ignored --nocapture
 fi
 
 if [ -n "$failed" ]; then

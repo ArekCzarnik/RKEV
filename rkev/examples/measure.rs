@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use candle_core::{DType, Device};
 use rkev::{
-    pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest,
+    device, pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest,
     SystemOneResponse,
 };
 
@@ -55,6 +55,9 @@ struct Options {
     repeat: usize,
     words: usize,
     batch: usize,
+    /// Where the backbone runs. Run it once per device to compare them; the rows
+    /// themselves say nothing about which device they were measured on.
+    device: Device,
 }
 
 const USAGE: &str = "\
@@ -63,7 +66,8 @@ usage: measure --base <dir> [--checkpoint <dir>] [options]
   --head <file>     the pointer head, if not <checkpoint>/head.pt
   --repeat <n>      passes per row, median reported (default 3)
   --words <n>       length of the generated state, in words (default 400)
-  --batch <n>       requests in the batched row (default 4)";
+  --batch <n>       requests in the batched row (default 4)
+  --device <name>   cpu|metal; metal needs --features metal (macOS only)";
 
 fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = options.checkpoint.as_deref();
@@ -78,7 +82,7 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     // One engine per configuration, because the knobs sit on the backend and a
     // loaded backend cannot be reconfigured behind the engine's mutex.
     let engine = |dtype: DType, prefix: bool, cache: usize| -> rkev::Result<LocalEngine> {
-        let backend = Backend::open_as(&options.base, checkpoint, Device::Cpu, dtype)?
+        let backend = Backend::open_as(&options.base, checkpoint, options.device.clone(), dtype)?
             .with_prefix(prefix)
             .with_prefix_min_tokens(0)
             .with_prefix_cache(cache);
@@ -164,11 +168,16 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- the recurrence, where there is one ---
     if hybrid {
-        let backend = Backend::open_as(&options.base, checkpoint, Device::Cpu, DType::F32)?
-            .with_prefix(true)
-            .with_prefix_min_tokens(0)
-            .with_prefix_cache(0)
-            .with_chunked_recurrence(false);
+        let backend = Backend::open_as(
+            &options.base,
+            checkpoint,
+            options.device.clone(),
+            DType::F32,
+        )?
+        .with_prefix(true)
+        .with_prefix_min_tokens(0)
+        .with_prefix_cache(0)
+        .with_chunked_recurrence(false);
         let sequential = LocalEngine::new(backend, pointer_head(&head_path)?);
         measure(
             "f32, the delta rule token by token",
@@ -349,6 +358,7 @@ fn parse() -> Result<Options, String> {
     let mut repeat = 3usize;
     let mut words = 400usize;
     let mut batch = 4usize;
+    let mut chosen = Device::Cpu;
 
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -364,6 +374,7 @@ fn parse() -> Result<Options, String> {
             "--repeat" => repeat = value()?.parse().map_err(|e| format!("--repeat: {e}"))?,
             "--words" => words = value()?.parse().map_err(|e| format!("--words: {e}"))?,
             "--batch" => batch = value()?.parse().map_err(|e| format!("--batch: {e}"))?,
+            "--device" => chosen = device(&value()?).map_err(|e| e.to_string())?,
             "-h" | "--help" => return Err(String::from("measure")),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -378,5 +389,6 @@ fn parse() -> Result<Options, String> {
         repeat,
         words,
         batch,
+        device: chosen,
     })
 }

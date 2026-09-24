@@ -65,7 +65,16 @@ step() {
     fi
 }
 
-# clippy runs with --all-features: a lint inside a cfg-gated module would
+# `metal` is macOS-only (candle's backend pulls Apple frameworks), so the
+# complete feature set is platform-dependent: --all-features on a Mac, and
+# everything-but-metal elsewhere. On a Mac this is also what compiles the
+# cfg-gated Metal code at all.
+all_features="--all-features"
+if [ "$(uname -s)" != "Darwin" ]; then
+    all_features="--features candle"
+fi
+
+# clippy runs with the full feature set: a lint inside a cfg-gated module would
 # otherwise never be seen, which is how the manual_async_fn in local.rs got
 # past the first run.
 #
@@ -81,7 +90,8 @@ fi
 
 if [ "$skip_clippy" -eq 0 ]; then
     if cargo clippy --version >/dev/null 2>&1; then
-        step "cargo clippy" cargo clippy --all-targets --all-features -- -D warnings
+        # shellcheck disable=SC2086
+        step "cargo clippy" cargo clippy --all-targets $all_features -- -D warnings
     else
         echo "==> skipping clippy (not installed: rustup component add clippy)"
     fi
@@ -100,7 +110,7 @@ step "cargo test" cargo test ${cargo_test_args[@]+"${cargo_test_args[@]}"}
 if [ "$skip_features" -eq 0 ] && [ ${#cargo_test_args[@]} -eq 0 ]; then
     for combo in "--no-default-features" \
                  "--no-default-features --features local" \
-                 "--all-features"; do
+                 "$all_features"; do
         # shellcheck disable=SC2086
         step "cargo test $combo" cargo test $combo
     done

@@ -26,7 +26,10 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use rkev::{pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest};
+use candle_core::Device;
+use rkev::{
+    device, pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest,
+};
 
 fn main() -> ExitCode {
     let options = match parse() {
@@ -51,6 +54,8 @@ struct Options {
     checkpoint: Option<PathBuf>,
     head: Option<PathBuf>,
     tolerance: f64,
+    /// Where the backbone runs; the precision follows it.
+    device: Device,
 }
 
 /// One case whose answer is not in doubt.
@@ -171,7 +176,9 @@ fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
             .find(|path| path.exists())
             .unwrap_or_else(|| dir.join("head.pt"))
     });
-    let open = || -> Result<Backend, rkev::Error> { Backend::open(&options.base, checkpoint) };
+    let open = || -> Result<Backend, rkev::Error> {
+        Backend::open_on(&options.base, checkpoint, options.device.clone())
+    };
     let engine = || -> Result<LocalEngine, rkev::Error> {
         Ok(LocalEngine::new(open()?, pointer_head(&head)?))
     };
@@ -416,13 +423,15 @@ usage: sanity --base <dir> [--checkpoint <dir>] [--head <file>] [--tolerance <f6
   --base        the base model directory (config.json and its safetensors)
   --checkpoint  the Kev checkpoint: adapter, head.pt, tokenizer
   --head        the pointer head, if it is not <checkpoint>/head.pt
-  --tolerance   largest difference to accept between paths (default 0.001)";
+  --tolerance   largest difference to accept between paths (default 0.001)
+  --device      cpu|metal; metal needs --features metal (macOS only)";
 
 fn parse() -> Result<Options, String> {
     let mut base = None;
     let mut checkpoint = None;
     let mut head = None;
     let mut tolerance = 0.001;
+    let mut chosen = Device::Cpu;
 
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -438,6 +447,7 @@ fn parse() -> Result<Options, String> {
             "--tolerance" => {
                 tolerance = value()?.parse().map_err(|e| format!("--tolerance: {e}"))?
             }
+            "--device" => chosen = device(&value()?).map_err(|e| e.to_string())?,
             "-h" | "--help" => return Err(String::from("sanity")),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -447,5 +457,6 @@ fn parse() -> Result<Options, String> {
         checkpoint,
         head,
         tolerance,
+        device: chosen,
     })
 }

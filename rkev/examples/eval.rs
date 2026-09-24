@@ -20,8 +20,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use candle_core::Device;
 use rkev::{
-    option_isolation, pointer_head, Answer, Backend, IndexMap, LocalEngine, Question,
+    device, option_isolation, pointer_head, Answer, Backend, IndexMap, LocalEngine, Question,
     SystemOneRequest, SystemOneResponse,
 };
 use serde_json::Value;
@@ -57,6 +58,8 @@ struct Options {
     limit: Option<usize>,
     errors: usize,
     json: bool,
+    /// Where the backbone runs; the precision follows it.
+    device: Device,
     /// `--min-accuracy`: a bare value applies to every question, `id=value` to one.
     /// Given both, the named one wins.
     minimum: Vec<(Option<String>, f64)>,
@@ -111,7 +114,7 @@ fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
             .find(|path| path.exists())
             .unwrap_or_else(|| dir.join("head.pt"))
     });
-    let backend = Backend::open(&options.base, checkpoint)?;
+    let backend = Backend::open_on(&options.base, checkpoint, options.device.clone())?;
     let hybrid = backend.is_hybrid();
     let dtype = backend.dtype();
     let mut engine = LocalEngine::new(backend, pointer_head(&head)?);
@@ -650,6 +653,7 @@ usage: eval --base <dir> [--checkpoint <dir>] --records <file.jsonl>
                     Exits non-zero below it, and below it counts a question with
                     a threshold and nothing labelled for it.
   --json            the tallies as JSON instead of a report
+  --device          cpu|metal; metal needs --features metal (macOS only)
 
 tests/eval/README.md has the record format and what the numbers mean.";
 
@@ -667,6 +671,7 @@ fn parse() -> Result<Options, String> {
         limit: None,
         errors: 5,
         json: false,
+        device: Device::Cpu,
         minimum: Vec::new(),
     };
 
@@ -692,6 +697,7 @@ fn parse() -> Result<Options, String> {
                 options.errors = value()?.parse().map_err(|e| format!("--errors: {e}"))?
             }
             "--json" => options.json = true,
+            "--device" => options.device = device(&value()?).map_err(|e| e.to_string())?,
             "--min-accuracy" => {
                 let given = value()?;
                 let (id, number) = match given.split_once('=') {

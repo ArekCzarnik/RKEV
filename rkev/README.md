@@ -370,6 +370,21 @@ rkev = { path = "../rkev", default-features = false }
 `--features local` sits between the two: the prompt, the layout and the readout,
 with `Forward` left to you.
 
+`--features metal` adds candle's Metal backend, for an Apple GPU. It is opt-in
+because it only builds on macOS, and `device("metal")` refuses without it rather
+than falling back to the CPU — a silent fallback would answer the wrong question
+when the reason for asking was speed:
+
+```bash
+cargo run --release --features metal --example measure -- \
+    --base <base> --checkpoint <kev> --device metal
+```
+
+The precision follows the device unless `--dtype` overrides it: bf16 on a GPU, f32
+on a CPU, as `kev.serve` picks it. `decide`, `sanity`, `eval` and `measure` take
+`--device`; `parity` deliberately does not, since the comparison belongs on the f32
+path the recording was made against.
+
 ## Measuring it on your own records
 
 Parity asks whether this engine agrees with the reference. `examples/eval.rs` asks

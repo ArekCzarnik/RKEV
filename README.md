@@ -375,10 +375,28 @@ Auswertung maschinenlesbar aus, und die Batch-Größe ändert die Zahlen nicht (
 | `candle` (Standard) | das Modell selbst: beide Qwen-Generationen | candle 0.9, tokenizers, zip |
 | `local` | Prompt, Token-Layout, Pointer-Head, `LocalEngine`; `Forward` bleibt dir | tokio (nur `spawn_blocking`) |
 | — | die Wire-Format-Typen, die Fehler, die `SystemOne`-Naht | nichts |
+| `metal` | candles Metal-Backend für eine Apple-GPU; nur auf macOS baubar | Apple-Frameworks |
 
 Ohne jedes Feature (`--no-default-features`) bleibt also genau das, was ein
 Aufrufer braucht, um mit etwas anderem zu reden — oder um eine Aufzeichnung zu
 halten. MSRV ist 1.75 ohne `candle`, mit `candle` dessen eigener Wert.
+
+`metal` ist bewusst nicht Teil von `candle`: candles Metal-Backend zieht
+Apple-Frameworks nach und baut auf keinem anderen System. Wo es fehlt, verweigert
+`device("metal")` den Dienst statt auf die CPU zurückzufallen — ein stiller
+Rückfall würde die Frage falsch beantworten, wenn der Grund fürs Fragen
+Geschwindigkeit war:
+
+```bash
+cd rkev
+cargo run --release --features metal --example measure -- \
+    --base <base> --checkpoint <kev> --device metal
+```
+
+`decide`, `sanity`, `eval` und `measure` nehmen `--device`; die Genauigkeit folgt
+dem Gerät, sofern `--dtype` nichts anderes sagt (bf16 auf GPU, f32 auf CPU, wie es
+`kev.serve` wählt). `scripts/local.sh --device metal` setzt das Feature gleich mit.
+Gemessen ist Metal hier nicht — gelaufen ist in diesem Projekt bisher nur die CPU.
 
 ## Beispiele
 
