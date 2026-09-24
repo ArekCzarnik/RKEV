@@ -1,4 +1,4 @@
-//! A local inference engine: the model runs in this process, no HTTP.
+//! A local inference engine: the model runs in this process.
 //!
 //! [`LocalEngine`] owns everything Kev-specific — the prompt layout
 //! ([`crate::encode`]) and the pointer-head readout ([`crate::readout`]) — and
@@ -597,7 +597,6 @@ impl LocalEngine {
                 output_tokens: output_tokens as u64,
             },
             latency_ms: Some((started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0),
-            // A header the HTTP server sets; there is no server here.
         })
     }
 

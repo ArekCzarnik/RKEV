@@ -1,4 +1,4 @@
-//! Check a real checkpoint without a server and without Python.
+//! Check a real checkpoint against nothing but itself and common sense.
 //!
 //! There are no reference numbers here, so this asks the two questions that can
 //! be answered without them:

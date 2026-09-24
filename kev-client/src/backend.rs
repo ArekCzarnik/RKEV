@@ -2,7 +2,7 @@
 //!
 //! This is the half a checkpoint ships as weights: the base model with the
 //! adapter merged, its tokenizer, and the pointer head. Put them together and
-//! [`LocalEngine`](crate::LocalEngine) answers System One requests with no server
+//! [`LocalEngine`](crate::LocalEngine) answers System One requests in this process
 //! in sight.
 //!
 //! Which backbone a checkpoint needs is in its `config.json`, so [`Backend`]

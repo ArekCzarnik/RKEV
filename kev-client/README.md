@@ -3,7 +3,7 @@
 [Kev](https://github.com/jaredpalmer/kev) in Rust — small decision models you run
 yourself, in this process. Kev implements TypeSafe's
 [System One](https://docs.typesafe.ai/api) API, and this crate answers the same
-requests locally: no server, and no Python. Kev's own implementation is *the
+requests locally. Kev's own implementation is *the
 reference* throughout this README: the rules here are copied from it rather than
 invented, and it is needed for exactly one thing, which is checking that the
 numbers match (see **Checking the engine against the server**).
@@ -141,7 +141,7 @@ let response = LocalEngine::new(backend, head).system_one_blocking(&request)?;
 ```
 
 There is a command-line front end for it too, which is the whole server's job
-done in process — no HTTP, no Python:
+done in process:
 
 ```bash
 cargo run --release --example decide -- \
@@ -281,7 +281,7 @@ every probability. Afterwards the recordings are files:
 scripts/parity.sh --check-only --base <base> --checkpoint <kev>
 ```
 
-repeats the comparison with no server and no Python, which is the point of
+repeats the comparison from the recordings alone, which is the point of
 recording rather than checking live.
 
 Two things it reports besides the probabilities. `input_tokens`, which is the
@@ -290,8 +290,8 @@ by a token, token counts cannot, so a mismatch there fails the run whatever the
 differences look like. And the model name each side answered as, in case the
 server was serving something other than the checkpoint being compared.
 
-Without a server — and without Python — two things are still checkable, and
-`examples/sanity.rs` runs both against a real checkpoint:
+Two things are checkable without a recording at all, and `examples/sanity.rs`
+runs both against a real checkpoint:
 
 ```bash
 cargo run --release --example sanity -- \

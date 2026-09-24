@@ -17,7 +17,7 @@ Every one is sent to `/v1/systemone` **and** `/v1/systemone/separate`, so both
 paths are compared; the recordings land in `recordings/` beside this file.
 
 Keep the recordings once they exist. `scripts/parity.sh --check-only` then repeats
-the whole comparison with no server and no Python, which is what turns a one-off
+the whole comparison from the recordings alone, which is what turns a one-off
 session at a server into a standing check.
 
 The tolerance is about the server's precision, not about being lenient: record

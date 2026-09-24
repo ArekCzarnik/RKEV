@@ -28,7 +28,7 @@ Or directly:
 
 ```bash
 cd kev-client
-cargo test                                   # all tests; needs no server or weights
+cargo test                                   # all tests; needs no weights
 cargo test --test wire_format                # the integration test file
 cargo test request_matches_the_readme_example  # a single test by name
 cargo run --release --example decide -- --base <dir> --checkpoint <dir> --state "..."
@@ -44,8 +44,7 @@ does run here — the recipe (rust-lld, a lib shim, a hand-built `crt1.o`) is at
 end of `.claude/tasks/2026-09-23-local-inference.md`. Since reqwest went, no
 dependency needs a C compiler, so the whole feature matrix builds here.
 
-`scripts/local.sh` is the same idea for the local engine, and needs neither a
-server nor Python:
+`scripts/local.sh` is the same idea for a real checkpoint:
 
 ```bash
 scripts/local.sh                                # the offline suite alone
@@ -382,8 +381,8 @@ agreeing to five decimals. So the loading, the real vocabulary and the real head
 are no longer open questions; parity with the Python is. Do not widen that claim:
 nothing here has ever been compared with the server running.
 
-`examples/sanity.rs` (feature `candle`) is what can be checked without a server
-and without Python: it answers one request along every path the engine has —
+`examples/sanity.rs` (feature `candle`) is what a checkpoint alone can be held to:
+it answers one request along every path the engine has —
 packed against separate, prefilled against not, chunked recurrence against
 sequential — and requires them to agree, then answers seven tickets whose answer
 is not in doubt. The first half is a real test of the layout, the mask and the
@@ -392,7 +391,7 @@ checkpoint" from "understands it", because untrained weights score near chance
 with distributions flat to two decimals. Non-zero exit if a path disagrees or
 more than one ticket is missed. It is not parity and does not replace it.
 
-### Using it without a server
+### Using it
 
 `examples/decide.rs` (feature `candle`) is the front end: it loads a base and a
 checkpoint and answers requests in process — `--request` (repeatable, which
@@ -408,8 +407,7 @@ the things the server can do are reachable from the command line too; the layout
 otherwise comes from `head.pt`, which for a safetensors head answers "unknown"
 rather than failing.
 
-`scripts/local.sh` runs all of that in order, and is the answer to "test it
-without Python and without a server":
+`scripts/local.sh` runs all of that in order:
 
 ```bash
 scripts/local.sh                                  # the offline suite alone
@@ -447,7 +445,7 @@ examples. Do not translate it, and keep the German names if you extend it.
 
 `README.md` at the repo root is the fourth, and it is in **German**: the overview,
 
-the quickstart without Python, the feature and example tables, and the honest
+the quickstart, the feature and example tables, and the honest
 status section. Keep it an entry point rather than a translation — detail belongs
 in the crate's README — and keep it German when editing it. Every number and every
 sample output in it is a measured one; if a run is not to hand, say what the shape

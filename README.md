@@ -202,14 +202,14 @@ Und weil die Namen mit der Sprache wechseln, prüft das Beispiel die **Position*
 der Option (`probabilities.get_index`), nicht ihren Namen — nur so lässt sich
 dieselbe Erwartung an beide Sprachen stellen.
 
-Was es *nicht* benutzt, damit der Weg sichtbar bleibt: kein HTTP, kein async, kein
-Batching, keine Permutation, keine Cache-Einstellungen. Nur die Genauigkeit kommt
+Was es *nicht* benutzt, damit der Weg sichtbar bleibt: kein async, kein Batching,
+keine Permutation, keine Cache-Einstellungen. Nur die Genauigkeit kommt
 vom Gerät — auf einer CPU f32, wie es `kev.serve` dort auch tut.
 
-## Schnellstart, ohne Python und ohne Server
+## Schnellstart
 
 Ein Skript holt einen Checkpoint (mit `curl` — das `hf`-CLI ist selbst Python) und
-prüft danach alles, was ohne Server prüfbar ist:
+prüft danach alles, woran ein Checkpoint allein gemessen werden kann:
 
 ```bash
 scripts/local.sh --fetch jaredpalmer/kev-0.6b
@@ -385,11 +385,11 @@ Was offen ist:
 - Nichts ist quantisiert, und außer der CPU ist kein Gerät gelaufen.
 
 
-### Braucht man dafür Python?
+### Wie Fehler laut werden
 
-Für den Betrieb nie. Für die Prüfung fast nie mehr — und das ist Absicht: die
-Fehler, die eine Paritätsaufzeichnung fangen würde, sind hier lokal laut gemacht,
-statt dass man sie an abweichenden Zahlen erkennen müsste.
+Ein falsch geladener Checkpoint rechnet weiter und antwortet plausibel — das ist
+die gefährliche Sorte Fehler. Die Stellen, an denen das möglich war, weigern sich
+inzwischen:
 
 - **Ein Adapter-Tensor, den der Merge nie anfasst, verhindert das Laden.** Das war
   die leiseste Art, ein falsches Modell zu servieren: `weights.rs` sucht die
@@ -410,7 +410,7 @@ statt dass man sie an abweichenden Zahlen erkennen müsste.
   Kopfzahlen sind Weigerungen, keine Näherungen.
 - **Die Formeln** von Prompt, Layout und Readout stehen gegen acht aus der Referenz
   portierte Testfälle, die Forward-Pässe gegen Transkriptionen von Hugging Faces
-  `modeling_qwen3.py` und `modeling_qwen3_5.py`.
+  `modeling_qwen3.py` und `modeling_qwen3_5.py`, Hidden-Unit für Hidden-Unit.
 
 - **Die Orientierung des Pointer-Heads ist empirisch abgesichert.** Welche
   Projektion `<decide>` liest und welche jedes `</opt>`, steht nur in den Namen `q`

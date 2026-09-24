@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Check the local inference engine without a Kev server and without Python.
+# Check the local inference engine: everything a checkpoint alone can be held to.
 #
 #   scripts/local.sh                            # the offline suite; needs no weights
 #   scripts/local.sh --checkpoint ~/models/kev-0.6b
@@ -75,7 +75,7 @@ step() {
 }
 
 # ---------------------------------------------------------------------------
-# Fetching a checkpoint, without Python: the `hf` CLI is itself a Python
+# Fetching a checkpoint: the `hf` CLI is itself a Python
 # package, and every file on the hub is a plain HTTPS GET.
 # ---------------------------------------------------------------------------
 
@@ -180,7 +180,7 @@ if [ -n "$fetch" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# The offline suite: no weights, no network, no server
+# The offline suite: no weights and no network
 # ---------------------------------------------------------------------------
 
 if [ "$skip_suite" -eq 0 ]; then
@@ -308,6 +308,6 @@ if [ -n "$failed" ]; then
 fi
 
 echo ""
-echo "==> everything that can be checked without a server passed."
+echo "==> everything a checkpoint alone can be held to passed."
 echo "    What is left needs one: whether these numbers match the Python's."
 echo "    That is scripts/test.sh's parity example, with a recorded response."

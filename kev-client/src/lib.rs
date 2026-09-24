@@ -7,7 +7,7 @@
 //!
 //! Everything happens in this process: the prompt, one forward pass over a Qwen
 //! backbone with the checkpoint's LoRA merged in, and the pointer head that turns
-//! the hidden states into answers. No server, and no Python.
+//! the hidden states into answers.
 //!
 //! ```no_run
 //! # #[cfg(feature = "candle")]

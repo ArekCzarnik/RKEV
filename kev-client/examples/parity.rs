@@ -3,8 +3,8 @@
 //! other test in this crate compares the implementation with itself or with a
 //! transcription of the reference, never with the reference running.
 //!
-//! The server side is a recorded response, so this example needs no HTTP stack —
-//! and the recording is the fixture a later offline test can use.
+//! The server side is a recorded response, which is what makes the recording a
+//! fixture a later run can use.
 //!
 //! ```bash
 //! # 1. a server, on the exact path the published numbers use

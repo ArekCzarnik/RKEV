@@ -186,4 +186,4 @@ if [ -n "$failed" ]; then
 fi
 echo "==> the engine matches the server on every recorded request."
 echo "    The recordings are files: scripts/parity.sh --check-only repeats this"
-echo "    without a server, so keep them."
+echo "    from the recordings alone, so keep them."

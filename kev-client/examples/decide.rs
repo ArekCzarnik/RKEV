@@ -1,4 +1,4 @@
-//! Answer System One requests with a local checkpoint: no server, no Python.
+//! Answer System One requests with a local checkpoint.
 //!
 //! This is the Kev server's job done in process. It loads a base model plus a
 //! Kev checkpoint, answers the requests you hand it, and prints the answers —
