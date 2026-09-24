@@ -6,3 +6,6 @@ claudebox.run
 # Library crate: the lockfile is not part of what downstream builds resolve.
 Cargo.lock
 CLAUDE.md
+
+# Measurement logs from scripts/sweep.sh.
+rkev-measurements*.txt

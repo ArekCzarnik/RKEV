@@ -333,6 +333,31 @@ hier nicht erprobt). Und die k-Quants packen 256 Gewichte pro Superblock: eine
 Projektion, deren Zeile nicht durch 256 teilbar ist, wird namentlich abgelehnt mit
 dem Hinweis auf q8_0, das 32 packt.
 
+### Alles auf einmal messen
+
+`scripts/sweep.sh` fährt einen Checkpoint durch jeden Pfad, den er hat, und legt
+ein Protokoll an, das man weitergeben kann:
+
+```bash
+scripts/sweep.sh --base ~/models/qwen-qwen3-0.6b-base --checkpoint ~/models/kev-0.6b
+```
+
+CPU dicht, dann q8_0, q6k und q4k, dann dieselben Läufe durch `sanity` — weil eine
+Beschleunigung, die die Entscheidungen beschädigt, keine ist. Danach Metal, dicht
+(quantisiert ist ein CPU-Pfad, dafür gibt es absichtlich keine Metal-Zeile). Nichts
+darin ist fatal: ein Lauf, der abbricht, wird vermerkt und der Rest läuft weiter —
+eine fehlende Metal-Op soll nicht die CPU-Zahlen kosten.
+
+Am Ende sammelt es die Verhältniszeilen und trennt zwei Dinge, die leicht
+verwechselt werden: **„did not finish"** ist ein Lauf, der nicht durchkam (meist
+eine Weigerung, die selbst schon die Antwort ist), **„not convinced"** ein Lauf, der
+durchkam und *nein* sagte — der Checkpoint hat die eindeutigen Fälle verfehlt. Das
+Zweite ist bei echten Gewichten das Ergebnis, nicht ein Fehler.
+
+`--skip-metal`, `--skip-cpu`, `--repeat`, `--words`, `--quantise "q8_0 q4k"` und
+`--out` stellen ein, was läuft; `--help` zeigt alles. Das Protokoll heißt
+`rkev-measurements.txt` und ist in der `.gitignore`.
+
 ## Auf deinen eigenen Tickets messen
 
 Parität fragt, ob diese Engine der Referenz gleicht. Die andere Frage — und die,
@@ -455,6 +480,7 @@ scripts/local.sh --fetch jaredpalmer/kev-0.6b   # Checkpoint holen, dann alles p
 scripts/local.sh --checkpoint <dir> --measure   # dazu die Zeitmessungen
 scripts/local.sh --checkpoint <dir> \
     --questions q.json --records tickets.jsonl  # dazu deine eigenen Tickets
+scripts/sweep.sh --base <dir> --checkpoint <dir>     # CPU und Metal durchmessen
 scripts/parity.sh --base <dir> --checkpoint <dir>    # gegen einen Server aufzeichnen
 scripts/parity.sh --check-only --base <dir> --checkpoint <dir>   # und offline nachprüfen
 ```
