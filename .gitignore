@@ -1,5 +1,6 @@
 target/
 .idea/
+*.iml
 claudebox.run
 
 # Library crate: the lockfile is not part of what downstream builds resolve.
