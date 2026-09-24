@@ -13,7 +13,7 @@ gleich bleiben.
 - ⬜ Task 3: Accelerate / MKL als optionales Feature
 - ✅ Task 4: GQA ohne `repeat_kv`, State-Keys vortransponiert
 - ✅ Task 5: Prefill ohne verworfene Arbeit im letzten Layer
-- ⬜ Task 6: Letzter Layer nur an den Readout-Positionen
+- ✅ Task 6: Letzter Layer nur an den Readout-Positionen
 - ⬜ Task 7: Projektionen beim Laden zusammenlegen
 - ⬜ Task 8: q statt Scores skalieren
 - ⬜ Task 9: Maske nur auf den Branch-Teil der Scores
@@ -108,6 +108,28 @@ beiden Backbones von den Prefix-Tests gefangen.
 Im Packed- und im Branch-Pass braucht das MLP des letzten Layers (und die
 finale Norm) nur die `<decide>`- und `</opt>`-Positionen. Wenige Prozent, mehr
 Umbau als Task 5.
+
+**Erledigt.** `forward` und `forward_from_batch` beider Backbones nehmen die
+Readout-Positionen und geben nur diese zurück; `Backend::pick` ist weg. Im
+letzten Layer laufen Keys und Values über alle Tokens, Query, Attention-Ausgabe,
+`o_proj`, MLP und finale Norm nur an den Readout-Positionen (`select_rows`,
+`Wanted` in `weights.rs`; `grouped_attention` nimmt dafür weniger Query-Zeilen
+als Keys). Ein rekurrenter letzter Layer läuft voll und wird vor dem MLP
+ausgedünnt.
+
+Gemessen, je dreimal, Toy-Fixtures mit **2 Layern**: Packed-Pass 17–18 ms →
+10–11 ms, Hybrid eine Zeile pro Frage 51 ms → 27–32 ms. Nur Branches auf der
+breiten Fixture: 220–244 → 218–272 ms, also nichts — die Branch-Zeilen sind
+kurz, und fast jedes ihrer Tokens ist eine Readout-Position. Auf 28 Layern ist
+für den Packed-Pass etwa ein Layer minus K/V zu erwarten, ein paar Prozent;
+gemessen ist das nicht.
+
+Prüfung: drei absichtliche Brüche (rekurrenter letzter Layer liest `normed`
+statt seiner Ausgabe, `select_rows` ignoriert die Batch-Zeile, Residuum aus
+`normed`) werden gefangen. Den ersten fängt nur der neue Test
+`a_checkpoint_ending_in_a_recurrent_layer_matches_the_transcription` — dafür
+nimmt `reference_hidden` jetzt die Layer-Typen als Parameter, und `reversed()`
+baut die Fixture mit getauschten Layern.
 
 ### Task 7: Projektionen beim Laden zusammenlegen
 

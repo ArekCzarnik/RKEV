@@ -331,6 +331,7 @@ fn rotate(head: &mut [f32], position: u32) {
 /// and the zero-centred norms, transcribed from the reference.
 fn reference_hidden(
     tensors: &Tensors,
+    layer_types: &[&str],
     ids: &[u32],
     positions: &[u32],
     attends: &dyn Fn(usize, usize) -> bool,
@@ -341,7 +342,7 @@ fn reference_hidden(
         .map(|id| embed[*id as usize * HIDDEN..(*id as usize + 1) * HIDDEN].to_vec())
         .collect();
 
-    for (layer, kind) in LAYER_TYPES.iter().enumerate() {
+    for (layer, kind) in layer_types.iter().enumerate() {
         let prefix = format!("model.layers.{layer}");
         let of = |name: &str| weights(tensors, &format!("{prefix}.{name}"));
         let normed: Vec<Vec<f32>> = xs
@@ -569,8 +570,20 @@ fn compare_with_the_reference(
     chunk: usize,
 ) -> Vec<Vec<f32>> {
     let fixture = checkpoint(name, false, false);
-    // The packed path: the one being transcribed, and the only one that returns
-    // hidden states for the state tokens as well as the branches.
+    compare_fixture_with_the_reference(&fixture, &LAYER_TYPES, name, state, branch, chunked, chunk)
+}
+
+/// The same, for a fixture whose layers are `layer_types`.
+fn compare_fixture_with_the_reference(
+    fixture: &Fixture,
+    layer_types: &[&str],
+    name: &str,
+    state: usize,
+    branch: usize,
+    chunked: bool,
+    chunk: usize,
+) -> Vec<Vec<f32>> {
+    // The packed path: the one being transcribed.
     let mut backend = Backend::open(&fixture.dir, None)
         .unwrap()
         .with_prefix(false)
@@ -590,13 +603,16 @@ fn compare_with_the_reference(
     let pass = Pass::new(&ids, &positions, &segments, &readout);
 
     let ours = backend.hidden(&pass).unwrap();
-    let reference: Vec<Vec<f32>> =
-        reference_hidden(&fixture.tensors, &ids, &positions, &|query, key| {
-            pass.attends(query, key)
-        })
-        .into_iter()
-        .skip(state)
-        .collect();
+    let reference: Vec<Vec<f32>> = reference_hidden(
+        &fixture.tensors,
+        layer_types,
+        &ids,
+        &positions,
+        &|query, key| pass.attends(query, key),
+    )
+    .into_iter()
+    .skip(state)
+    .collect();
 
     // They agree to about 1e-6, f32 accumulation order; 1e-5 leaves room for
     // another CPU without letting a wrong convention through.
@@ -754,22 +770,49 @@ fn running_the_state_once_gives_the_same_answers_as_running_it_per_question() {
 fn a_prefix_ending_in_a_recurrent_layer_changes_no_answer_either() {
     // A prefill stops each checkpoint's last layer as soon as it has what that
     // layer hands on. The fixture above ends in attention, as the released
-    // checkpoints do; this is the same model with its two layers the other way
-    // round, so the last one is the recurrence.
-    let fixture = checkpoint("prefix-reversed-source", false, false);
-    let dir = fresh_dir("qwen3_5-prefix-reversed");
+    // checkpoints do; this one ends in the recurrence.
+    let fixture = reversed("prefix-reversed");
+
+    assert_the_prefix_changes_no_answer(&fixture.dir);
+}
+
+#[test]
+fn a_checkpoint_ending_in_a_recurrent_layer_matches_the_transcription() {
+    // The last layer is read out only where the readout asks; for a recurrence
+    // that means running it in full and cutting it down before the feed-forward.
+    // Comparing the prefix with the packed path cannot check that, since both
+    // go through it — the transcription can.
+    let fixture = reversed("reference-reversed");
+
+    compare_fixture_with_the_reference(
+        &fixture,
+        &REVERSED_LAYER_TYPES,
+        "reference-reversed",
+        3,
+        6,
+        false,
+        64,
+    );
+}
+
+/// [`LAYER_TYPES`] the other way round.
+const REVERSED_LAYER_TYPES: [&str; LAYERS] = [LAYER_TYPES[1], LAYER_TYPES[0]];
+
+/// The usual fixture with its two layers swapped, so that it ends in the
+/// recurrence rather than in attention: the same weights, the other order.
+fn reversed(name: &str) -> Fixture {
+    let fixture = checkpoint(&format!("{name}-source"), false, false);
+    let dir = fresh_dir(&format!("qwen3_5-{name}"));
+    let layers = |types: &[&str]| format!(r#"["{}","{}"]"#, types[0], types[1]);
     let config = fs::read_to_string(fixture.dir.join("config.json"))
         .unwrap()
-        .replace(
-            &format!(r#"["{}","{}"]"#, LAYER_TYPES[0], LAYER_TYPES[1]),
-            &format!(r#"["{}","{}"]"#, LAYER_TYPES[1], LAYER_TYPES[0]),
-        );
-    assert!(config.contains(&format!(r#"["{}","{}"]"#, LAYER_TYPES[1], LAYER_TYPES[0])));
+        .replace(&layers(&LAYER_TYPES), &layers(&REVERSED_LAYER_TYPES));
+    assert!(config.contains(&layers(&REVERSED_LAYER_TYPES)));
     fs::write(dir.join("config.json"), config).unwrap();
     for file in ["tokenizer.json", "head.safetensors"] {
         fs::copy(fixture.dir.join(file), dir.join(file)).unwrap();
     }
-    let swapped: Tensors = fixture
+    let tensors: Tensors = fixture
         .tensors
         .iter()
         .map(|(name, tensor)| {
@@ -783,9 +826,8 @@ fn a_prefix_ending_in_a_recurrent_layer_changes_no_answer_either() {
             (name, tensor.clone())
         })
         .collect();
-    write_safetensors(&dir.join("model.safetensors"), &swapped);
-
-    assert_the_prefix_changes_no_answer(&dir);
+    write_safetensors(&dir.join("model.safetensors"), &tensors);
+    Fixture { dir, tensors }
 }
 
 /// The same request with the state prefilled and with it run per question.

@@ -380,13 +380,6 @@ impl Backend {
         self.cache.insert(prefix.clone());
         Ok(prefix)
     }
-
-    /// The hidden states at `readout`, as the trait wants them.
-    fn pick(&self, hidden: &Tensor, readout: &[usize]) -> Result<Vec<Vec<f32>>> {
-        let wanted: Vec<u32> = readout.iter().map(|index| *index as u32).collect();
-        let wanted = Tensor::from_vec(wanted, readout.len(), &self.device)?;
-        Ok(hidden.index_select(&wanted, 0)?.to_vec2::<f32>()?)
-    }
 }
 
 impl std::fmt::Debug for Backend {
@@ -524,12 +517,16 @@ impl Forward for Backend {
                     .iter()
                     .map(|branch| (branch.ids.as_slice(), branch.positions.as_slice()))
                     .collect();
+                let readouts: Vec<&[usize]> = branches
+                    .iter()
+                    .map(|branch| branch.readout.as_slice())
+                    .collect();
                 let hidden = match (&self.model, &prefix) {
                     (Model::Attention(model), Prefilled::Attention(prefix)) => {
-                        model.forward_from_batch(prefix, &rows)?
+                        model.forward_from_batch(prefix, &rows, &readouts)?
                     }
                     (Model::Hybrid(model), Prefilled::Hybrid(prefix)) => {
-                        model.forward_from_batch(prefix, &rows)?
+                        model.forward_from_batch(prefix, &rows, &readouts)?
                     }
                     _ => {
                         return Err(Error::Engine(String::from(
@@ -538,8 +535,8 @@ impl Forward for Backend {
                     }
                 };
                 let mut states = Vec::with_capacity(pass.readout.len());
-                for (hidden, branch) in hidden.iter().zip(&branches) {
-                    states.extend(self.pick(hidden, &branch.readout)?);
+                for hidden in &hidden {
+                    states.extend(hidden.to_vec2::<f32>()?);
                 }
                 return Ok(states);
             }
@@ -553,8 +550,8 @@ impl Forward for Backend {
                     &self.device,
                     self.dtype(),
                 )?;
-                let hidden = model.forward(pass.ids, pass.positions, &mask)?;
-                self.pick(&hidden, pass.readout)
+                let hidden = model.forward(pass.ids, pass.positions, &mask, pass.readout)?;
+                Ok(hidden.to_vec2::<f32>()?)
             }
             // A recurrence carries state forward token by token and cannot be
             // told to skip another question's tokens, so every question gets a
@@ -572,8 +569,8 @@ impl Forward for Backend {
                         &self.device,
                         self.dtype(),
                     )?;
-                    let hidden = model.forward(row.ids, row.positions, &mask)?;
-                    states.extend(self.pick(&hidden, row.readout)?);
+                    let hidden = model.forward(row.ids, row.positions, &mask, row.readout)?;
+                    states.extend(hidden.to_vec2::<f32>()?);
                 }
                 Ok(states)
             }
