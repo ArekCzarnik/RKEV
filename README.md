@@ -168,17 +168,8 @@ reduzierte Präzision dort), ein echter **hybrider** Checkpoint wurde noch nicht
 geladen, und gelaufen sind bisher CPU und Metal — sonst kein Gerät.
 
 Mehr dazu in [docs/pruefungen.md](docs/pruefungen.md).
-
-## Herkunft
-
-Kev ist ein eigenes Projekt: <https://github.com/jaredpalmer/kev> (Apache-2.0),
-geschrieben in Python, und hier die **Referenz**. Die Regeln, die Prompt, Layout und
-Readout umsetzen, sind aus `kev/api.py` und `kev/model.py` übernommen und nicht
-erfunden; Änderungen daran folgen der Referenz statt der eigenen Meinung. Dieser
-Code selbst hat mit Python nichts zu tun — keine Abhängigkeit, kein Build-Skript,
-kein Unterprozess.
-
 ## Mehr im Detail
+
 
 | | |
 |---|---|
