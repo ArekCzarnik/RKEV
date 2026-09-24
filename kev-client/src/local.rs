@@ -8,8 +8,11 @@
 //! head reads *hidden states*, never vocabulary logits, so a backend needs to
 //! expose the backbone rather than a text-generation API.
 //!
-//! See `.claude/tasks/2026-09-23-local-inference.md` for which engines can do
-//! that.
+//! Which rules out a text-generation engine as the backend, mistral.rs included:
+//! checked against its sources, it will run a prompt and generate nothing, but it
+//! exposes no hidden states at chosen positions (its embedding models pool one
+//! vector per sequence), no custom additive attention mask, no custom position ids,
+//! and nowhere to put a pointer head. All four are what Kev's layout is made of.
 
 use std::fmt;
 use std::future::Future;

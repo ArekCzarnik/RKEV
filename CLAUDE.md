@@ -38,11 +38,36 @@ cargo doc --open                             # the crate is documented in rustdo
 **Never report a `cargo test` result you did not run** — say plainly that a
 change is unverified instead.
 
-This container has no C toolchain (no `cc`, no glibc `crt1.o`), so a plain
-`cargo test` cannot link. A Rust toolchain installs with `rustup`, and everything
-does run here — the recipe (rust-lld, a lib shim, a hand-built `crt1.o`) is at the
-end of `.claude/tasks/2026-09-23-local-inference.md`. Since reqwest went, no
-dependency needs a C compiler, so the whole feature matrix builds here.
+### Linking in a container with no C toolchain
+
+Some containers have no `cc` and no glibc `crt1.o`/`libc.so` (glibc itself is there
+to run against), so a plain `cargo test` cannot link. Since reqwest went, no
+dependency needs a C compiler either, so three local things — none of them in the
+repo — make the whole feature matrix build:
+
+```bash
+# 1. point the linker at the runtime libraries cc would have found
+mkdir -p ~/lib-shim && cd /usr/lib/aarch64-linux-gnu \
+  && ln -sf $PWD/libc.so.6 ~/lib-shim/libc.so \
+  && ln -sf $PWD/libm.so.6 ~/lib-shim/libm.so \
+  && ln -sf $PWD/libgcc_s.so.1 ~/lib-shim/libgcc_s.so \
+  && for l in dl pthread rt util; do ln -sf $PWD/libc.so.6 ~/lib-shim/lib$l.so; done
+
+# 2. supply the startup object: ~/crt/crt1.rs is glibc's aarch64 start.S in a
+#    global_asm! block, built with
+#    rustc --crate-type lib --emit=obj -O ~/crt/crt1.rs -o ~/crt/crt1.o
+
+# 3. ~/bin/rustc-shim adds to every rustc call:
+#      -Clinker=<toolchain>/rust-lld -Lnative=~/lib-shim -Clink-arg=~/crt/crt1.o
+#      -Clink-arg=-dynamic-linker -Clink-arg=/lib/ld-linux-aarch64.so.1
+#    The last one is not optional: without PT_INTERP the binary segfaults before
+#    main, and nothing says why.
+
+RUSTFLAGS=-Ctarget-feature=+fp16 RUSTC_WRAPPER=~/bin/rustc-shim scripts/test.sh
+```
+
+`+fp16` is for `gemm-f16`, whose inline assembly does not build on this aarch64
+target without it; a Mac has it in the base feature set and needs neither flag.
 
 `scripts/local.sh` is the same idea for a real checkpoint:
 
@@ -436,6 +461,12 @@ the engine agrees with the reference, but how often a checkpoint is right on a
 caller's own labelled records, and whether its confidence can carry a routing
 threshold. JSONL in (`state` plus `labels`), a per-question report out; `--json`
 for the tallies, `--errors` for the confident mistakes, `--batch` for short states.
+
+`--min-accuracy` is the CI half: a bare value for every question, `id=value` for
+one, and a question with a threshold but nothing labelled for it counts as *below*
+it rather than as a pass — the same principle as everything else here, that a
+guarantee with no evidence is worse than no guarantee. An unknown id and a value
+outside 0..=1 are both refused before any weights load.
 
 Three decisions worth keeping: a label for an unknown question id is an error, not
 a silent zero (a typo would read as a perfect score on nothing); a question missing

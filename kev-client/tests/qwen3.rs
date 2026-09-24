@@ -8,8 +8,9 @@
 //! (`tests/test_model.py::test_rows_match_packed`). The rest is a transcription
 //! of `modeling_qwen3.py` to compare against.
 //!
-//! Real weights can only be checked against a running Kev server; see
-//! `.claude/tasks/2026-09-23-local-inference.md`.
+//! What made-up weights cannot show is whether a real checkpoint loads and means
+//! anything: `examples/sanity.rs` and `examples/eval.rs` are for that, and
+//! `scripts/parity.sh` for the comparison with the reference.
 
 #![cfg(feature = "candle")]
 
