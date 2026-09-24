@@ -512,13 +512,17 @@ pub(crate) fn grouped_attention(
         Ok(x.reshape((batch, heads, rows, cols))?)
     };
 
-    let queries = grouped(q)?;
+    // Scaled before the product rather than after: the same factor on the `dim`
+    // columns of the queries instead of the `state + len` columns of the scores,
+    // which in a branch pass over a long state is several times fewer. Not
+    // bit-identical unless the scale is a power of two, which `1 / sqrt(128)` is
+    // not — a rounding step moved, nothing more.
+    let queries = grouped(&(q * scale)?)?;
     let branch = ungrouped(queries.matmul(&k.transpose(2, 3)?)?)?;
     let scores = match past {
         None => branch,
         Some((keys, _)) => Tensor::cat(&[ungrouped(shared_matmul(&queries, keys)?)?, branch], 3)?,
     };
-    let scores = (scores * scale)?;
     // The mask is what keeps one question from reading another.
     let scores = scores.broadcast_add(mask)?;
     // The reference takes the softmax in f32 whatever the backbone runs in.
