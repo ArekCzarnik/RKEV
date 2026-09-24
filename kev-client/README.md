@@ -3,7 +3,10 @@
 [Kev](https://github.com/jaredpalmer/kev) in Rust — small decision models you run
 yourself, in this process. Kev implements TypeSafe's
 [System One](https://docs.typesafe.ai/api) API, and this crate answers the same
-requests locally: no server, and no Python.
+requests locally: no server, and no Python. Kev's own implementation is *the
+reference* throughout this README: the rules here are copied from it rather than
+invented, and it is needed for exactly one thing, which is checking that the
+numbers match (see **Checking the engine against the server**).
 
 You hand it a **state** (a ticket, a document, any text) plus a set of
 **questions**, and get back probabilities rather than a single label. The
@@ -102,7 +105,7 @@ questions keep the order you add them in.
 
 ## What it answers
 
-| The Python's endpoint | Here |
+| The reference's endpoint | Here |
 |---|---|
 | `POST /v1/systemone` | `system_one`, `system_one_blocking` |
 | `POST /v1/systemone/separate` | `system_one_separate`, `system_one_separate_blocking` |
@@ -164,8 +167,8 @@ this code: what has been run here is the shape.
 it (repeat it for a batch); `--questions questions.json` asks your own questions
 about a `--state`; `--lines` reads a state per line from stdin and answers each as
 it arrives, so the model loads once and the state cache stays warm; `--json`
-prints what the server would have replied, answers serialised the way the Python
-serialises them. `--dtype`, `--separate` and `--permute` are there as well, and
+prints what the server would have replied, answers serialised the way the
+reference serialises them. `--dtype`, `--separate` and `--permute` are there as well, and
 the option layout comes from `head.pt` unless you override it. Diagnostics go to
 stderr, answers to stdout.
 
@@ -174,7 +177,7 @@ only, so a whole request runs as one masked pass. The current bases (Qwen3.5) mi
 attention with Gated DeltaNet layers, which are recurrent: a recurrence carries
 state forward token by token and cannot be told to skip another question's
 tokens, so every question runs as its own row — the state, then its branch. That
-is exact rather than masked, and it is what the Python does there too.
+is exact rather than masked, and it is what the reference does there too.
 
 The state is run once per request and every question continues from it, and the
 last few states are kept across requests, keyed by their tokens — a repeated
@@ -220,7 +223,7 @@ threshold is forced to zero, since an attention-only base otherwise skips the
 prefix below 384 state tokens and both prefix rows would quietly measure the
 packed path.
 
-Precision follows the device, as the Python server does it: bf16 on a GPU, f32 on
+Precision follows the device, as the reference does it: bf16 on a GPU, f32 on
 the CPU, which is the path every published number was measured at. The LoRA is
 merged in f32 before the cast, and the delta rule, the gated norm and the pointer
 head stay in f32 whatever the backbone runs in.
@@ -244,7 +247,7 @@ over `Qwen/Qwen3-0.6B-Base` in f32 on an Apple CPU takes all seven of the
 unambiguous tickets in `examples/sanity.rs`, with `shipping` and `returns` at
 1.00 where they belong and `p(yes)` at 0.71 against 0.01 on a thank-you note, and
 the packed and prefilled paths agree to five decimals over the real layer stack.
-What has *not* happened is a comparison with the Python answering the same
+What has *not* happened is a comparison with the reference answering the same
 request, so treat the probabilities as unverified against the reference until it
 has. `examples/parity.rs` is that run: it answers a request in process and
 compares every probability with a recorded server response.

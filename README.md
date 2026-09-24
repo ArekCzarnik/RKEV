@@ -41,11 +41,12 @@ Reihenfolge ist immer dieselbe — es gibt keine Schleife und keine Generierung.
 
 Der State wird zu Text. Ein String bleibt, wie er ist; ein JSON-Objekt wird zu
 `schlüssel: wert` pro Zeile, eine Liste zu `- eintrag`, verschachteltes eingerückt.
-Skalare folgen Pythons `str()`: `True` und `False` statt `true`/`false`, Zahlen so,
-wie Python sie druckt, und `null` wird zu **nichts** — also `schlüssel: ` mit leerem
-Wert. Das ist kein Geschmack, sondern Bedingung: der Server baut genau diesen Text,
-und ein anderer Text ist eine andere Antwort. `tests/upstream_unit.rs` hält sechs
-dieser Ausgaben an den Testfällen der Python-Seite fest.
+Bei Skalaren zählt die Schreibweise: `True` und `False` statt `true`/`false`, und
+`null` wird zu **nichts** — also `schlüssel: ` mit leerem Wert. Das ist kein
+Geschmack, sondern Bedingung: die Referenz-Implementierung (siehe *Herkunft*) baut
+genau diesen Text, und ein anderer Text ist eine andere Antwort.
+`tests/upstream_unit.rs` hält sechs dieser Ausgaben an deren eigenen Testfällen
+fest.
 
 Jede Frage wird zu Anweisungen plus einer Liste von **Optionstexten**, jeweils
 `name: beschreibung`. Die drei Fragetypen unterscheiden sich nur darin, was die
@@ -119,7 +120,7 @@ Wie er läuft, hängt von der Basis ab:
   eine Rekurrenz kann man nicht bitten, die Tokens einer anderen Frage zu
   überspringen: sie läuft die Tokens ab. Deshalb wird pro Frage eine eigene
   kausale Zeile gerechnet — State, dann ihr Zweig. Das ist exakt statt maskiert
-  und genau das, was die Python-Seite dort auch tut.
+  und genau das, was die Referenz dort auch tut.
 
 Im Layout steht der State ohnehin nur einmal. Als **eigener** Pass, von dem die
 Fragen dann fortsetzen, läuft er, wenn es sich lohnt: auf einer rekurrenten Basis
@@ -150,10 +151,10 @@ ist. Aus der Verteilung wird die Antwort:
 - `choice`: die wahrscheinlichste Option, Confidence `(p_max − 1/K)/(1 − 1/K)`.
 - `score`: der mittlere Stufenindex, Confidence `1 − E|Stufe − Modus|/(L−1)`.
 
-Alles auf vier Dezimalen gerundet, wie auf der Python-Seite. Die Confidence ist
-ein Maß für die *Form* der Verteilung, keine gemessene Trefferquote — TypeSafes
-API-Dokumentation definiert sie nicht, diese Formeln sind die der Python-Seite,
-und `tests/upstream_unit.rs` hält sie an deren eigenen Testfällen fest.
+Alles auf vier Dezimalen gerundet, wie in der Referenz. Die Confidence ist ein Maß
+für die *Form* der Verteilung, keine gemessene Trefferquote — TypeSafes
+API-Dokumentation definiert sie nicht, diese Formeln sind die der Referenz, und
+`tests/upstream_unit.rs` hält sie an deren eigenen Testfällen fest.
 
 ```text
 SystemOneRequest
@@ -370,11 +371,12 @@ Was geprüft ist:
 
 Was offen ist:
 
-- **Parität mit dem Python-Server ist nicht geprüft.** Dass die Zahlen plausibel
-  und untereinander konsistent sind, heißt nicht, dass sie dieselben sind. Dafür
-  braucht es den Server **einmal**: `scripts/parity.sh` zeichnet fünf Anfragen
-  über beide Endpunkte auf und vergleicht jede Wahrscheinlichkeit. Danach sind die
-  Aufzeichnungen Dateien, und `--check-only` wiederholt den Vergleich offline.
+- **Parität mit der Referenz ist nicht geprüft.** Dass die Zahlen plausibel und
+  untereinander konsistent sind, heißt nicht, dass sie dieselben sind. Das ist die
+  **einzige** Stelle, an der der Python-Server noch gebraucht wird, und auch dort
+  genau einmal: `scripts/parity.sh` zeichnet fünf Anfragen über beide Endpunkte auf
+  und vergleicht jede Wahrscheinlichkeit. Danach sind die Aufzeichnungen Dateien,
+  und `--check-only` wiederholt den Vergleich offline, für immer.
 - Auf einer CPU gibt es in candle kein bf16-Matmul, also wird bf16 dort mit einer
   Meldung abgelehnt statt tief in einer Projektion zu scheitern; f16 ist die
   reduzierte Präzision, die eine CPU kann.
@@ -385,6 +387,9 @@ Was offen ist:
 ## Herkunft
 
 Kev selbst ist ein eigenes Projekt: <https://github.com/jaredpalmer/kev>
-(Apache-2.0). Die Regeln, die Prompt und Readout hier umsetzen, sind aus dessen
-Python übernommen, nicht erfunden — `kev/api.py` und `kev/model.py`. Änderungen
-daran folgen der Python-Seite, nie der eigenen Meinung.
+(Apache-2.0), geschrieben in Python. Es ist hier die **Referenz**: die Regeln, die
+Prompt und Readout umsetzen, sind aus `kev/api.py` und `kev/model.py` übernommen
+und nicht erfunden, und Änderungen daran folgen der Referenz statt der eigenen
+Meinung. Gebraucht wird sie nur an zwei Stellen — beim Nachlesen und für die
+Paritätsaufzeichnung. Dieser Code selbst hat mit Python nichts zu tun: keine
+Abhängigkeit, kein Build-Skript, kein Unterprozess.
