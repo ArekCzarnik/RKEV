@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Run the kev-client checks: formatting, lints, then tests.
+# Run the rkev checks: formatting, lints, then tests.
 #
 #   scripts/test.sh                                  # everything
 #   scripts/test.sh request_matches_the_readme_example   # one test by name
@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-CRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/kev-client"
+CRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/rkev"
 
 skip_fmt=0
 skip_clippy=0

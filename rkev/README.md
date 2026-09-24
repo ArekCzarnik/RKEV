@@ -1,4 +1,4 @@
-# kev-client
+# rkev
 
 [Kev](https://github.com/jaredpalmer/kev) in Rust — small decision models you run
 yourself, in this process. Kev implements TypeSafe's
@@ -16,13 +16,13 @@ questions share the state but cannot read each other.
 
 ```toml
 [dependencies]
-kev-client = { path = "../kev-client" }
+rkev = { path = "../rkev" }
 ```
 
 ```rust
 use std::path::Path;
 
-use kev_client::{pointer_head, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest};
+use rkev::{pointer_head, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base = Path::new("models/qwen3-0.6b-base");
@@ -131,7 +131,7 @@ both generations of Kev's bases. Which one a checkpoint needs is in its
 `config.json`, so there is nothing to choose:
 
 ```rust
-use kev_client::{pointer_head, LocalEngine, Backend};
+use rkev::{pointer_head, LocalEngine, Backend};
 
 let backend = Backend::open(base_model_dir, Some(checkpoint_dir))?;
 // The other half of a checkpoint: head.pt's two projections, and the
@@ -262,7 +262,7 @@ cargo run --release --example parity -- \
     --request request.json --server server.json
 ```
 
-One script does the whole session, and `kev-client/tests/parity/` holds the
+One script does the whole session, and `rkev/tests/parity/` holds the
 requests it sends — five of them, each picked for something that can break: the
 README's worked example, a JSON state, twelve options with two bare ones, text
 that contains Kev's own delimiters, and a state past the prefix threshold. Each
@@ -335,7 +335,7 @@ again with `KEV_TOKENIZER` set to the real vocabulary, one request through
 To put another engine underneath instead, implement `Forward` yourself:
 
 ```rust
-use kev_client::{Forward, Pass, Result};
+use rkev::{Forward, Pass, Result};
 
 impl Forward for MyBackbone {
     // Token ids for caller text, and the ids of Kev's five delimiters.
@@ -364,7 +364,7 @@ the errors and the `SystemOne` seam — to talk to something else, or to hold a
 recording — turns it off:
 
 ```toml
-kev-client = { path = "../kev-client", default-features = false }
+rkev = { path = "../rkev", default-features = false }
 ```
 
 `--features local` sits between the two: the prompt, the layout and the readout,

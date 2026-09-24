@@ -28,7 +28,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use candle_core::{DType, Device};
-use kev_client::{
+use rkev::{
     answers_json, option_isolation, pointer_head, Answer, Backend, Choice, IndexMap, LocalEngine,
     Noul, Question, Score, SystemOneRequest, SystemOneResponse,
 };
@@ -165,7 +165,7 @@ fn answer(
     engine: &LocalEngine,
     options: &Options,
     request: &SystemOneRequest,
-) -> kev_client::Result<SystemOneResponse> {
+) -> rkev::Result<SystemOneResponse> {
     if options.separate {
         engine.system_one_separate_blocking(request)
     } else {

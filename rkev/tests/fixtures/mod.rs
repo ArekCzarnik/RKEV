@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kev_client::{
+use rkev::{
     Error, Forward, Linear, LocalEngine, OptionSlot, Pass, PointerHead, Result, DECIDE, OPTION,
     OPTION_END, QUESTION, STATE,
 };

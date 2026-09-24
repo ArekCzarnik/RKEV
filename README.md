@@ -1,17 +1,25 @@
-# RKEV 1.0p -> Kev in Rust
+# RKEV 1.0p
 
-Eine vollständige lokale Inferenz-Engine für
-[Kev](https://github.com/jaredpalmer/kev), die kleinen Entscheidungsmodelle, die
-TypeSafe's [System One](https://docs.typesafe.ai/api)-API sprechen.
+### RKev 1.0p Kevs Entscheidungsmodelle in Rust
+-> Prompt, Forward-Pass und Readout laufen in Rust im eigenen Prozess <-
 
-Prompt, Forward-Pass und Readout laufen in Rust im eigenen Prozess.
+RKev führt Kevs Entscheidungsmodelle direkt in Rust im eigenen Prozess aus: ohne zusätzlichen Server, ohne API-Gateway und ohne laufende API-Kosten. Alles läuft vollständig     
+lokal.
 
-Das einzige Crate liegt in [`kev-client/`](kev-client/); das Wurzelverzeichnis ist
-kein Cargo-Workspace, `cargo`-Befehle laufen also aus `kev-client/`. Die
+Das Prinzip ist einfach: Text (oder JSON) + Fragestellung rein → Wahrscheinlichkeiten raus. Unterstützt werden Ja/Nein-Entscheidungen, die Auswahl aus mehreren Optionen sowie Bewertungen auf einer Skala.
+
+Dabei werden keine Antwort-Tokens generiert. Die Entscheidung erfolgt über einen Pointer-Head auf den Hidden States der Qwen-Basis, in die der LoRA-Adapter des Checkpoints      
+eingerechnet ist.
+
+RKev unterstützt Qwen3 ebenso wie das hybride Qwen3.5 mit Gated DeltaNet. Dazu kommen ein CLI für direkte Anfragen und ein Eval-Runner, mit dem sich eigene gelabelte Tickets    
+auswerten lassen — mit Trefferquote pro Sicherheitsband, aus dem eine Schwelle fürs automatische Routing folgt.    
+--
+Das einzige Crate liegt in [`rkev/`](rkev/); das Wurzelverzeichnis ist
+kein Cargo-Workspace, `cargo`-Befehle laufen also aus `rkev/`. Die
 ausführliche, englische Dokumentation des Crates steht in
-[`kev-client/README.md`](kev-client/README.md).
+[`rkev/README.md`](rkev/README.md).
 
-## Was Kev macht
+## Was RKev macht
 
 Du schickst einen **State** , ein Ticket, ein Dokument, beliebigen Text oder JSON
 , und dazu eine Menge **Fragen**. Zurück kommen Wahrscheinlichkeiten statt eines
@@ -32,12 +40,12 @@ Hidden States der Options-Enden gegen den `<decide>`-Token bewertet werden. Gena
 deshalb kann keine Text-Generierungs-Engine diese Modelle bedienen , gebraucht
 werden Hidden States, nicht Logits.
 
-## Vom Ticket zur Antwort: der Weg von Kev nach Qwen
+## Vom Ticket zur Antwort: der Weg von RKev nach Qwen
 
 Vier Schritte, vier Module. Jeder Schritt ist im Code an einer Stelle, und die
 Reihenfolge ist immer dieselbe , es gibt keine Schleife und keine Generierung.
 
-### 1. Anfrage → Text (`kev-client/src/prompt.rs`)
+### 1. Anfrage → Text (`rkev/src/prompt.rs`)
 
 Der State wird zu Text. Ein String bleibt, wie er ist; ein JSON-Objekt wird zu
 `schlüssel: wert` pro Zeile, eine Liste zu `- eintrag`, verschachteltes eingerückt.
@@ -58,7 +66,7 @@ Optionen sind:
 | `choice` | deine Optionen, in deiner Reihenfolge | die Optionsnamen |
 | `score` | die Stufenbeschreibungen, niedrigste zuerst | die Stufenindizes `0`, `1`, … |
 
-### 2. Text → Tokens (`kev-client/src/encode.rs`)
+### 2. Text → Tokens (`rkev/src/encode.rs`)
 
 Fünf selten benutzte Qwen-Spezialtokens dienen als Trennzeichen, damit keine
 Embedding-Zeilen dazukommen müssen , der LoRA-Adapter gibt ihnen ihre Bedeutung:
@@ -131,7 +139,7 @@ gespeicherten Keys und Values, bei der Rekurrenz über Zustandsmatrix und
 Faltungsfenster. Die letzten vier Zustände bleiben über Anfragen hinweg im Cache,
 nach ihren Tokens geschlüsselt, wie es `kev.serve` auch macht.
 
-### 4. Hidden States → Antwort (`kev-client/src/readout.rs`)
+### 4. Hidden States → Antwort (`rkev/src/readout.rs`)
 
 Der **Pointer-Head** ist die zweite Hälfte eines Checkpoints und liegt in
 `head.pt`. Für jede Frage:
@@ -175,7 +183,7 @@ SystemOneResponse
 
 ### Was das deutsche Beispiel davon benutzt
 
-`kev-client/examples/deutsch.rs` geht genau diesen Weg, einmal pro Anfrage:
+`rkev/examples/deutsch.rs` geht genau diesen Weg, einmal pro Anfrage:
 
 | Im Beispiel | Was dahinter passiert |
 |---|---|
@@ -218,7 +226,7 @@ scripts/local.sh --fetch jaredpalmer/kev-0.6b
 Danach beantwortest du Anfragen direkt:
 
 ```bash
-cd kev-client
+cd rkev
 cargo run --release --example decide -- \
     --base ~/models/qwen-qwen3-0.6b-base --checkpoint ~/models/kev-0.6b \
     --state "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card."
@@ -269,11 +277,11 @@ geht auf stderr, Antworten auf stdout.
 
 ```toml
 [dependencies]
-kev-client = { path = "kev-client" }
+rkev = { path = "rkev" }
 ```
 
 ```rust
-use kev_client::{pointer_head, Backend, Choice, LocalEngine, Noul, SystemOneRequest};
+use rkev::{pointer_head, Backend, Choice, LocalEngine, Noul, SystemOneRequest};
 
 // Basismodell plus Checkpoint; welche Architektur nötig ist, steht in dessen config.json.
 let backend = Backend::open(base_dir, Some(checkpoint_dir))?;
@@ -306,7 +314,7 @@ die entscheidet, ob ein Checkpoint dir etwas nützt , ist: wie oft hat er auf
 *deinen* Tickets recht, und zwar so, dass du darauf routen kannst?
 
 ```bash
-cd kev-client
+cd rkev
 cargo run --release --example eval -- \
     --base ~/models/qwen-qwen3-0.6b-base --checkpoint ~/models/kev-0.6b \
     --questions tests/eval/questions.json --records meine-tickets.jsonl
@@ -364,7 +372,7 @@ beschriftet ist, gilt als unterschritten — eine Garantie ohne Belege ist keine
 `scripts/local.sh` leitet das Flag weiter.
 
 Die Zahlen oben sind eine Formatillustration, kein gemessener Lauf. Sechs
-Beispiel-Records und die passende Fragendatei liegen in `kev-client/tests/eval/`,
+Beispiel-Records und die passende Fragendatei liegen in `rkev/tests/eval/`,
 zum Abschauen des Formats; `--batch 8` beschleunigt kurze States, `--json` gibt die
 Auswertung maschinenlesbar aus, und die Batch-Größe ändert die Zahlen nicht (geprüft:
 `--batch 1` und `--batch 4` liefern dasselbe JSON).
@@ -383,7 +391,7 @@ halten. MSRV ist 1.75 ohne `candle`, mit `candle` dessen eigener Wert.
 
 ## Beispiele
 
-Alle in `kev-client/examples/`:
+Alle in `rkev/examples/`:
 
 | Beispiel | Wofür | Braucht |
 |---|---|---|
@@ -415,7 +423,7 @@ Spiegel (oder auf einen `file://`-Baum).
 Alle offline, keiner braucht einen Server oder Gewichte:
 
 ```bash
-cd kev-client
+cd rkev
 cargo test                                    # 83
 cargo test --no-default-features --features local   # 50
 cargo test --no-default-features              # 14

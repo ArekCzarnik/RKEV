@@ -26,7 +26,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use candle_core::{DType, Device};
-use kev_client::{
+use rkev::{
     pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest,
     SystemOneResponse,
 };
@@ -77,7 +77,7 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
 
     // One engine per configuration, because the knobs sit on the backend and a
     // loaded backend cannot be reconfigured behind the engine's mutex.
-    let engine = |dtype: DType, prefix: bool, cache: usize| -> kev_client::Result<LocalEngine> {
+    let engine = |dtype: DType, prefix: bool, cache: usize| -> rkev::Result<LocalEngine> {
         let backend = Backend::open_as(&options.base, checkpoint, Device::Cpu, dtype)?
             .with_prefix(prefix)
             .with_prefix_min_tokens(0)
@@ -237,9 +237,9 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// A failed pass is an error and not a fast one: swallowing it here would print a
 /// very good number for doing nothing.
-fn times<F>(requests: &[SystemOneRequest], mut answer: F) -> kev_client::Result<Vec<f64>>
+fn times<F>(requests: &[SystemOneRequest], mut answer: F) -> rkev::Result<Vec<f64>>
 where
-    F: FnMut(&SystemOneRequest) -> kev_client::Result<SystemOneResponse>,
+    F: FnMut(&SystemOneRequest) -> rkev::Result<SystemOneResponse>,
 {
     requests
         .iter()

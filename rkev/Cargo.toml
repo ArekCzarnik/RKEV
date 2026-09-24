@@ -1,9 +1,9 @@
 [package]
-name = "kev-client"
+name = "rkev"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Rust client for Kev, the small decision models that speak TypeSafe's System One API"
+description = "Kev's decision models in Rust: local inference for TypeSafe's System One API"
 repository = "https://github.com/jaredpalmer/kev"
 license = "Apache-2.0"
 

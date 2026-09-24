@@ -11,10 +11,10 @@
 //!
 //! ```no_run
 //! # #[cfg(feature = "candle")]
-//! # fn run() -> Result<(), kev_client::Error> {
+//! # fn run() -> Result<(), rkev::Error> {
 //! use std::path::Path;
 //!
-//! use kev_client::{pointer_head, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest};
+//! use rkev::{pointer_head, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest};
 //!
 //! let base = Path::new("models/qwen3-0.6b-base");
 //! let checkpoint = Path::new("models/kev-0.6b");

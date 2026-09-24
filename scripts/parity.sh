@@ -12,7 +12,7 @@
 #   scripts/parity.sh --record-only                         # only talk to the server
 #
 #   --url <url>          the server (default http://127.0.0.1:8009)
-#   --requests <dir>     requests to send (default kev-client/tests/parity)
+#   --requests <dir>     requests to send (default rkev/tests/parity)
 #   --recordings <dir>   where responses go (default <requests>/recordings)
 #   --tolerance <f64>    largest probability difference to accept (default 0.01)
 #   --only <name>        one request by file stem, repeatable
@@ -28,7 +28,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CRATE_DIR="$ROOT/kev-client"
+CRATE_DIR="$ROOT/rkev"
 URL="${KEV_BASE_URL:-http://127.0.0.1:8009}"
 REQUESTS="$CRATE_DIR/tests/parity"
 RECORDINGS=""

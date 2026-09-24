@@ -16,7 +16,7 @@ mod fixtures;
 use std::sync::atomic::Ordering;
 
 use fixtures::{engine, identity_head, Stub, DECIDE_ID, OPTION_END_ID};
-use kev_client::{
+use rkev::{
     Choice, Limits, Linear, LocalEngine, Noul, PointerHead, Result, Score, SystemOne,
     SystemOneRequest,
 };
@@ -333,7 +333,7 @@ fn the_model_is_the_one_the_request_pins_or_the_engine_default() {
     let default = engine.system_one_blocking(&ask()).unwrap();
     let pinned = engine.system_one_blocking(&ask().model("kev-4b")).unwrap();
 
-    assert_eq!(default.model, kev_client::DEFAULT_MODEL);
+    assert_eq!(default.model, rkev::DEFAULT_MODEL);
     assert_eq!(pinned.model, "kev-4b");
 }
 
@@ -563,7 +563,7 @@ async fn permuting_works_off_the_runtime_thread_too() {
 
 #[test]
 fn isolating_the_options_puts_every_span_at_the_same_positions() {
-    use kev_client::OptionSlot;
+    use rkev::OptionSlot;
 
     // Every option span restarts where the instructions end, and `<decide>` sits
     // past the longest of them — so no option can be told apart by where it sits.

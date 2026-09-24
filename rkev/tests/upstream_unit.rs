@@ -13,7 +13,7 @@
 mod fixtures;
 
 use fixtures::engine;
-use kev_client::{render, Choice, Linear, Noul, Pass, PointerHead, Score, SystemOneRequest};
+use rkev::{render, Choice, Linear, Noul, Pass, PointerHead, Score, SystemOneRequest};
 use serde_json::json;
 
 /// `test_render_flattens_structured_content`
@@ -251,7 +251,7 @@ fn the_temperature_divides_the_logits_and_leaves_the_winner() {
 /// and `<decide>`.
 #[test]
 fn an_isolated_option_is_read_by_itself_and_by_decide() {
-    use kev_client::OptionSlot::{Decide, Elsewhere, Option as Span};
+    use rkev::OptionSlot::{Decide, Elsewhere, Option as Span};
 
     let ids = [0u32; 9];
     let positions = [0u32, 1, 2, 3, 4, 5, 4, 5, 6];

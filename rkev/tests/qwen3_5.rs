@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use fixtures::{
     fresh_dir, tokenizer_json, vocab_size, write_head, write_safetensors, Noise, Tensors,
 };
-use kev_client::{pointer_head, Backend, Forward, LocalEngine, Noul, Pass, SystemOneRequest};
+use rkev::{pointer_head, Backend, Forward, LocalEngine, Noul, Pass, SystemOneRequest};
 
 const HIDDEN: usize = 32;
 const INTERMEDIATE: usize = 64;
@@ -249,7 +249,7 @@ fn a_request() -> SystemOneRequest {
         .ask("late", Noul::new("is this late ?"))
 }
 
-fn probability(response: &kev_client::SystemOneResponse, id: &str) -> f64 {
+fn probability(response: &rkev::SystemOneResponse, id: &str) -> f64 {
     response.answer(id).unwrap().as_noul().unwrap()
 }
 
@@ -1197,7 +1197,7 @@ fn a_recurrent_base_refuses_option_isolation() {
         .system_one_blocking(
             &SystemOneRequest::new("a ticket about money").ask(
                 "team",
-                kev_client::Choice::new("which team ?")
+                rkev::Choice::new("which team ?")
                     .option_bare("returns")
                     .option_bare("billing"),
             ),

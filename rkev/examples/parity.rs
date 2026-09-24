@@ -28,7 +28,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use kev_client::{pointer_head, Answer, Backend, LocalEngine, SystemOneRequest, SystemOneResponse};
+use rkev::{pointer_head, Answer, Backend, LocalEngine, SystemOneRequest, SystemOneResponse};
 
 struct Options {
     base: PathBuf,
@@ -115,7 +115,7 @@ fn run(options: &Options) -> Result<Verdict, Box<dyn std::error::Error>> {
     );
     // Serving the layout the checkpoint was not trained on is a silently
     // different prompt, which would show up here as a difference that is ours.
-    if let Some(isolation) = kev_client::option_isolation(&head)? {
+    if let Some(isolation) = rkev::option_isolation(&head)? {
         engine = engine.with_option_isolation(isolation);
     }
 

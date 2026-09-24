@@ -1,7 +1,7 @@
 //! The request and response shapes are checked against the worked example in
 //! the Kev README, so a refactor cannot silently change what goes on the wire.
 
-use kev_client::{Answer, Choice, Noul, Score, SystemOneRequest, SystemOneResponse};
+use rkev::{Answer, Choice, Noul, Score, SystemOneRequest, SystemOneResponse};
 use serde_json::json;
 
 fn readme_request() -> SystemOneRequest {
@@ -86,7 +86,7 @@ fn noul_criteria_are_sent_as_true_and_false_keys() {
         .yes("Needs a human today")
         .no("Can wait for the queue");
 
-    let sent = serde_json::to_value(kev_client::Question::from(question)).unwrap();
+    let sent = serde_json::to_value(rkev::Question::from(question)).unwrap();
 
     assert_eq!(sent["criteria"]["true"], json!("Needs a human today"));
     assert_eq!(sent["criteria"]["false"], json!("Can wait for the queue"));
@@ -94,7 +94,7 @@ fn noul_criteria_are_sent_as_true_and_false_keys() {
 
 #[test]
 fn a_question_without_criteria_omits_the_field() {
-    let sent = serde_json::to_value(kev_client::Question::from(Noul::new("Urgent?"))).unwrap();
+    let sent = serde_json::to_value(rkev::Question::from(Noul::new("Urgent?"))).unwrap();
 
     assert_eq!(sent, json!({"type": "noul", "instructions": "Urgent?"}));
 }

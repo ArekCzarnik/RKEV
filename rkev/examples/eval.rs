@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use kev_client::{
+use rkev::{
     option_isolation, pointer_head, Answer, Backend, IndexMap, LocalEngine, Question,
     SystemOneRequest, SystemOneResponse,
 };

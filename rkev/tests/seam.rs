@@ -11,9 +11,7 @@ use std::future::Future;
 #[path = "fixtures/mod.rs"]
 mod fixtures;
 
-use kev_client::{
-    Answer, IndexMap, Noul, Result, SystemOne, SystemOneRequest, SystemOneResponse, Usage,
-};
+use rkev::{Answer, IndexMap, Noul, Result, SystemOne, SystemOneRequest, SystemOneResponse, Usage};
 
 /// A backend that answers from a canned response. Compiles and runs with
 /// `--no-default-features`, which is the point: the seam costs a caller nothing.
@@ -81,7 +79,7 @@ async fn the_separate_call_goes_through_the_same_seam() {
 #[cfg(feature = "local")]
 mod over_the_local_engine {
     use super::{a_request, fixtures};
-    use kev_client::SystemOne;
+    use rkev::SystemOne;
 
     fn assert_send<F: Send>(_future: F) {}
 

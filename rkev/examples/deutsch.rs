@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use kev_client::{
+use rkev::{
     option_isolation, pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Score,
     SystemOneRequest,
 };
@@ -339,7 +339,7 @@ fn zufall(fälle: &[Fall]) -> f64 {
         .sum()
 }
 
-fn erste(antwort: &kev_client::SystemOneResponse) -> Result<&Answer, &'static str> {
+fn erste(antwort: &rkev::SystemOneResponse) -> Result<&Answer, &'static str> {
     antwort
         .answers
         .values()

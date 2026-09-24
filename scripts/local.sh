@@ -24,7 +24,7 @@
 # A low accuracy on your records fails the run only if you say what low means, with
 # --min-accuracy; otherwise it is reported and that is all. A question with a
 # threshold and nothing labelled for it counts as below it.
-# kev-client/tests/eval/README.md has the record format.
+# rkev/tests/eval/README.md has the record format.
 #
 # Nothing here starts a server, or needs the network unless --fetch is given.
 # HF_TOKEN is used for --fetch if it is set.
@@ -32,7 +32,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CRATE_DIR="$ROOT/kev-client"
+CRATE_DIR="$ROOT/rkev"
 MODEL_DIR="${KEV_MODEL_DIR:-$HOME/models}"
 # KEV_HF points the downloads elsewhere: a mirror, or a local tree (file://...)
 # to exercise this script without the network.

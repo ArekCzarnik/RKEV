@@ -26,9 +26,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use kev_client::{
-    pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest,
-};
+use rkev::{pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest};
 
 fn main() -> ExitCode {
     let options = match parse() {
@@ -173,9 +171,8 @@ fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
             .find(|path| path.exists())
             .unwrap_or_else(|| dir.join("head.pt"))
     });
-    let open =
-        || -> Result<Backend, kev_client::Error> { Backend::open(&options.base, checkpoint) };
-    let engine = || -> Result<LocalEngine, kev_client::Error> {
+    let open = || -> Result<Backend, rkev::Error> { Backend::open(&options.base, checkpoint) };
+    let engine = || -> Result<LocalEngine, rkev::Error> {
         Ok(LocalEngine::new(open()?, pointer_head(&head)?))
     };
 
@@ -195,7 +192,7 @@ fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
         },
         backend.hidden_size(),
     );
-    if let Some(isolation) = kev_client::option_isolation(&head).ok().flatten() {
+    if let Some(isolation) = rkev::option_isolation(&head).ok().flatten() {
         println!("head.pt says option_isolation = {isolation}");
         if isolation {
             println!("  (pass --option-isolation to match it; without it the prompt differs)\n");
@@ -233,7 +230,7 @@ fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
     // them, because both sides would be swapped alike. A *trained* head can. Only
     // worth the passes if the ordinary orientation answered these cases at all.
     if hits + 1 >= cases.len() {
-        let swapped = || -> Result<LocalEngine, kev_client::Error> {
+        let swapped = || -> Result<LocalEngine, rkev::Error> {
             Ok(LocalEngine::new(open()?, pointer_head(&head)?.swapped()))
         };
         let mut wrong_way = 0;
@@ -300,7 +297,7 @@ fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
     println!("  (the README publishes 0.47/0.28/0.25, p(yes) 0.93, score 1.44 for Kev-4B in bf16)");
 
     println!();
-    let mut compare = |what: &str, other: &kev_client::SystemOneResponse| {
+    let mut compare = |what: &str, other: &rkev::SystemOneResponse| {
         let worst = reference
             .answers
             .iter()

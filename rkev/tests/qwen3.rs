@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use fixtures::{
     fresh_dir, tokenizer_json, vocab_size, write_head, write_safetensors, Noise, Tensors,
 };
-use kev_client::{
+use rkev::{
     pointer_head, Backend, Choice, Forward, LocalEngine, Noul, Pass, SystemOneRequest, DECIDE,
     OPTION, OPTION_END, QUESTION, STATE,
 };
@@ -276,7 +276,7 @@ fn a_request(second_question_options: (&str, &str)) -> SystemOneRequest {
         )
 }
 
-fn probabilities(response: &kev_client::SystemOneResponse, id: &str) -> Vec<f64> {
+fn probabilities(response: &rkev::SystemOneResponse, id: &str) -> Vec<f64> {
     let answer = response.answer(id).unwrap();
     match answer.probabilities() {
         Some(distribution) => distribution.values().copied().collect(),
@@ -662,15 +662,15 @@ struct Recording<B> {
 }
 
 impl<B: Forward> Forward for Recording<B> {
-    fn tokenise(&mut self, text: &str) -> kev_client::Result<Vec<u32>> {
+    fn tokenise(&mut self, text: &str) -> rkev::Result<Vec<u32>> {
         self.inner.tokenise(text)
     }
 
-    fn delimiter(&mut self, token: &str) -> kev_client::Result<u32> {
+    fn delimiter(&mut self, token: &str) -> rkev::Result<u32> {
         self.inner.delimiter(token)
     }
 
-    fn hidden(&mut self, pass: &Pass<'_>) -> kev_client::Result<Vec<Vec<f32>>> {
+    fn hidden(&mut self, pass: &Pass<'_>) -> rkev::Result<Vec<Vec<f32>>> {
         self.passes.lock().unwrap().push(pass.ids.to_vec());
         self.inner.hidden(pass)
     }
