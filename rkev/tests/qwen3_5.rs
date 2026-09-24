@@ -1162,7 +1162,13 @@ fn bf16_on_a_cpu_says_what_to_do_instead() {
 
     let error = Backend::open_as(&fixture.dir, None, Device::Cpu, DType::BF16).unwrap_err();
 
-    assert!(error.to_string().contains("no bf16 matmul"), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("no bf16 matmul"), "{message}");
+    // The advice, as one readable sentence.
+    assert!(
+        message.contains("use f32 there, which is the exact path anyway, or f16"),
+        "{message}"
+    );
 }
 
 #[test]
