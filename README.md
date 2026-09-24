@@ -299,6 +299,58 @@ Ein asynchroner Aufrufer nimmt `engine.system_one(&request).await` — das schie
 den Pass vom Runtime-Thread weg, weil ein Forward-Pass CPU-gebunden ist.
 `LocalEngine` ist billig zu klonen, und Klone teilen das eine geladene Modell.
 
+## Auf deinen eigenen Tickets messen
+
+Parität fragt, ob diese Engine der Referenz gleicht. Die andere Frage — und die,
+die entscheidet, ob ein Checkpoint dir etwas nützt — ist: wie oft hat er auf
+*deinen* Tickets recht, und zwar so, dass du darauf routen kannst?
+
+```bash
+cd kev-client
+cargo run --release --example eval -- \
+    --base ~/models/qwen-qwen3-0.6b-base --checkpoint ~/models/kev-0.6b \
+    --questions tests/eval/questions.json --records meine-tickets.jsonl
+```
+
+Die Fragen sind die `questions`-Map einer System-One-Anfrage (oder `--request` auf
+eine ganze Anfrage, die du schon hast). Die Records sind JSONL, ein Objekt pro
+Zeile:
+
+```json
+{"state": "Mein Paket ist nie angekommen.", "labels": {"abteilung": "versand", "eskalation": true, "verärgerung": 1}}
+```
+
+`state` ist Text oder beliebiges JSON, wie in einer Anfrage. `labels` hält, was du
+für richtig hältst: bei `choice` den Optionsnamen, bei `noul` `true`/`false`, bei
+`score` den Stufenindex oder die Stufenbeschreibung. Eine Frage, die du wegläßt,
+wird für den Record nicht gewertet — ein teilweise beschrifteter Satz ist also
+brauchbar. Ein Label für eine Frage, die es nicht gibt, ist dagegen ein Fehler und
+keine stille Null: ein Tippfehler in einer Frage-Id sähe sonst wie eine perfekte
+Trefferquote auf nichts aus.
+
+Berichtet wird pro Frage das Maß, das zum Typ passt — Trefferquote bei `choice`
+samt Verwechslungen zwischen den Optionen, Trefferquote bei 0.5 plus die Trennung
+beider Klassen und die AUC bei `noul`, nächstliegende Stufe plus mittlerer
+absoluter Fehler bei `score`:
+
+```text
+question         type     scored  accuracy  and what else it says
+abteilung        choice      120     84.2%  confidence 0.71 when right, 0.38 when wrong
+eskalation       noul        120     91.7%  p(yes) 0.84 when yes, 0.11 when no, AUC 0.95
+verärgerung      score        96     62.5%  mean absolute error 0.44 levels
+```
+
+Und dann der Teil, für den ein Entscheidungsmodell überhaupt da ist: **Trefferquote
+nach Sicherheit.** Daraus kommt die Schwelle, über der du automatisch routen und
+unter der du an einen Menschen geben kannst. `--errors <n>` zeigt die sichersten
+Fehlgriffe — dort steckt meist die Formulierung einer Frage, nicht das Modell.
+
+Die Zahlen oben sind eine Formatillustration, kein gemessener Lauf. Sechs
+Beispiel-Records und die passende Fragendatei liegen in `kev-client/tests/eval/`,
+zum Abschauen des Formats; `--batch 8` beschleunigt kurze States, `--json` gibt die
+Auswertung maschinenlesbar aus, und die Batch-Größe ändert die Zahlen nicht (geprüft:
+`--batch 1` und `--batch 4` liefern dasselbe JSON).
+
 ## Features
 
 | Feature | Was es bringt | Kosten |
@@ -322,6 +374,7 @@ Alle in `kev-client/examples/`:
 | `measure` | f16 gegen f32, Prefix-Cache, Chunking, Batching — mit Kontrollzeilen | Checkpoint |
 | `parity` | vergleicht jede Wahrscheinlichkeit mit einer aufgezeichneten Server-Antwort | Aufzeichnung |
 | `deutsch` | ein deutsches Ticket mit allen drei Fragetypen, und mit `--vergleich` dieselben Inhalte auf englisch daneben | Checkpoint |
+| `eval` | Trefferquote und Kalibrierung auf deinen eigenen beschrifteten Tickets | Checkpoint + Records |
 
 ## Skripte
 

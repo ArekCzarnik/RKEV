@@ -102,6 +102,7 @@ questions keep the order you add them in.
 | `measure` | f16 against f32, the prefix cache, chunking, batching | a checkpoint |
 | `parity` | every probability against a recorded server response | a recording |
 | `deutsch` | the same thing in German, and with `--vergleich` the same content in English beside it — the checkpoints are published on English data and the base is multilingual, so what that costs is worth measuring rather than assuming | a checkpoint |
+| `eval` | accuracy and calibration on your own labelled records | a checkpoint and a JSONL set |
 
 ## What it answers
 
@@ -368,6 +369,30 @@ kev-client = { path = "../kev-client", default-features = false }
 
 `--features local` sits between the two: the prompt, the layout and the readout,
 with `Forward` left to you.
+
+## Measuring it on your own records
+
+Parity asks whether this engine agrees with the reference. `examples/eval.rs` asks
+the question that decides whether a checkpoint is any use to you:
+
+```bash
+cargo run --release --example eval -- \
+    --base <base> --checkpoint <kev> \
+    --questions questions.json --records tickets.jsonl
+```
+
+One JSON object per line, `state` plus the `labels` you consider right, keyed by
+question id. A question left out of a record's labels is not scored for it, and a
+label for a question that does not exist is an error rather than a silent zero —
+a typo in an id would otherwise read as a perfect score on nothing.
+
+Per question it reports the measure that fits the type (accuracy and the confusion
+for a choice, accuracy plus class separation and AUC for a noul, nearest level plus
+mean absolute error for a score), and then **accuracy by confidence**, which is
+where a routing threshold comes from and the reason to run a model that answers
+with a distribution. `--errors <n>` lists the confident mistakes, which is usually
+where a question's wording is wrong rather than the model.
+`tests/eval/README.md` has the format, with a six-record sample beside it.
 
 ## Tests
 

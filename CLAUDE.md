@@ -425,6 +425,22 @@ timings. No feature flags: the model is the crate's default.
 `KEV_HF` points the downloads at a mirror — or at a `file://` tree, which is how
 the fetch path was tested here without reaching the hub.
 
+### Measuring a checkpoint rather than checking it
+
+`examples/eval.rs` (feature `candle`) is the other axis from parity: not whether
+the engine agrees with the reference, but how often a checkpoint is right on a
+caller's own labelled records, and whether its confidence can carry a routing
+threshold. JSONL in (`state` plus `labels`), a per-question report out; `--json`
+for the tallies, `--errors` for the confident mistakes, `--batch` for short states.
+
+Three decisions worth keeping: a label for an unknown question id is an error, not
+a silent zero (a typo would read as a perfect score on nothing); a question missing
+from a record's labels is simply unscored, so a partly labelled set works; and
+`NaN` never reaches the output — a measure with nothing behind it prints as a dash
+and serialises as `null`, since `NaN` is not JSON. The sample set in
+`tests/eval/` is German and deliberately tiny: it shows the format, it is not a
+benchmark, and its numbers mean nothing.
+
 ## Documentation
 
 The crate is documented in three places that must stay in sync when the public

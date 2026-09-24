@@ -859,6 +859,55 @@ closure is scoped in a block instead, which is what actually ends the borrow.
 only a numeric divergence with no local symptom at all — a rounding step the
 reference takes and this port does not, or a config field read differently.
 
+## Done: an eval runner for the caller's own tickets
+
+Commit "Add an eval runner for your own labelled records". Parity asks whether the
+engine agrees with the reference; this asks whether the checkpoint is any use on
+the records someone actually has. `examples/eval.rs`:
+
+```bash
+cargo run --release --example eval -- --base <base> --checkpoint <kev> \
+    --questions tests/eval/questions.json --records tickets.jsonl
+```
+
+Input: the `questions` map of a System One request (`--questions`, or `--request`
+to take it out of a whole request), and JSONL records of `state` plus `labels`.
+`tests/eval/` holds a six-record German sample and the format's own README.
+
+Per question, the measure that fits the type:
+
+- **choice** — accuracy, the confusion between options where they fit on a line,
+  and the mean confidence split by right and wrong (the cheapest look at whether
+  the number means anything);
+- **noul** — accuracy at 0.5, mean `p(yes)` per class, and the AUC, which is what
+  the answer is worth before any threshold is chosen;
+- **score** — nearest-level accuracy and the mean absolute error in levels, because
+  an ordinal scale deserves both.
+
+Then **accuracy by confidence** in five buckets, which is the actual product of a
+model that answers with a distribution: it is where a routing threshold comes from.
+`--errors <n>` lists the most confident mistakes, which is where a question's
+wording usually turns out to be the problem.
+
+Decisions:
+
+- **A label for an unknown question id is an error**, naming the ids that exist. A
+  typo would otherwise read as a perfect score on nothing, which is the commonest
+  way to fool yourself with an eval set.
+- **A question missing from a record's labels is unscored**, so a partly labelled
+  set is usable — and the model answers every question either way.
+- **`NaN` never reaches the output.** A measure with nothing behind it prints as a
+  dash, and serialises as `null`: `NaN` is not JSON, and `--json` has to be
+  parseable. Checked with a partly labelled set.
+- `--batch` goes through `system_one_batch_blocking`; `--batch 1` and `--batch 4`
+  produce byte-identical JSON, which is the exactness of the batched prefill shown
+  on one more path.
+
+Verified on both synthetic fixtures: on noise weights the three-way choice sits at
+33.3%, the noul AUC at 0.38, MAE 0.60 — chance, as it must be. Also ran the error
+paths: the label typo (refused, exit 1), a record with no labels at all, `--limit`,
+`--errors`, `--request` as the question source, and the hybrid backbone.
+
 ## Left to do
 
 1. **Parity — one server session away.** Everything around it is done: the

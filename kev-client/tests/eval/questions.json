@@ -1,0 +1,20 @@
+{
+  "abteilung": {
+    "type": "choice",
+    "instructions": "Welches Team soll das übernehmen?",
+    "criteria": {
+      "rückgabe": "Umtausch, Rückgabe, falsche oder beschädigte Ware",
+      "versand": "Lieferstatus, Verzug, verlorene Pakete",
+      "zahlung": "Abbuchungen, Rechnungen, Zahlungsprobleme"
+    }
+  },
+  "eskalation": {
+    "type": "noul",
+    "instructions": "Muss sich dringend ein Mensch darum kümmern?"
+  },
+  "verärgerung": {
+    "type": "score",
+    "instructions": "Wie verärgert ist die Kundin oder der Kunde?",
+    "criteria": ["ruhig", "verärgert", "sehr wütend"]
+  }
+}

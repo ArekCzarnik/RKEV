@@ -1,0 +1,6 @@
+{"state": "Mein Paket ist nie angekommen, die Sendungsverfolgung steht seit acht Tagen.", "labels": {"abteilung": "versand", "eskalation": true, "verärgerung": 1}}
+{"state": "Ich wurde für Bestellung 4411 zweimal abgebucht. Bitte eine Buchung zurück.", "labels": {"abteilung": "zahlung", "eskalation": true, "verärgerung": 1}}
+{"state": "Der Pullover ist zwei Nummern zu klein. Kann ich ihn umtauschen?", "labels": {"abteilung": "rückgabe", "eskalation": false, "verärgerung": 0}}
+{"state": "Wollte nur kurz danke sagen, die Schuhe sind wunderschön.", "labels": {"abteilung": "rückgabe", "eskalation": false, "verärgerung": 0}}
+{"state": "Zum dritten Mal schreibe ich. Niemand antwortet. Ich will mein Geld zurück, heute.", "labels": {"abteilung": "zahlung", "eskalation": true, "verärgerung": 2}}
+{"state": {"betreff": "Lieferung steht seit einer Woche", "bestellung": 8814, "premium": true}, "labels": {"abteilung": "versand", "eskalation": true}}

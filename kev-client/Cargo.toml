@@ -68,3 +68,7 @@ required-features = ["candle"]
 [[example]]
 name = "deutsch"
 required-features = ["candle"]
+
+[[example]]
+name = "eval"
+required-features = ["candle"]
