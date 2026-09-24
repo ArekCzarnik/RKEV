@@ -127,36 +127,46 @@ fn checkpoint(name: &str, adapter: bool, merge: bool) -> Fixture {
         (vec![HIDDEN], noise.around_one(HIDDEN)),
     );
 
-    // One rank-2 LoRA on the first layer's query projection, either shipped as
-    // an adapter or already folded into the weight.
+    // Rank-2 LoRAs on the first layer, either shipped as an adapter or already
+    // folded into the weights: the query projection, and the value and up
+    // projections — the second half of a pair the backbone loads as one, which is
+    // where a merge landing at the wrong offset would show.
     if adapter || merge {
         let rank = 2;
         let mut lora = Noise(7);
-        let a = lora.values(rank * HIDDEN);
-        let b = lora.values(HEADS * HEAD_DIM * rank);
         let scale = 4.0 / rank as f32; // lora_alpha / r
-        if merge {
-            let target = tensors
-                .get_mut("model.layers.0.self_attn.q_proj.weight")
-                .unwrap();
-            for row in 0..HEADS * HEAD_DIM {
-                for column in 0..HIDDEN {
-                    let delta: f32 = (0..rank)
-                        .map(|r| b[row * rank + r] * a[r * HIDDEN + column])
-                        .sum();
-                    target.1[row * HIDDEN + column] += delta * scale;
+        let mut adapter_tensors = Tensors::new();
+        for (module, outputs) in [
+            ("self_attn.q_proj", HEADS * HEAD_DIM),
+            ("self_attn.v_proj", KV_HEADS * HEAD_DIM),
+            ("mlp.up_proj", INTERMEDIATE),
+        ] {
+            let a = lora.values(rank * HIDDEN);
+            let b = lora.values(outputs * rank);
+            if merge {
+                let target = tensors
+                    .get_mut(&format!("model.layers.0.{module}.weight"))
+                    .unwrap();
+                for row in 0..outputs {
+                    for column in 0..HIDDEN {
+                        let delta: f32 = (0..rank)
+                            .map(|r| b[row * rank + r] * a[r * HIDDEN + column])
+                            .sum();
+                        target.1[row * HIDDEN + column] += delta * scale;
+                    }
                 }
+            } else {
+                adapter_tensors.insert(
+                    format!("base_model.model.layers.0.{module}.lora_A.weight"),
+                    (vec![rank, HIDDEN], a),
+                );
+                adapter_tensors.insert(
+                    format!("base_model.model.layers.0.{module}.lora_B.weight"),
+                    (vec![outputs, rank], b),
+                );
             }
-        } else {
-            let mut adapter_tensors = Tensors::new();
-            adapter_tensors.insert(
-                String::from("base_model.model.layers.0.self_attn.q_proj.lora_A.weight"),
-                (vec![rank, HIDDEN], a),
-            );
-            adapter_tensors.insert(
-                String::from("base_model.model.layers.0.self_attn.q_proj.lora_B.weight"),
-                (vec![HEADS * HEAD_DIM, rank], b),
-            );
+        }
+        if !merge {
             let adapter_dir = dir.join("adapter");
             fs::create_dir_all(&adapter_dir).unwrap();
             write_safetensors(
@@ -165,7 +175,7 @@ fn checkpoint(name: &str, adapter: bool, merge: bool) -> Fixture {
             );
             fs::write(
                 adapter_dir.join("adapter_config.json"),
-                r#"{"r":2,"lora_alpha":4,"target_modules":["q_proj"]}"#,
+                r#"{"r":2,"lora_alpha":4,"target_modules":["q_proj","v_proj","up_proj"]}"#,
             )
             .unwrap();
         }
