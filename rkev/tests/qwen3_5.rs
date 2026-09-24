@@ -559,14 +559,15 @@ fn a_hybrid_config_gets_the_hybrid_backbone() {
 }
 
 /// One row: a state of `state` tokens, then a branch of `branch`, compared
-/// against the transcription at every hidden unit of every token.
+/// against the transcription at every hidden unit of every token. Returns the
+/// branch's hidden states, for a caller comparing two runs with each other.
 fn compare_with_the_reference(
     name: &str,
     state: usize,
     branch: usize,
     chunked: bool,
     chunk: usize,
-) {
+) -> Vec<Vec<f32>> {
     let fixture = checkpoint(name, false, false);
     // The packed path: the one being transcribed, and the only one that returns
     // hidden states for the state tokens as well as the branches.
@@ -608,6 +609,7 @@ fn compare_with_the_reference(
             );
         }
     }
+    ours
 }
 
 #[test]
@@ -628,6 +630,24 @@ fn the_chunked_delta_rule_matches_the_sequential_one() {
         compare_with_the_reference(&format!("chunked-{chunk}"), 100, 35, true, chunk);
         compare_with_the_reference(&format!("chunked-short-{chunk}"), 3, 6, true, chunk);
     }
+}
+
+#[test]
+fn the_chunk_size_reaches_the_delta_rule() {
+    // Every chunk size is meant to give the same numbers, so the test above
+    // cannot tell whether the size was used at all — it once passed with every
+    // size running as 64. What the size does change is the order the
+    // updates are summed in: both runs have to match the transcription, and
+    // they must not match each other bit for bit. If they do, the size never
+    // reached the computation.
+    let small = compare_with_the_reference("chunk-size-2", 100, 35, true, 2);
+    let large = compare_with_the_reference("chunk-size-64", 100, 35, true, 64);
+
+    // Not `assert_ne!`: on failure it would print both runs, every hidden unit.
+    assert!(
+        small != large,
+        "chunks of 2 and of 64 summed in the same order: the chunk size was ignored"
+    );
 }
 
 #[test]

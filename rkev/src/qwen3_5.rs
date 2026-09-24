@@ -788,9 +788,9 @@ impl Backbone {
         };
         let (out, state) = if self
             .chunked
-            .unwrap_or_else(|| chunking_pays(len, key_dim, value_dim))
+            .unwrap_or_else(|| chunking_pays(len, key_dim, value_dim, self.chunk))
         {
-            delta_rule_chunked(&q, &k, &v, &decay, &beta, start, CHUNK)?
+            delta_rule_chunked(&q, &k, &v, &decay, &beta, start, self.chunk)?
         } else {
             delta_rule_sequential(&q, &k, &v, &decay, &beta, start)?
         };
@@ -819,16 +819,17 @@ impl Backbone {
 /// reference uses; [`Backbone::with_chunk_size`] changes it.
 pub const CHUNK: usize = 64;
 
-/// Whether to run the delta rule in chunks for this shape.
+/// Whether to run the delta rule in chunks of `chunk` tokens for this shape.
 ///
 /// Two conditions. There has to be more than a chunk of tokens, or there is
 /// nothing to condense. And a chunk's own algebra — a triangular inverse and a
 /// few `chunk x chunk` matmuls, so about `chunk^3 / 2` — has to cost less than
 /// the `3 * chunk * key * value` the token-by-token form spends over the same
-/// span. That puts the crossover at `key * value ~ chunk^2 / 6`: the released
-/// checkpoints (128 by 128) are far above it, a toy model far below.
-fn chunking_pays(len: usize, key_dim: usize, value_dim: usize) -> bool {
-    len > CHUNK && key_dim * value_dim > CHUNK * CHUNK / 6
+/// span. That puts the crossover at `key * value ~ chunk^2 / 6`: at the default
+/// 64 the released checkpoints (128 by 128) are far above it, a toy model far
+/// below.
+fn chunking_pays(len: usize, key_dim: usize, value_dim: usize, chunk: usize) -> bool {
+    len > chunk && key_dim * value_dim > chunk * chunk / 6
 }
 
 /// The gated delta rule, one token at a time.
@@ -877,9 +878,8 @@ fn delta_rule_sequential(
 /// scan is left with one step per chunk instead of one per token. Same numbers,
 /// and on a long state the difference is the difference between usable and not.
 ///
-/// The inverse is built as `I + A + A^2 + ...` for `A = -strict_lower(system)`,
-/// which terminates because `A` is nilpotent, and by doubling — so
-/// `log2(chunk)` matmuls rather than `chunk` substitutions.
+/// The inverse is built block by block ([`unit_lower_inverse`]), `log2(chunk)`
+/// levels, rather than by `chunk` substitutions.
 fn delta_rule_chunked(
     q: &Tensor,
     k: &Tensor,

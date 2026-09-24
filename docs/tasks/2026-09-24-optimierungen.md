@@ -8,8 +8,8 @@ gleich bleiben.
 
 ## Fortschritt
 
-- 🔄 Task 1: `with_chunk_size` wirkt nicht (Bug)
-- ⬜ Task 2: Fehlertext bei bf16 auf der CPU (Bug)
+- ✅ Task 1: `with_chunk_size` wirkt nicht (Bug)
+- 🔄 Task 2: Fehlertext bei bf16 auf der CPU (Bug)
 - ⬜ Task 3: Accelerate / MKL als optionales Feature
 - ⬜ Task 4: GQA ohne `repeat_kv`, State-Keys vortransponiert
 - ⬜ Task 5: Prefill ohne verworfene Arbeit im letzten Layer
