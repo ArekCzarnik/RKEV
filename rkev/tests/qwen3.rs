@@ -1061,6 +1061,48 @@ fn a_repeated_state_is_prefilled_once_and_then_found() {
     assert_eq!(small.prefix_hits(), (0, 3), "one state was kept, not none");
 }
 
+/// Why `weights::linear` folds the batch into the rows.
+///
+/// `broadcast_matmul` broadcasts the *weight* to the batch and materialises it, so a
+/// projection is copied once per row. At a 0.6B model's shapes that is what made a
+/// branch pass cost three times a packed one.
+#[test]
+#[ignore = "a measurement, not an assertion: cargo test --release -- --ignored --nocapture"]
+fn what_folding_the_batch_into_the_rows_is_worth() {
+    use candle_core::{DType, Device, Tensor};
+    use std::time::Instant;
+
+    // kev-0.6b's q_proj, and five question branches of about forty tokens each.
+    let (batch, len, hidden, out) = (5usize, 45usize, 1024usize, 2048usize);
+    let device = Device::Cpu;
+    let xs = Tensor::ones((batch, len, hidden), DType::F32, &device).unwrap();
+    let weight = Tensor::ones((out, hidden), DType::F32, &device).unwrap();
+
+    let rounds = 20;
+    let broadcast = Instant::now();
+    for _ in 0..rounds {
+        xs.broadcast_matmul(&weight.t().unwrap()).unwrap();
+    }
+    let broadcast = broadcast.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+
+    let folded = Instant::now();
+    for _ in 0..rounds {
+        let flat = xs.reshape((batch * len, hidden)).unwrap();
+        flat.matmul(&weight.t().unwrap())
+            .unwrap()
+            .reshape((batch, len, out))
+            .unwrap();
+    }
+    let folded = folded.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+
+    println!(
+        "one {out}x{hidden} projection over {batch}x{len} rows:\n  \
+         broadcast_matmul {broadcast:>8.2} ms\n  folded into rows {folded:>8.2} ms \
+         ({:.1}x)",
+        broadcast / folded
+    );
+}
+
 #[test]
 #[ignore = "a measurement, not an assertion: cargo test -- --ignored --nocapture"]
 fn how_much_the_prefix_saves() {

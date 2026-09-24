@@ -409,7 +409,27 @@ where
 
 /// `y = x W^T`, for the bias-free projections these models use throughout.
 pub(crate) fn linear(xs: &Tensor, weight: &Tensor) -> candle_core::Result<Tensor> {
-    xs.broadcast_matmul(&weight.t()?)
+    let dims = xs.dims();
+    if dims.len() < 3 {
+        return xs.broadcast_matmul(&weight.t()?);
+    }
+    // Every leading dimension is folded into the rows, which is what the quantised
+    // kernel does with its own input. `broadcast_matmul` would instead broadcast the
+    // *weight* to the batch and materialise it — candle says so in a TODO — so a
+    // 2048x1024 projection at five rows copies 40 MB per call. Per projection, per
+    // layer, per pass: on a 0.6B model with five questions that is gigabytes of
+    // memcpy, and it was the reason a branch pass cost three times a packed one.
+    let (rows, inner) = (
+        dims[..dims.len() - 1].iter().product::<usize>(),
+        dims[dims.len() - 1],
+    );
+    let out = xs
+        .contiguous()?
+        .reshape((rows, inner))?
+        .matmul(&weight.t()?)?;
+    let mut shape = dims[..dims.len() - 1].to_vec();
+    shape.push(out.dim(1)?);
+    out.reshape(shape)
 }
 
 pub(crate) fn rms_norm(xs: &Tensor, weight: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
