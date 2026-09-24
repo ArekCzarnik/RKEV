@@ -44,21 +44,25 @@ cargo run --release --example decide -- \
     --state "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card."
 ```
 
-Das ist ein gemessener Lauf von `kev-0.6b` in f32 auf einer Apple-CPU, kein
+Das ist ein gemessener Lauf von `kev-0.6b` auf der GPU eines Macs (derselbe
+Aufruf mit `--features metal` und `--device metal`, dort in bf16), kein
 Beispielbild:
 
 ```text
-attention-only base in F32, loaded in 1.0s
-department     billing      0.51   confidence 0.26
+attention-only base in BF16, loaded in 3.7s
+department     billing      0.51   confidence 0.27
                shipping     0.25
                returns      0.24
 escalate       no           0.41
 frustration    Frustrated   level 1.04   confidence 0.97
                Calm         0.01
-               Frustrated   0.95
+               Frustrated   0.94
                Very angry   0.05
-               101 tokens in, 1671 ms
+               101 tokens in, 319 ms
 ```
+
+Auf der CPU in f32 dauerte dieselbe Anfrage 1671 ms; die Wahrscheinlichkeiten
+wichen um höchstens 0.01 ab.
 
 Das Ticket nennt absichtlich drei Abteilungen gleichzeitig; bei eindeutigen
 Tickets sitzt dieses Modell auf 1.00.
