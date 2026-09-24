@@ -188,7 +188,8 @@ impl Backend {
         // with nothing to say about what to do instead.
         if dtype == DType::BF16 && device.is_cpu() {
             return Err(Error::Engine(String::from(
-                "candle has no bf16 matmul on the CPU: use f32 there, which is the                  exact path anyway, or f16 for half the memory",
+                "candle has no bf16 matmul on the CPU: use f32 there, which is the \
+                 exact path anyway, or f16 for half the memory",
             )));
         }
         let path = tokenizer_path(base, adapter)?;
