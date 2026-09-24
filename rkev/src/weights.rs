@@ -471,12 +471,13 @@ pub(crate) fn shared_matmul(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
 }
 
 /// Softmax attention over a batch of rows, grouped-query, optionally continuing
-/// from a prefilled state: `[batch, heads, len, dim]` out.
+/// from a prefilled state: `[batch, heads, rows, dim]` out.
 ///
-/// `q` is `[batch, heads, len, dim]`, `k` and `v` are `[batch, kv_heads, len,
-/// dim]`, and `mask` is additive over `[.., len, state + len]`. A state comes as
+/// `q` is `[batch, heads, rows, dim]`, `k` and `v` are `[batch, kv_heads, len,
+/// dim]`, and `mask` is additive over `[.., rows, state + len]`. A state comes as
 /// `(keys, values)` from [`state_keys`] and the prefill: `[1, kv_heads, dim,
-/// state]` and `[1, kv_heads, state, dim]`.
+/// state]` and `[1, kv_heads, state, dim]`. `rows` is usually `len`; in the last
+/// layer it is only the readout positions ([`select_rows`]).
 ///
 /// Query head `h` reads key/value head `h / group`, so the `group` query heads
 /// that share one are stacked along the rows and multiplied against it once. The
@@ -496,19 +497,19 @@ pub(crate) fn grouped_attention(
     mask: &Tensor,
     scale: f64,
 ) -> Result<Tensor> {
-    let (batch, heads, len, dim) = q.dims4()?;
-    let kv_heads = k.dim(1)?;
+    let (batch, heads, rows, dim) = q.dims4()?;
+    let (kv_heads, len) = (k.dim(1)?, k.dim(2)?);
     let group = heads / kv_heads;
-    // `[batch, heads, len, cols]` <-> `[batch, kv_heads, group * len, cols]`: the
-    // same memory, since the heads of one group are adjacent.
+    // `[batch, heads, rows, cols]` <-> `[batch, kv_heads, group * rows, cols]`:
+    // the same memory, since the heads of one group are adjacent.
     let grouped = |x: &Tensor| -> Result<Tensor> {
         let cols = x.dim(3)?;
         Ok(x.contiguous()?
-            .reshape((batch, kv_heads, group * len, cols))?)
+            .reshape((batch, kv_heads, group * rows, cols))?)
     };
     let ungrouped = |x: Tensor| -> Result<Tensor> {
         let cols = x.dim(3)?;
-        Ok(x.reshape((batch, heads, len, cols))?)
+        Ok(x.reshape((batch, heads, rows, cols))?)
     };
 
     let queries = grouped(q)?;
@@ -533,7 +534,72 @@ pub(crate) fn grouped_attention(
             (from_state + from_branch)?
         }
     };
-    Ok(attended.reshape((batch, heads, len, dim))?)
+    Ok(attended.reshape((batch, heads, rows, dim))?)
+}
+
+/// What a pass is run for.
+#[derive(Clone, Copy)]
+pub(crate) enum Wanted<'a> {
+    /// The final hidden states at these positions, one list per row of the
+    /// batch, every list the same length ([`pad_readouts`]).
+    Readout(&'a [Vec<usize>]),
+    /// Only what each layer hands on to a branch: a prefill.
+    Cache,
+}
+
+/// The positions `at` of every row, `[batch, tokens, ..]` in and `[batch,
+/// at[row].len(), ..]` out — one list per row, all the same length.
+pub(crate) fn select_rows(xs: &Tensor, at: &[Vec<usize>]) -> Result<Tensor> {
+    let dims = xs.dims().to_vec();
+    let (batch, tokens) = (dims[0], dims[1]);
+    let count = at.first().map_or(0, Vec::len);
+    if at.len() != batch || at.iter().any(|row| row.len() != count) {
+        return Err(Error::Engine(String::from(
+            "every row of a batch has to ask for the same number of positions",
+        )));
+    }
+    let flat: Vec<u32> = at
+        .iter()
+        .enumerate()
+        .flat_map(|(row, positions)| {
+            positions
+                .iter()
+                .map(move |position| (row * tokens + position) as u32)
+        })
+        .collect();
+    let index = Tensor::from_vec(flat, batch * count, xs.device())?;
+    let mut flattened = vec![batch * tokens];
+    flattened.extend_from_slice(&dims[2..]);
+    let mut selected = vec![batch, count];
+    selected.extend_from_slice(&dims[2..]);
+    Ok(xs
+        .contiguous()?
+        .reshape(flattened)?
+        .index_select(&index, 0)?
+        .reshape(selected)?)
+}
+
+/// The rows of an additive mask `[batch, 1, queries, keys]` at the readout
+/// positions, as the last layer's fewer queries need it.
+pub(crate) fn select_mask_rows(mask: &Tensor, at: &[Vec<usize>]) -> Result<Tensor> {
+    Ok(select_rows(&mask.squeeze(1)?, at)?.unsqueeze(1)?)
+}
+
+/// Readout lists padded to the longest by repeating each one's last position
+/// (or position 0 for an empty one), so a batch can select them in one go.
+/// Returns the padded lists and the length of each, to cut the padding off again.
+pub(crate) fn pad_readouts(readouts: &[&[usize]]) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let longest = readouts.iter().map(|at| at.len()).max().unwrap_or(0);
+    let padded = readouts
+        .iter()
+        .map(|at| {
+            let mut at = at.to_vec();
+            let filler = at.last().copied().unwrap_or(0);
+            at.resize(longest, filler);
+            at
+        })
+        .collect();
+    (padded, readouts.iter().map(|at| at.len()).collect())
 }
 
 /// A state's keys as [`grouped_attention`] reads them: `[.., kv_heads, dim,

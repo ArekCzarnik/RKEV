@@ -21,8 +21,9 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::weights::{
-    attention_mask, branch_batch_mask, grouped_attention, pad_rows, prefill_batch_mask, rms_norm,
-    rope, rotary_tables, state_keys, Projection, Quantisation, Weights,
+    attention_mask, branch_batch_mask, grouped_attention, pad_readouts, pad_rows,
+    prefill_batch_mask, rms_norm, rope, rotary_tables, select_mask_rows, select_rows, state_keys,
+    Projection, Quantisation, Wanted, Weights,
 };
 
 /// The parts of a Qwen3 `config.json` this backbone needs.
@@ -260,14 +261,21 @@ impl Backbone {
         self.config.hidden_size
     }
 
-    /// One forward pass: the last hidden state of every token.
+    /// One forward pass: the last hidden state at each `readout` position,
+    /// `[readout.len(), hidden]`.
     ///
     /// `positions` are the position ids, one per token — not `0..n`, since each
     /// question's branch restarts after the state. `mask` is additive and
     /// `[1, 1, n, n]`: `0.0` where a token may read another, very negative
     /// where it may not.
-    pub fn forward(&self, ids: &[u32], positions: &[u32], mask: &Tensor) -> Result<Tensor> {
-        let (hidden, _) = self.run(&[(ids, positions)], mask, None)?;
+    pub fn forward(
+        &self,
+        ids: &[u32],
+        positions: &[u32],
+        mask: &Tensor,
+        readout: &[usize],
+    ) -> Result<Tensor> {
+        let hidden = self.run(&[(ids, positions)], mask, None, &[readout.to_vec()])?;
         Ok(hidden.i(0)?.to_dtype(DType::F32)?)
     }
 
@@ -339,18 +347,25 @@ impl Backbone {
             .collect()
     }
 
-    /// The hidden states of one branch, continuing from a prefilled state.
+    /// The hidden states of one branch at its `readout` positions, continuing
+    /// from a prefilled state.
     ///
     /// The branch sees the whole state and its own tokens up to each position,
     /// which is exactly what the packed mask would allow it.
-    pub fn forward_from(&self, prefix: &Prefix, ids: &[u32], positions: &[u32]) -> Result<Tensor> {
+    pub fn forward_from(
+        &self,
+        prefix: &Prefix,
+        ids: &[u32],
+        positions: &[u32],
+        readout: &[usize],
+    ) -> Result<Tensor> {
         Ok(self
-            .forward_from_batch(prefix, &[(ids, positions)])?
+            .forward_from_batch(prefix, &[(ids, positions)], &[readout])?
             .remove(0))
     }
 
-    /// The hidden states of several branches at once, all continuing from the
-    /// same prefilled state.
+    /// The hidden states of several branches at once, each at its own `readout`
+    /// positions, all continuing from the same prefilled state.
     ///
     /// Padded to the longest row and run as one batch: the same arithmetic as one
     /// call each, in a fraction of the calls, which is most of what a short
@@ -359,6 +374,7 @@ impl Backbone {
         &self,
         prefix: &Prefix,
         rows: &[(&[u32], &[u32])],
+        readouts: &[&[usize]],
     ) -> Result<Vec<Tensor>> {
         let (ids, positions, lengths, padded) = pad_rows(rows);
         let mask = branch_batch_mask(
@@ -376,45 +392,49 @@ impl Backbone {
                 )
             })
             .collect();
-        let (hidden, _) = self.run(&batched, &mask, Some(prefix))?;
-        lengths
+        let (at, counts) = pad_readouts(readouts);
+        let hidden = self.run(&batched, &mask, Some(prefix), &at)?;
+        counts
             .iter()
             .enumerate()
-            .map(|(row, length)| Ok(hidden.i(row)?.narrow(0, 0, *length)?.to_dtype(DType::F32)?))
+            .map(|(row, count)| Ok(hidden.i(row)?.narrow(0, 0, *count)?.to_dtype(DType::F32)?))
             .collect()
     }
 
-    /// One pass over a batch of rows: `[rows, tokens, hidden]` out.
+    /// One pass over a batch of rows: `[rows, at[row].len(), hidden]` out.
     fn run(
         &self,
         rows: &[(&[u32], &[u32])],
         mask: &Tensor,
         prefix: Option<&Prefix>,
-    ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
-        let (xs, kept) = self.stack(rows, mask, prefix, true)?;
-        Ok((rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?, kept))
+        at: &[Vec<usize>],
+    ) -> Result<Tensor> {
+        let (xs, _) = self.stack(rows, mask, prefix, Wanted::Readout(at))?;
+        Ok(rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?)
     }
 
     /// Every layer's keys and values over a batch of rows, and nothing more: what
     /// a prefill keeps.
     fn cache(&self, rows: &[(&[u32], &[u32])], mask: &Tensor) -> Result<Vec<(Tensor, Tensor)>> {
-        Ok(self.stack(rows, mask, None, false)?.1)
+        Ok(self.stack(rows, mask, None, Wanted::Cache)?.1)
     }
 
     /// The layers over a batch of rows: the residual stream, and each layer's
     /// keys and values.
     ///
-    /// With `whole` false the last layer stops once it has its keys and values,
-    /// and the stream handed back is the one entering it. A prefill reads nothing
-    /// else — the answers come from the branches — so the last layer's query, its
-    /// attention output and its feed-forward, and the final norm, would be work no
-    /// answer depends on.
+    /// Only the last layer depends on what is wanted, because only its output is
+    /// read by nothing further on. Its keys and values cover every token — every
+    /// position reads them — but for a readout its query, attention output and
+    /// feed-forward run at the readout positions only, and the stream handed back
+    /// is `[batch, at[row].len(), hidden]`. For a prefill, which reads nothing but
+    /// the keys and values, the last layer stops once it has them, and the stream
+    /// handed back is the one entering it.
     fn stack(
         &self,
         rows: &[(&[u32], &[u32])],
         mask: &Tensor,
         prefix: Option<&Prefix>,
-        whole: bool,
+        wanted: Wanted<'_>,
     ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
         let batch = rows.len();
         let len = rows.first().map(|(ids, _)| ids.len()).unwrap_or(0);
@@ -465,13 +485,24 @@ impl Backbone {
                 let (k, v) = &prefix.layers[index];
                 (k, v)
             });
+            let last = index + 1 == self.layers.len();
             let normed = rms_norm(&xs, &layer.input_norm, self.config.rms_norm_eps)?;
-            if !whole && index + 1 == self.layers.len() {
-                kept.push(self.keys_values(layer, &normed, &cos, &sin)?);
-                break;
-            }
-            let residual = xs.clone();
-            let (attended, k, v) = self.attention(layer, &normed, &cos, &sin, mask, past)?;
+            let (k, v) = self.keys_values(layer, &normed, &cos, &sin)?;
+            let (queries, cos, sin, mask, residual) = match wanted {
+                Wanted::Cache if last => {
+                    kept.push((k, v));
+                    break;
+                }
+                Wanted::Readout(at) if last => (
+                    select_rows(&normed, at)?,
+                    select_rows(&cos, at)?,
+                    select_rows(&sin, at)?,
+                    select_mask_rows(mask, at)?,
+                    select_rows(&xs, at)?,
+                ),
+                _ => (normed, cos.clone(), sin.clone(), mask.clone(), xs),
+            };
+            let attended = self.attention(layer, &queries, &cos, &sin, &k, &v, &mask, past)?;
             kept.push((k, v));
             xs = (residual + attended)?;
 
@@ -510,39 +541,41 @@ impl Backbone {
     }
 
     /// Attention over a batch of rows, optionally continuing from a state's keys
-    /// and values. Returns the output and this pass's keys and values, so a
-    /// prefill can keep them.
+    /// and values. `xs` and the rotary tables are the queries' rows, which in the
+    /// last layer are fewer than the keys' — see [`Backbone::stack`].
+    #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
         layer: &Layer,
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
         mask: &Tensor,
         past: Option<(&Tensor, &Tensor)>,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (batch, len, _) = xs.dims3()?;
+    ) -> Result<Tensor> {
+        let (batch, rows, _) = xs.dims3()?;
         let heads = self.config.num_attention_heads;
         let dim = self.config.head_dim();
 
         let q = layer
             .q_proj
             .forward(xs)?
-            .reshape((batch, len, heads, dim))?;
+            .reshape((batch, rows, heads, dim))?;
         // Per-head normalisation, then the rotary embedding, in that order.
         let q = rms_norm(&q, &layer.q_norm, self.config.rms_norm_eps)?;
         let q = rope(&q.transpose(1, 2)?, cos, sin)?;
-        let (k, v) = self.keys_values(layer, xs, cos, sin)?;
 
         // The state's keys sit in front of this pass's, which is what makes a branch
         // see the whole state and nothing of another branch.
         let scale = 1.0 / (dim as f64).sqrt();
-        let attended = grouped_attention(&q, &k, &v, past, mask, scale)?;
+        let attended = grouped_attention(&q, k, v, past, mask, scale)?;
 
         let out = attended
             .transpose(1, 2)?
-            .reshape((batch, len, heads * dim))?;
-        Ok((layer.o_proj.forward(&out)?, k, v))
+            .reshape((batch, rows, heads * dim))?;
+        Ok(layer.o_proj.forward(&out)?)
     }
 
     fn feed_forward(&self, layer: &Layer, xs: &Tensor) -> Result<Tensor> {

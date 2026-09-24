@@ -25,8 +25,9 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::qwen3::{read_config, supported_rope, RopeParameters};
 use crate::weights::{
-    attention_mask, branch_batch_mask, grouped_attention, pad_rows, prefill_batch_mask, real_mask,
-    rms_norm, rope, rotary_tables, state_keys, Projection, Quantisation, Weights,
+    attention_mask, branch_batch_mask, grouped_attention, pad_readouts, pad_rows,
+    prefill_batch_mask, real_mask, rms_norm, rope, rotary_tables, select_mask_rows, select_rows,
+    state_keys, Projection, Quantisation, Wanted, Weights,
 };
 
 /// Hugging Face's default when a Qwen3.5 config does not state one.
@@ -357,14 +358,21 @@ impl Backbone {
         self.config.hidden_size
     }
 
-    /// One forward pass over one row: the last hidden state of every token.
+    /// One forward pass over one row: the last hidden state at each `readout`
+    /// position, `[readout.len(), hidden]`.
     ///
     /// `mask` is the additive mask for the attention layers. The recurrent
     /// layers ignore it — they cannot honour it — so a row must contain exactly
     /// the tokens its question may read, in order, which is what
     /// [`Pass::rows`](crate::Pass::rows) produces.
-    pub fn forward(&self, ids: &[u32], positions: &[u32], mask: &Tensor) -> Result<Tensor> {
-        let (hidden, _) = self.run(&[(ids, positions)], mask, None)?;
+    pub fn forward(
+        &self,
+        ids: &[u32],
+        positions: &[u32],
+        mask: &Tensor,
+        readout: &[usize],
+    ) -> Result<Tensor> {
+        let hidden = self.run(&[(ids, positions)], mask, None, &[readout.to_vec()])?;
         Ok(hidden.i(0)?.to_dtype(DType::F32)?)
     }
 
@@ -448,15 +456,22 @@ impl Backbone {
             .collect()
     }
 
-    /// The hidden states of one branch, continuing from a prefilled state.
-    pub fn forward_from(&self, prefix: &Prefix, ids: &[u32], positions: &[u32]) -> Result<Tensor> {
+    /// The hidden states of one branch at its `readout` positions, continuing
+    /// from a prefilled state.
+    pub fn forward_from(
+        &self,
+        prefix: &Prefix,
+        ids: &[u32],
+        positions: &[u32],
+        readout: &[usize],
+    ) -> Result<Tensor> {
         Ok(self
-            .forward_from_batch(prefix, &[(ids, positions)])?
+            .forward_from_batch(prefix, &[(ids, positions)], &[readout])?
             .remove(0))
     }
 
-    /// The hidden states of several branches at once, all continuing from the
-    /// same prefilled state.
+    /// The hidden states of several branches at once, each at its own `readout`
+    /// positions, all continuing from the same prefilled state.
     ///
     /// The rows are padded to the longest and run as one batch: the same
     /// arithmetic as one call each, in a fifth of the calls when there are five
@@ -467,6 +482,7 @@ impl Backbone {
         &self,
         prefix: &Prefix,
         rows: &[(&[u32], &[u32])],
+        readouts: &[&[usize]],
     ) -> Result<Vec<Tensor>> {
         let (ids, positions, lengths, padded) = pad_rows(rows);
         let state = prefix.tokens.len();
@@ -479,23 +495,25 @@ impl Backbone {
                 )
             })
             .collect();
-        let (hidden, _) = self.run(&batched, &mask, Some(prefix))?;
-        lengths
+        let (at, counts) = pad_readouts(readouts);
+        let hidden = self.run(&batched, &mask, Some(prefix), &at)?;
+        counts
             .iter()
             .enumerate()
-            .map(|(row, length)| Ok(hidden.i(row)?.narrow(0, 0, *length)?.to_dtype(DType::F32)?))
+            .map(|(row, count)| Ok(hidden.i(row)?.narrow(0, 0, *count)?.to_dtype(DType::F32)?))
             .collect()
     }
 
-    /// One pass over a batch of rows: `[rows, tokens, hidden]` out.
+    /// One pass over a batch of rows: `[rows, at[row].len(), hidden]` out.
     fn run(
         &self,
         rows: &[(&[u32], &[u32])],
         mask: &Tensor,
         prefix: Option<&Prefix>,
-    ) -> Result<(Tensor, Vec<LayerPrefix>)> {
-        let (xs, kept) = self.stack(rows, mask, prefix, None, true)?;
-        Ok((rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?, kept))
+        at: &[Vec<usize>],
+    ) -> Result<Tensor> {
+        let (xs, _) = self.stack(rows, mask, prefix, None, Wanted::Readout(at))?;
+        Ok(rms_norm(&xs, &self.norm, self.config.rms_norm_eps)?)
     }
 
     /// What every layer hands on over a batch of rows, and nothing more: what a
@@ -506,25 +524,28 @@ impl Backbone {
         mask: &Tensor,
         lengths: Option<&[usize]>,
     ) -> Result<Vec<LayerPrefix>> {
-        Ok(self.stack(rows, mask, None, lengths, false)?.1)
+        Ok(self.stack(rows, mask, None, lengths, Wanted::Cache)?.1)
     }
 
     /// The layers over a batch of rows: the residual stream, and what each layer
     /// hands on — keys and values, or a recurrent state and its window.
     ///
-    /// With `whole` false the last layer stops once it has those, and the stream
-    /// handed back is the one entering it. A prefill reads nothing else — the
-    /// answers come from the branches — so the last layer's output and its
-    /// feed-forward, and the final norm, would be work no answer depends on. A
-    /// recurrent last layer still runs in full, since its state is its output's
-    /// by-product rather than the other way round.
+    /// Only the last layer depends on what is wanted, because only its output is
+    /// read by nothing further on. For a readout, an attention last layer computes
+    /// its keys and values over every token and everything after them only at the
+    /// readout positions; a recurrent one runs in full, since a recurrence walks
+    /// every token, and is cut down to the readout positions before its
+    /// feed-forward. The stream handed back is then `[batch, at[row].len(),
+    /// hidden]`. For a prefill, which reads only what the layers hand on, the last
+    /// layer stops once it has that, and the stream handed back is the one
+    /// entering it.
     fn stack(
         &self,
         rows: &[(&[u32], &[u32])],
         mask: &Tensor,
         prefix: Option<&Prefix>,
         lengths: Option<&[usize]>,
-        whole: bool,
+        wanted: Wanted<'_>,
     ) -> Result<(Tensor, Vec<LayerPrefix>)> {
         let batch = rows.len();
         let len = rows.first().map(|(ids, _)| ids.len()).unwrap_or(0);
@@ -575,15 +596,16 @@ impl Backbone {
         let mut kept = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
             let past = prefix.map(|prefix| &prefix.layers[index]);
-            let last = !whole && index + 1 == self.layers.len();
-            let residual = xs.clone();
+            let last = index + 1 == self.layers.len();
+            // Where this layer's output is read: everywhere, or in the last layer
+            // of a readout only at the readout positions.
+            let at = match wanted {
+                Wanted::Readout(at) if last => Some(at),
+                _ => None,
+            };
+            let prefill_ends = last && matches!(wanted, Wanted::Cache);
             let normed = rms_norm(&xs, &layer.input_norm, eps)?;
             let mixed = match (&layer.mixer, past) {
-                (Mixer::Attention(attention), _) if last => {
-                    let (keys, values) = self.keys_values(attention, &normed, &cos, &sin)?;
-                    kept.push(LayerPrefix::Attention { keys, values });
-                    break;
-                }
                 (Mixer::Attention(attention), past) => {
                     let past = match past {
                         Some(LayerPrefix::Attention { keys, values }) => Some((keys, values)),
@@ -594,8 +616,26 @@ impl Backbone {
                         }
                         None => None,
                     };
-                    let (mixed, keys, values) =
-                        self.attention(attention, &normed, &cos, &sin, mask, past)?;
+                    let (keys, values) = self.keys_values(attention, &normed, &cos, &sin)?;
+                    if prefill_ends {
+                        kept.push(LayerPrefix::Attention { keys, values });
+                        break;
+                    }
+                    let mixed = match at {
+                        Some(at) => self.attention(
+                            attention,
+                            &select_rows(&normed, at)?,
+                            &select_rows(&cos, at)?,
+                            &select_rows(&sin, at)?,
+                            &keys,
+                            &values,
+                            &select_mask_rows(mask, at)?,
+                            past,
+                        )?,
+                        None => self.attention(
+                            attention, &normed, &cos, &sin, &keys, &values, mask, past,
+                        )?,
+                    };
                     kept.push(LayerPrefix::Attention { keys, values });
                     mixed
                 }
@@ -612,11 +652,18 @@ impl Backbone {
                     let (mixed, window, state) =
                         self.recurrence(recurrence, &normed, past, lengths)?;
                     kept.push(LayerPrefix::Recurrence { window, state });
-                    if last {
+                    if prefill_ends {
                         break;
                     }
-                    mixed
+                    match at {
+                        Some(at) => select_rows(&mixed, at)?,
+                        None => mixed,
+                    }
                 }
+            };
+            let residual = match at {
+                Some(at) => select_rows(&xs, at)?,
+                None => xs,
             };
             xs = (residual + mixed)?;
 
@@ -657,45 +704,49 @@ impl Backbone {
 
     /// Attention as Qwen3 does it, plus the output gate that comes out of the
     /// second half of `q_proj`, over a batch of rows and optionally continuing
-    /// from a state's keys and values.
+    /// from a state's keys and values. `xs` and the rotary tables are the
+    /// queries' rows, which in the last layer are fewer than the keys' — see
+    /// [`Backbone::stack`].
+    #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
         layer: &Attention,
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
         mask: &Tensor,
         past: Option<(&Tensor, &Tensor)>,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (batch, len, _) = xs.dims3()?;
+    ) -> Result<Tensor> {
+        let (batch, rows, _) = xs.dims3()?;
         let heads = self.config.num_attention_heads;
         let dim = self.config.head_dim();
 
         let projected = layer
             .q_proj
             .forward(xs)?
-            .reshape((batch, len, heads, 2 * dim))?;
+            .reshape((batch, rows, heads, 2 * dim))?;
         let q = projected.narrow(3, 0, dim)?;
         let gate = projected
             .narrow(3, dim, dim)?
-            .reshape((batch, len, heads * dim))?;
+            .reshape((batch, rows, heads * dim))?;
 
         let q = rms_norm(&q, &layer.q_norm, self.config.rms_norm_eps)?;
         let q = rope(&q.transpose(1, 2)?, cos, sin)?;
-        let (k, v) = self.keys_values(layer, xs, cos, sin)?;
 
         // The state was prefilled once; every row of this batch reads the same keys
         // and values in front of its own. Here the prefix is not optional, since
         // three quarters of the layers are a recurrence with no masked pass to fall
         // back on.
         let scale = 1.0 / (dim as f64).sqrt();
-        let attended = grouped_attention(&q, &k, &v, past, mask, scale)?;
+        let attended = grouped_attention(&q, k, v, past, mask, scale)?;
 
         let out = attended
             .transpose(1, 2)?
-            .reshape((batch, len, heads * dim))?;
+            .reshape((batch, rows, heads * dim))?;
         let out = (out * candle_nn::ops::sigmoid(&gate)?)?;
-        Ok((layer.o_proj.forward(&out)?, k, v))
+        Ok(layer.o_proj.forward(&out)?)
     }
 
     fn recurrence(
