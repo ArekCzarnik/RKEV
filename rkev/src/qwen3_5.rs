@@ -25,8 +25,8 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::qwen3::{read_config, supported_rope, RopeParameters};
 use crate::weights::{
-    attention_mask, branch_batch_mask, pad_rows, prefill_batch_mask, real_mask, repeat_kv,
-    rms_norm, rope, rotary_tables, shared_matmul, Projection, Quantisation, Weights,
+    attention_mask, branch_batch_mask, grouped_attention, pad_rows, prefill_batch_mask, real_mask,
+    rms_norm, rope, rotary_tables, state_keys, Projection, Quantisation, Weights,
 };
 
 /// Hugging Face's default when a Qwen3.5 config does not state one.
@@ -176,6 +176,8 @@ impl Prefix {
 
 enum LayerPrefix {
     Attention {
+        /// Already transposed, `[1, kv_heads, dim, tokens]` — see
+        /// [`state_keys`].
         keys: Tensor,
         values: Tensor,
     },
@@ -377,7 +379,18 @@ impl Backbone {
         let (_, layers) = self.run(&[(ids, positions)], &mask, None, None)?;
         Ok(Prefix {
             tokens: ids.to_vec(),
-            layers,
+            layers: layers
+                .into_iter()
+                .map(|layer| {
+                    Ok(match layer {
+                        LayerPrefix::Attention { keys, values } => LayerPrefix::Attention {
+                            keys: state_keys(&keys)?,
+                            values,
+                        },
+                        recurrence => recurrence,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 
@@ -414,10 +427,7 @@ impl Backbone {
                     .map(|layer| {
                         Ok(match layer {
                             LayerPrefix::Attention { keys, values } => LayerPrefix::Attention {
-                                keys: keys
-                                    .narrow(0, row, 1)?
-                                    .narrow(2, 0, *length)?
-                                    .contiguous()?,
+                                keys: state_keys(&keys.narrow(0, row, 1)?.narrow(2, 0, *length)?)?,
                                 values: values
                                     .narrow(0, row, 1)?
                                     .narrow(2, 0, *length)?
@@ -620,49 +630,12 @@ impl Backbone {
         let k = rope(&k.transpose(1, 2)?, cos, sin)?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let repeats = heads / kv_heads;
-        let scale = 1.0 / (dim as f64).sqrt();
-
         // The state was prefilled once; every row of this batch reads the same keys
-        // and values in front of its own. Scored in two pieces rather than
-        // concatenated, so that the one shared tensor is not materialised per row —
-        // see `shared_matmul`. Here the prefix is not optional, since three quarters
-        // of the layers are a recurrence with no masked pass to fall back on.
-        let branch_keys = repeat_kv(&k, repeats)?;
-        let scores = match past {
-            None => q.matmul(&branch_keys.transpose(2, 3)?)?,
-            Some((past_k, _)) => {
-                let state = repeat_kv(past_k, repeats)?.transpose(2, 3)?.contiguous()?;
-                Tensor::cat(
-                    &[
-                        shared_matmul(&q, &state)?,
-                        q.matmul(&branch_keys.transpose(2, 3)?)?,
-                    ],
-                    3,
-                )?
-            }
-        };
-        let scores = (scores * scale)?;
-        let scores = scores.broadcast_add(mask)?;
-        // The reference takes the softmax in f32 whatever the backbone runs in.
-        let weights = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
-            .to_dtype(self.dtype)?;
-
-        let branch_values = repeat_kv(&v, repeats)?;
-        let attended = match past {
-            None => weights.matmul(&branch_values)?,
-            Some((_, past_v)) => {
-                let state = repeat_kv(past_v, repeats)?;
-                let tokens = state.dim(2)?;
-                let from_state =
-                    shared_matmul(&weights.narrow(3, 0, tokens)?.contiguous()?, &state)?;
-                let from_branch = weights
-                    .narrow(3, tokens, len)?
-                    .contiguous()?
-                    .matmul(&branch_values)?;
-                (from_state + from_branch)?
-            }
-        };
+        // and values in front of its own. Here the prefix is not optional, since
+        // three quarters of the layers are a recurrence with no masked pass to fall
+        // back on.
+        let scale = 1.0 / (dim as f64).sqrt();
+        let attended = grouped_attention(&q, &k, &v, past, mask, scale)?;
 
         let out = attended
             .transpose(1, 2)?
