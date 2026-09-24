@@ -767,6 +767,56 @@ Verified on both synthetic fixtures: 2 of 7 on either language, which is the
 chance line — as it has to be on noise weights. What the real checkpoint says is
 the user's to run.
 
+## Done: making Python unnecessary rather than unmentioned
+
+Commit "Refuse an adapter tensor the merge would pass over". The question was
+whether the crate can be built so Python is not needed at all. The parity
+recording is the only thing that needs it, so the honest answer was: not by
+deleting the check, but by closing locally the failures it would have caught.
+
+**The one that mattered.** `Weights::lora` looks a delta up under peft's
+`base_model.model.<path>` and returned `Ok(None)` for anything it did not find —
+silently unmerged. The weights load, every answer looks reasonable, and the numbers
+are a different model's. That is the quietest possible bug and exactly what parity
+is for. Now every tensor in `adapter_model.safetensors` has to be consumed:
+
+- leftover whose target is a tensor the backbone **reads** → error, by name;
+- leftover for a module it never runs (a vocabulary head: Kev's answers come from
+  the hidden states) → warning, since it cannot reach an answer;
+- leftover that is not a LoRA pair, or sits under a prefix nothing here knows →
+  error, because we cannot reason about it;
+- `KEV_ALLOW_UNMERGED=1` downgrades the refusals, for a checkpoint whose extra
+  tensors have been read and judged harmless.
+
+Implementation: `Adapter` keeps the file's tensor names and a `RefCell` of the ones
+`lora()` used, `Weights` keeps the base names `plain_f32` read, and
+`adapter_fully_merged()` runs at the end of both backbones' `load` — last, because
+it needs to know what the layers above asked for. `Weights` is local to `load` in
+both, so the `RefCell` costs nothing in `Send`/`Sync`.
+
+Three tests, in `tests/qwen3.rs`: an adapter that also adapts an `input_layernorm`
+(refused by name), one under `base_model.wrapped.…` (refused), and one for
+`lm_head` (loads, warns). The first also exercises the override, setting and
+clearing the variable in one test since the suite shares a process.
+
+**The tokenizer.** `a_real_tokenizer_does_not_truncate_what_it_is_given` pins what
+was once a real bug: `tokenizer.json` can carry truncation and padding, the
+tokenizers crate honours them, transformers turns both off on every call. Needs
+`KEV_TOKENIZER`; verified by pointing it at a fixture's tokenizer so the body
+actually runs rather than only the skip path.
+
+`is_none_or` had to become `is_some_and(|v| !v.is_empty())` — stable since 1.82
+against the crate's 1.75, the same trap as `repeat_n` earlier. clippy caught it.
+
+**What only a recording can still catch,** and what the README now says: an
+arbitrary numeric divergence with no local symptom — whether `head.pt`'s query
+projection really belongs on `<decide>` and the key on `</opt>` (swapped gives a
+different but entirely plausible distribution), or a rounding step the reference
+takes and this port does not. That is a reading error in a port, and only the
+numbers side by side find it.
+
+86 tests, all four feature combinations green.
+
 ## Left to do
 
 1. **Parity — one server session away.** Everything around it is done: the

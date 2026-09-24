@@ -231,14 +231,17 @@ impl Backbone {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Self {
+        let this = Self {
             embed_tokens: weights.plain("embed_tokens.weight")?,
             norm: weights.plain("norm.weight")?,
             layers,
             config,
             device: device.clone(),
             dtype,
-        })
+        };
+        // Last, because it needs to know which weights the layers above read.
+        weights.adapter_fully_merged()?;
+        Ok(this)
     }
 
     /// What the backbone runs in.

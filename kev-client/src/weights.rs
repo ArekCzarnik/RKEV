@@ -4,12 +4,20 @@
 //! rank-16 adapter, and merging it at load time in f32 is what the Python does
 //! (`LoadOptions.merge`), exactly there.
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+
+/// Set to any non-empty value to turn [`Weights::adapter_fully_merged`]'s
+/// refusals into warnings. For a checkpoint that carries something this crate
+/// does not implement but that provably cannot reach the answers — you have read
+/// the names it printed and decided they cannot.
+const OVERRIDE: &str = "KEV_ALLOW_UNMERGED";
 
 /// The checkpoint on disk: base weights, and the adapter folded into them as
 /// they are read.
@@ -21,12 +29,20 @@ pub(crate) struct Weights {
     /// says, and cast afterwards — which is both exact in f32 and, in bf16,
     /// closer to the f32 numbers than merging after the cast would be.
     dtype: DType,
+    /// The base tensors that were read, so an adapter delta for one of them
+    /// cannot go unnoticed.
+    loaded: RefCell<BTreeSet<String>>,
 }
 
 struct Adapter {
     tensors: candle_core::safetensors::MmapedSafetensors,
     /// `lora_alpha / r`, the scale peft folds into the delta.
     scale: f64,
+    /// Every tensor the file holds, so that nothing in it can be passed over
+    /// without saying so.
+    all: BTreeSet<String>,
+    /// The ones the merge actually used.
+    used: RefCell<BTreeSet<String>>,
 }
 
 #[derive(Deserialize)]
@@ -69,13 +85,21 @@ impl Weights {
                 } else {
                     config.r
                 };
+                let tensors = unsafe {
+                    candle_core::safetensors::MmapedSafetensors::new(
+                        dir.join("adapter_model.safetensors"),
+                    )?
+                };
+                let all = tensors
+                    .tensors()
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect();
                 Some(Adapter {
-                    tensors: unsafe {
-                        candle_core::safetensors::MmapedSafetensors::new(
-                            dir.join("adapter_model.safetensors"),
-                        )?
-                    },
+                    tensors,
                     scale: config.lora_alpha / divisor,
+                    all,
+                    used: RefCell::new(BTreeSet::new()),
                 })
             }
         };
@@ -85,6 +109,7 @@ impl Weights {
             adapter,
             device: device.clone(),
             dtype,
+            loaded: RefCell::new(BTreeSet::new()),
         })
     }
 
@@ -98,7 +123,12 @@ impl Weights {
     /// in f32 whatever the backbone runs in.
     pub fn plain_f32(&self, path: &str) -> Result<Tensor> {
         let name = format!("model.{path}");
-        Ok(self.base.load(&name, &self.device)?.to_dtype(DType::F32)?)
+        let tensor = self.base.load(&name, &self.device)?.to_dtype(DType::F32)?;
+        // Which base tensors the backbone actually runs: an adapter delta for one
+        // of these that the merge never applied changes the answers, and an
+        // adapter delta for anything else cannot.
+        self.loaded.borrow_mut().insert(name);
+        Ok(tensor)
     }
 
     /// A norm weight, which is stored as the deviation from 1.0 in the Qwen3.5
@@ -131,15 +161,86 @@ impl Weights {
         Ok((weight + delta)?.to_dtype(self.dtype)?)
     }
 
+    /// Refuse a checkpoint whose adapter holds anything the merge passed over.
+    ///
+    /// This is the quietest way to serve the wrong model: a LoRA pair the merge
+    /// never looked up leaves the weights loading, every answer looking
+    /// reasonable, and the numbers somebody else's. peft names the module it
+    /// wrapped `base_model.model.<path>`, and [`Weights::lora`] tries the two
+    /// prefixes kev's own wrapping produces — if a checkpoint ever names them
+    /// otherwise, or adapts a module this backbone merges nothing into, this says
+    /// so by name instead of letting the answers drift.
+    ///
+    /// A delta for something the backbone never reads at all (a vocabulary head,
+    /// say — Kev's answers do not come from one) cannot change an answer, so that
+    /// is a warning rather than a refusal.
+    pub(crate) fn adapter_fully_merged(&self) -> Result<()> {
+        let Some(adapter) = &self.adapter else {
+            return Ok(());
+        };
+        let used = adapter.used.borrow();
+        let loaded = self.loaded.borrow();
+
+        let mut ignored = Vec::new();
+        let mut unreachable = Vec::new();
+        for name in adapter.all.difference(&used) {
+            match target_of(name) {
+                // A weight this backbone runs, whose delta was never applied.
+                Some(target) if loaded.contains(&target) => ignored.push(name.clone()),
+                // A module it does not run; the reference's answers cannot depend
+                // on it either, since they come from the hidden states.
+                Some(_) => unreachable.push(name.clone()),
+                // Not a LoRA pair at all, or under a prefix nothing here knows:
+                // an adapter that does something this crate does not implement.
+                None => ignored.push(name.clone()),
+            }
+        }
+
+        if !unreachable.is_empty() {
+            eprintln!(
+                "warning: the adapter carries {} tensor(s) for modules this backbone \
+                 does not run, so they cannot reach an answer: {}",
+                unreachable.len(),
+                shorten(&unreachable)
+            );
+        }
+        if !ignored.is_empty() {
+            let message = format!(
+                "the adapter holds {} tensor(s) the merge never applied, which would \
+                 serve a different model than the checkpoint describes: {}. Either \
+                 this crate does not implement what the adapter does, or it names its \
+                 modules differently than peft's `base_model.model.<path>`. Set \
+                 {OVERRIDE}=1 to load anyway, once you are satisfied those tensors \
+                 cannot change an answer.",
+                ignored.len(),
+                shorten(&ignored)
+            );
+            // `is_none_or` would read better and is stable since 1.82; the crate
+            // says 1.75.
+            let allowed = std::env::var_os(OVERRIDE).is_some_and(|value| !value.is_empty());
+            if !allowed {
+                return Err(Error::Engine(message));
+            }
+            eprintln!("warning: {message}");
+        }
+        Ok(())
+    }
+
     fn lora(&self, adapter: &Adapter, path: &str) -> Result<Option<(Tensor, Tensor)>> {
         // peft names the module it wrapped `base_model.model.<path>`; kev wraps
         // the text model, so `<path>` is what the base file calls `model.<path>`.
         for prefix in ["base_model.model", "base_model.model.model"] {
             let a = format!("{prefix}.{path}.lora_A.weight");
             let b = format!("{prefix}.{path}.lora_B.weight");
-            if let Ok(a) = adapter.tensors.load(&a, &self.device) {
-                let b = adapter.tensors.load(&b, &self.device)?;
-                return Ok(Some((a.to_dtype(DType::F32)?, b.to_dtype(DType::F32)?)));
+            if let Ok(first) = adapter.tensors.load(&a, &self.device) {
+                let second = adapter.tensors.load(&b, &self.device)?;
+                let mut used = adapter.used.borrow_mut();
+                used.insert(a);
+                used.insert(b);
+                return Ok(Some((
+                    first.to_dtype(DType::F32)?,
+                    second.to_dtype(DType::F32)?,
+                )));
             }
         }
         Ok(None)
@@ -347,4 +448,32 @@ pub(crate) fn real_mask(lengths: &[usize], padded: usize, device: &Device) -> Re
         }
     }
     Ok(Tensor::from_vec(values, (lengths.len(), padded), device)?)
+}
+
+/// The base tensor a leftover adapter tensor would have been merged into, or
+/// `None` when it is not a LoRA pair under a prefix this crate knows.
+fn target_of(name: &str) -> Option<String> {
+    let stem = name
+        .strip_suffix(".lora_A.weight")
+        .or_else(|| name.strip_suffix(".lora_B.weight"))?;
+    // The same two prefixes `Weights::lora` looks under, longest first.
+    for prefix in ["base_model.model.model.", "base_model.model."] {
+        if let Some(path) = stem.strip_prefix(prefix) {
+            return Some(format!("model.{path}.weight"));
+        }
+    }
+    None
+}
+
+/// A few names, and then the count — enough to act on, short enough to read.
+fn shorten(names: &[String]) -> String {
+    let shown: Vec<&str> = names.iter().take(4).map(String::as_str).collect();
+    if names.len() <= shown.len() {
+        return shown.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        shown.join(", "),
+        names.len() - shown.len()
+    )
 }

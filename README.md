@@ -384,6 +384,44 @@ Was offen ist:
   hybrider Checkpoint geladen** — der echte Lauf war ein attention-only Modell.
 - Nichts ist quantisiert, und außer der CPU ist kein Gerät gelaufen.
 
+
+### Braucht man dafür Python?
+
+Für den Betrieb nie. Für die Prüfung fast nie mehr — und das ist Absicht: die
+Fehler, die eine Paritätsaufzeichnung fangen würde, sind hier lokal laut gemacht,
+statt dass man sie an abweichenden Zahlen erkennen müsste.
+
+- **Ein Adapter-Tensor, den der Merge nie anfasst, verhindert das Laden.** Das war
+  die leiseste Art, ein falsches Modell zu servieren: `weights.rs` sucht die
+  LoRA-Gewichte unter pefts Namensschema `base_model.model.<pfad>`, und was es
+  dort nicht findet, wurde einfach nicht gemergt — das Modell lief weiter, jede
+  Antwort sah vernünftig aus, die Zahlen waren die eines anderen Modells. Jetzt
+  muss **jeder** Tensor der Adapterdatei verbraucht sein. Betrifft er ein Gewicht,
+  das das Backbone liest, ist es ein Fehler mit Namen; betrifft er ein Modul, das
+  hier gar nicht läuft (einen Vokabular-Head etwa — Kevs Antworten gehen durch
+  keinen), eine Warnung. `KEV_ALLOW_UNMERGED=1` hebt die Weigerung auf, wenn du die
+  Namen gelesen und entschieden hast.
+- **Truncation und Padding des Tokenizers** sind ausdrücklich abgeschaltet, wie es
+  transformers bei jedem Aufruf tut, und ein Test hält das fest (mit
+  `KEV_TOKENIZER`, weil ein echter Qwen-Tokenizer hier nicht mitgeliefert werden
+  kann). Ein Tokenizer, der kürzt, ist ein leise anderer Prompt.
+- **Die `config.json`** wird nicht stillschweigend teilweise gelesen: Sliding-Window,
+  eine andere Rotary-Variante, `rope_scaling`, Attention-Bias oder nicht aufgehende
+  Kopfzahlen sind Weigerungen, keine Näherungen.
+- **Die Formeln** von Prompt, Layout und Readout stehen gegen acht aus der Referenz
+  portierte Testfälle, die Forward-Pässe gegen Transkriptionen von Hugging Faces
+  `modeling_qwen3.py` und `modeling_qwen3_5.py`.
+
+Was dann noch übrig bleibt und **nur** eine Aufzeichnung fangen kann: eine
+beliebige numerische Abweichung, für die es hier gar keine Symptome gibt — etwa ob
+`head.pt`s Query-Projektion wirklich auf `<decide>` und die Key-Projektion auf
+`</opt>` gehört (vertauscht ergibt eine andere, aber völlig plausible Verteilung),
+oder ob die Referenz an einer Stelle rundet, wo dieser Code es nicht tut. Das ist
+ein Lesefehler in einem Port, und dagegen hilft nur, die Zahlen einmal
+nebeneinanderzulegen.
+
+Deshalb bleibt `scripts/parity.sh`, und deshalb nur einmal: danach sind die
+Aufzeichnungen Dateien.
 ## Herkunft
 
 Kev selbst ist ein eigenes Projekt: <https://github.com/jaredpalmer/kev>

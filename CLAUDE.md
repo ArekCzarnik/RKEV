@@ -175,6 +175,19 @@ never uninhabited, which a feature-less build would otherwise trip over in
   wrong one is a silently different prompt rather than an error. A recurrent base
   refuses it: the rule is about who may read whom, and a recurrence reads
   everything it walked past.
+- **Every adapter tensor has to be consumed.** `Weights::adapter_fully_merged`,
+  called at the end of both backbones' `load`, refuses a checkpoint whose
+  `adapter_model.safetensors` holds a tensor the merge never applied. This is the
+  quietest failure the crate had: `Weights::lora` looks the delta up under peft's
+  `base_model.model.<path>`, and a name it does not find was simply not merged —
+  the model loads, the answers look reasonable, the numbers are another model's.
+  A leftover whose target is a tensor the backbone *reads* is an error naming it; a
+  leftover for a module it never runs is a warning, since Kev's answers come from
+  the hidden states and cannot pass through one. `KEV_ALLOW_UNMERGED=1` downgrades
+  the refusal for a checkpoint whose extra tensors have been read and judged
+  harmless. Do not weaken this into a warning: it exists because it catches
+  locally what previously only a parity recording would have shown, and then only
+  as a difference in the decimals.
 - **Delimiters are unforgeable, and that is load-bearing.** Caller text has
   `<|name|>` rewritten to `<¦name¦>` before tokenising, because a tokenizer
   matches its own special tokens inside ordinary text (`encode_special_tokens`

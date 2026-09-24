@@ -182,6 +182,83 @@ fn engine(dir: &Path, adapter: Option<&Path>) -> LocalEngine {
     LocalEngine::new(backend, head)
 }
 
+/// Rewrite a fixture's adapter with the rank-2 pair it normally has, plus one
+/// extra pair under each of the given names — the shapes do not matter, since the
+/// point is a tensor the merge never loads.
+fn adapter_with_extra(dir: &Path, extra: &[&str]) {
+    let mut lora = Noise(7);
+    let rank = 2;
+    let mut tensors = Tensors::new();
+    tensors.insert(
+        String::from("base_model.model.layers.0.self_attn.q_proj.lora_A.weight"),
+        (vec![rank, HIDDEN], lora.values(rank * HIDDEN)),
+    );
+    tensors.insert(
+        String::from("base_model.model.layers.0.self_attn.q_proj.lora_B.weight"),
+        (
+            vec![HEADS * HEAD_DIM, rank],
+            lora.values(HEADS * HEAD_DIM * rank),
+        ),
+    );
+    for module in extra {
+        for part in ["lora_A", "lora_B"] {
+            tensors.insert(format!("{module}.{part}.weight"), (vec![1, 1], vec![0.5]));
+        }
+    }
+    write_safetensors(&dir.join("adapter_model.safetensors"), &tensors);
+}
+
+/// A LoRA pair the merge never applies is the quietest way to serve the wrong
+/// model, so it has to be the loudest thing on load.
+#[test]
+fn an_adapter_tensor_the_merge_would_pass_over_is_refused() {
+    let fixture = checkpoint("strict-adapter", true, false);
+    let adapter = fixture.dir.join("adapter");
+
+    // A norm this backbone reads, and merges nothing into: applying the adapter
+    // would give different numbers, so loading must not look successful.
+    adapter_with_extra(&adapter, &["base_model.model.layers.0.input_layernorm"]);
+    let refused = Backend::open(&fixture.dir, Some(&adapter)).unwrap_err();
+    let message = refused.to_string();
+    assert!(
+        message.contains("input_layernorm") && message.contains("never applied"),
+        "{message}"
+    );
+
+    // The same for a prefix nothing here knows: if a checkpoint ever names its
+    // modules differently, every delta would be skipped, not just this one.
+    adapter_with_extra(&adapter, &["base_model.wrapped.layers.0.self_attn.k_proj"]);
+    let refused = Backend::open(&fixture.dir, Some(&adapter)).unwrap_err();
+    assert!(
+        refused.to_string().contains("base_model.wrapped"),
+        "{refused}"
+    );
+
+    // And the escape hatch, for a checkpoint whose extra tensors have been read
+    // and judged harmless. Set and cleared here, since the tests share a process.
+    std::env::set_var("KEV_ALLOW_UNMERGED", "1");
+    let loaded = Backend::open(&fixture.dir, Some(&adapter));
+    std::env::remove_var("KEV_ALLOW_UNMERGED");
+    assert!(loaded.is_ok(), "{:?}", loaded.err());
+}
+
+/// The answers come from the hidden states, so an adapter for a module the
+/// backbone never runs cannot move them — that is a warning, not a refusal.
+#[test]
+fn an_adapter_for_a_module_the_backbone_never_runs_still_loads() {
+    let fixture = checkpoint("spare-adapter", true, false);
+    let adapter = fixture.dir.join("adapter");
+    // A vocabulary head: Kev's answers never pass through one.
+    adapter_with_extra(&adapter, &["base_model.model.lm_head"]);
+
+    let engine = engine(&fixture.dir, Some(&adapter));
+    let answers = engine
+        .system_one_blocking(&a_request(("calm", "angry")))
+        .unwrap();
+
+    assert!(answers.answers.contains_key("team"));
+}
+
 fn a_request(second_question_options: (&str, &str)) -> SystemOneRequest {
     SystemOneRequest::new("a ticket about money")
         .ask(
@@ -643,6 +720,49 @@ fn caller_text_cannot_forge_a_delimiter() {
         ids.iter().filter(|id| **id == option_end).count(),
         2,
         "the state forged an option boundary"
+    );
+}
+
+/// A tokenizer that truncates is a different prompt, quietly.
+///
+/// `tokenizer.json` can carry truncation and padding of its own, and the
+/// tokenizers crate honours them; transformers turns both off on every call, so
+/// `Backend` says it out loud. This is what pins that — and it needs a real
+/// tokenizer, because the fixture's has no settings to inherit:
+///
+/// ```text
+/// KEV_TOKENIZER=/path/to/tokenizer.json cargo test
+/// ```
+#[test]
+fn a_real_tokenizer_does_not_truncate_what_it_is_given() {
+    let Ok(real) = std::env::var("KEV_TOKENIZER") else {
+        eprintln!("KEV_TOKENIZER is not set: skipping the truncation check");
+        return;
+    };
+    let fixture = checkpoint("real-tokenizer-length", false, false);
+    fs::copy(&real, fixture.dir.join("tokenizer.json")).unwrap();
+    let mut backend = Backend::open(&fixture.dir, None).unwrap();
+
+    // Well past any length a tokenizer file is likely to carry, and past the
+    // 1024 the released checkpoints were trained on.
+    let long = "Das Paket ist nie angekommen und die Sendungsverfolgung steht. ".repeat(400);
+    let ids = backend.tokenise(&long).unwrap();
+
+    assert!(
+        ids.len() > 2048,
+        "{real} truncated {} characters to {} tokens; truncation is supposed to be \
+         off, and the state's own limit is Limits::serving",
+        long.len(),
+        ids.len()
+    );
+    // Twice the text, about twice the tokens: nothing is being clipped at some
+    // length this assertion happens to sit under.
+    let twice = backend.tokenise(&long.repeat(2)).unwrap();
+    assert!(
+        twice.len() > ids.len() * 2 - 8,
+        "{} tokens for twice the text, against {}",
+        twice.len(),
+        ids.len()
     );
 }
 

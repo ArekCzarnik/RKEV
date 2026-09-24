@@ -294,7 +294,7 @@ impl Backbone {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Self {
+        let this = Self {
             embed_tokens: weights.plain("embed_tokens.weight")?,
             norm: weights.zero_centred_norm("norm")?,
             layers,
@@ -303,7 +303,10 @@ impl Backbone {
             dtype,
             chunked: None,
             chunk: CHUNK,
-        })
+        };
+        // Last, because it needs to know which weights the layers above read.
+        weights.adapter_fully_merged()?;
+        Ok(this)
     }
 
     /// What the backbone runs in. The delta rule, the gated norm and the pointer
