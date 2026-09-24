@@ -4,3 +4,4 @@ claudebox.run
 
 # Library crate: the lockfile is not part of what downstream builds resolve.
 Cargo.lock
+CLAUDE.md
