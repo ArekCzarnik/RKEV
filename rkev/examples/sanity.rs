@@ -28,7 +28,8 @@ use std::process::ExitCode;
 
 use candle_core::Device;
 use rkev::{
-    device, pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest,
+    device, pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Quantisation, Score,
+    SystemOneRequest,
 };
 
 fn main() -> ExitCode {
@@ -56,6 +57,8 @@ struct Options {
     tolerance: f64,
     /// Where the backbone runs; the precision follows it.
     device: Device,
+    /// Quantise the projections, to see what that costs the answers.
+    quantise: Option<Quantisation>,
 }
 
 /// One case whose answer is not in doubt.
@@ -177,7 +180,16 @@ fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
             .unwrap_or_else(|| dir.join("head.pt"))
     });
     let open = || -> Result<Backend, rkev::Error> {
-        Backend::open_on(&options.base, checkpoint, options.device.clone())
+        match options.quantise {
+            None => Backend::open_on(&options.base, checkpoint, options.device.clone()),
+            Some(quantise) => Backend::open_with(
+                &options.base,
+                checkpoint,
+                options.device.clone(),
+                candle_core::DType::F32,
+                Some(quantise),
+            ),
+        }
     };
     let engine = || -> Result<LocalEngine, rkev::Error> {
         Ok(LocalEngine::new(open()?, pointer_head(&head)?))
@@ -424,7 +436,8 @@ usage: sanity --base <dir> [--checkpoint <dir>] [--head <file>] [--tolerance <f6
   --checkpoint  the Kev checkpoint: adapter, head.pt, tokenizer
   --head        the pointer head, if it is not <checkpoint>/head.pt
   --tolerance   largest difference to accept between paths (default 0.001)
-  --device      cpu|metal; metal needs --features metal (macOS only)";
+  --device      cpu|metal; metal needs --features metal (macOS only)
+  --quantise    q4k|q5k|q6k|q8_0, to see what quantising costs the answers";
 
 fn parse() -> Result<Options, String> {
     let mut base = None;
@@ -432,6 +445,7 @@ fn parse() -> Result<Options, String> {
     let mut head = None;
     let mut tolerance = 0.001;
     let mut chosen = Device::Cpu;
+    let mut quantise = None;
 
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -448,6 +462,9 @@ fn parse() -> Result<Options, String> {
                 tolerance = value()?.parse().map_err(|e| format!("--tolerance: {e}"))?
             }
             "--device" => chosen = device(&value()?).map_err(|e| e.to_string())?,
+            "--quantise" | "--quantize" => {
+                quantise = Some(Quantisation::from_name(&value()?).map_err(|e| e.to_string())?)
+            }
             "-h" | "--help" => return Err(String::from("sanity")),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -458,5 +475,6 @@ fn parse() -> Result<Options, String> {
         head,
         tolerance,
         device: chosen,
+        quantise,
     })
 }

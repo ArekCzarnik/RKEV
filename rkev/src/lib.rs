@@ -98,5 +98,7 @@ pub use system_one::SystemOne;
 pub use types::{
     Answer, Choice, Noul, NoulCriteria, Question, Score, SystemOneRequest, SystemOneResponse, Usage,
 };
+#[cfg(feature = "candle")]
+pub use weights::Quantisation;
 
 pub use indexmap::IndexMap;

@@ -298,6 +298,41 @@ Ein asynchroner Aufrufer nimmt `engine.system_one(&request).await` — das schie
 den Pass vom Runtime-Thread weg, weil ein Forward-Pass CPU-gebunden ist.
 `LocalEngine` ist billig zu klonen, und Klone teilen das eine geladene Modell.
 
+## Quantisierung
+
+Ein CPU-Pass ist bandbreitengebunden: entscheidend ist, wie viele Bytes an
+Gewichten er lesen muss. `--quantise` packt die Projektionen in Blöcke — q4k
+braucht etwa ein Siebtel von f32, q8_0 etwa ein Viertel:
+
+```bash
+cd rkev
+cargo run --release --example measure -- \
+    --base <base> --checkpoint <kev> --quantise q8_0
+```
+
+Vier Stufen: `q4k` (4.5 Bit), `q5k`, `q6k`, `q8_0` (8.5 Bit). `decide`, `sanity`,
+`eval` und `measure` nehmen das Flag, `scripts/local.sh` reicht es weiter.
+
+**Quantisiert wird nach dem LoRA-Merge, nie davor.** Der Merge bleibt exakt in f32,
+und erst sein Ergebnis wird gerundet — ein vorquantisiertes Basismodell ließe sich
+gar nicht mergen. Dicht bleiben die Embeddings, die Norms, die Faltung, die
+Per-Head-Skalare und der Pointer-Head: die sind klein, und im Head steckt die
+Kalibrierung.
+
+**Was es kostet, musst du messen, nicht schätzen.** Die Antwort ist eine
+kalibrierte Wahrscheinlichkeit; Rundung verschiebt sie. `measure --quantise`
+druckt die Zeit **und** die größte Abweichung von f32 im selben Lauf, `eval
+--quantise` die Trefferquote auf deinen Tickets. Erst beide Zahlen zusammen sind
+eine Antwort.
+
+Zwei Grenzen, beide als Weigerung statt als stiller Rückfall: Quantisierung läuft
+nur mit **f32-Aktivierungen** (die ggml-Kerne wollen f32; f16 dazu würde zwei
+Verluste vermischen, die man dann nicht mehr auseinanderhalten kann) und nur auf
+der **CPU** (`QTensor::quantize` ist eine CPU-Routine; quantisiert auf Metal ist
+hier nicht erprobt). Und die k-Quants packen 256 Gewichte pro Superblock: eine
+Projektion, deren Zeile nicht durch 256 teilbar ist, wird namentlich abgelehnt mit
+dem Hinweis auf q8_0, das 32 packt.
+
 ## Auf deinen eigenen Tickets messen
 
 Parität fragt, ob diese Engine der Referenz gleicht. Die andere Frage — und die,

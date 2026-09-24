@@ -22,6 +22,9 @@
 #   --min-accuracy    0.8 for every question, or id=0.8 for one; repeatable
 #   --device <name>   cpu (default) or metal; metal also adds --features metal,
 #                     which only builds on macOS
+#   --quantise <name> q4k|q5k|q6k|q8_0; quantises the projections after the LoRA
+#                     merge. CPU and f32 only, and it costs accuracy - the eval
+#                     step is where you see how much
 #
 # A low accuracy on your records fails the run only if you say what low means, with
 # --min-accuracy; otherwise it is reported and that is all. A question with a
@@ -46,6 +49,7 @@ questions=""
 request=""
 minimum=()
 device=""
+quantise=""
 checkpoint=""
 fetch=""
 measure=0
@@ -62,13 +66,14 @@ while [ $# -gt 0 ]; do
         --records)    records="${2:-}"; shift 2 ;;
         --min-accuracy) minimum+=(--min-accuracy "${2:-}"); shift 2 ;;
         --device)     device="${2:-}"; shift 2 ;;
+        --quantise|--quantize) quantise="${2:-}"; shift 2 ;;
         --questions)  questions="${2:-}"; shift 2 ;;
         --request)    request="${2:-}"; shift 2 ;;
         --measure)    measure=1; shift ;;
         --skip-suite) skip_suite=1; shift ;;
         --force)      force=1; shift ;;
         --release)    release="--release"; shift ;;
-        -h|--help)    sed -n '3,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '3,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            echo "error: unknown argument $1 (try --help)" >&2; exit 1 ;;
     esac
 done
@@ -84,6 +89,7 @@ if [ -n "$device" ]; then
         metal*) features=(--features metal) ;;
     esac
 fi
+[ -n "$quantise" ] && chosen+=(--quantise "$quantise")
 
 # Every path the caller gave is made absolute before anything else: the checks below
 # run from inside the crate directory, where a relative path means something else.

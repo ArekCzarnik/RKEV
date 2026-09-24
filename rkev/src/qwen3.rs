@@ -21,8 +21,8 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::weights::{
-    attention_mask, branch_batch_mask, linear, pad_rows, prefill_batch_mask, repeat_kv, rms_norm,
-    rope, rotary_tables, Weights,
+    attention_mask, branch_batch_mask, pad_rows, prefill_batch_mask, repeat_kv, rms_norm, rope,
+    rotary_tables, Projection, Quantisation, Weights,
 };
 
 /// The parts of a Qwen3 `config.json` this backbone needs.
@@ -182,16 +182,16 @@ pub struct Backbone {
 
 struct Layer {
     input_norm: Tensor,
-    q_proj: Tensor,
-    k_proj: Tensor,
-    v_proj: Tensor,
-    o_proj: Tensor,
+    q_proj: Projection,
+    k_proj: Projection,
+    v_proj: Projection,
+    o_proj: Projection,
     q_norm: Tensor,
     k_norm: Tensor,
     post_attention_norm: Tensor,
-    gate_proj: Tensor,
-    up_proj: Tensor,
-    down_proj: Tensor,
+    gate_proj: Projection,
+    up_proj: Projection,
+    down_proj: Projection,
 }
 
 impl Backbone {
@@ -205,28 +205,29 @@ impl Backbone {
         adapter: Option<&Path>,
         device: &Device,
         dtype: DType,
+        quantise: Option<Quantisation>,
     ) -> Result<Self> {
         let config = Config::read(base)?;
-        let weights = Weights::open(base, adapter, device, dtype)?;
+        let weights = Weights::open(base, adapter, device, dtype, quantise)?;
 
         let layers = (0..config.num_hidden_layers)
             .map(|index| {
                 let layer = format!("layers.{index}");
                 Ok(Layer {
                     input_norm: weights.plain(&format!("{layer}.input_layernorm.weight"))?,
-                    q_proj: weights.adapted(&format!("{layer}.self_attn.q_proj"))?,
-                    k_proj: weights.adapted(&format!("{layer}.self_attn.k_proj"))?,
-                    v_proj: weights.adapted(&format!("{layer}.self_attn.v_proj"))?,
-                    o_proj: weights.adapted(&format!("{layer}.self_attn.o_proj"))?,
+                    q_proj: weights.projection(&format!("{layer}.self_attn.q_proj"))?,
+                    k_proj: weights.projection(&format!("{layer}.self_attn.k_proj"))?,
+                    v_proj: weights.projection(&format!("{layer}.self_attn.v_proj"))?,
+                    o_proj: weights.projection(&format!("{layer}.self_attn.o_proj"))?,
                     // Qwen3 normalises every head's query and key before the
                     // rotary embedding; Qwen2 did not.
                     q_norm: weights.plain(&format!("{layer}.self_attn.q_norm.weight"))?,
                     k_norm: weights.plain(&format!("{layer}.self_attn.k_norm.weight"))?,
                     post_attention_norm: weights
                         .plain(&format!("{layer}.post_attention_layernorm.weight"))?,
-                    gate_proj: weights.adapted(&format!("{layer}.mlp.gate_proj"))?,
-                    up_proj: weights.adapted(&format!("{layer}.mlp.up_proj"))?,
-                    down_proj: weights.adapted(&format!("{layer}.mlp.down_proj"))?,
+                    gate_proj: weights.projection(&format!("{layer}.mlp.gate_proj"))?,
+                    up_proj: weights.projection(&format!("{layer}.mlp.up_proj"))?,
+                    down_proj: weights.projection(&format!("{layer}.mlp.down_proj"))?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -468,9 +469,18 @@ impl Backbone {
         let kv_heads = self.config.num_key_value_heads;
         let dim = self.config.head_dim();
 
-        let q = linear(xs, &layer.q_proj)?.reshape((batch, len, heads, dim))?;
-        let k = linear(xs, &layer.k_proj)?.reshape((batch, len, kv_heads, dim))?;
-        let v = linear(xs, &layer.v_proj)?.reshape((batch, len, kv_heads, dim))?;
+        let q = layer
+            .q_proj
+            .forward(xs)?
+            .reshape((batch, len, heads, dim))?;
+        let k = layer
+            .k_proj
+            .forward(xs)?
+            .reshape((batch, len, kv_heads, dim))?;
+        let v = layer
+            .v_proj
+            .forward(xs)?
+            .reshape((batch, len, kv_heads, dim))?;
 
         // Per-head normalisation, then the rotary embedding, in that order.
         let q = rms_norm(&q, &layer.q_norm, self.config.rms_norm_eps)?;
@@ -508,12 +518,12 @@ impl Backbone {
             .matmul(&repeat_kv(&values, repeats)?)?
             .transpose(1, 2)?
             .reshape((batch, len, heads * dim))?;
-        Ok((linear(&out, &layer.o_proj)?, k, v))
+        Ok((layer.o_proj.forward(&out)?, k, v))
     }
 
     fn feed_forward(&self, layer: &Layer, xs: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&linear(xs, &layer.gate_proj)?)?;
-        let up = linear(xs, &layer.up_proj)?;
-        Ok(linear(&(gate * up)?, &layer.down_proj)?)
+        let gate = candle_nn::ops::silu(&layer.gate_proj.forward(xs)?)?;
+        let up = layer.up_proj.forward(xs)?;
+        Ok(layer.down_proj.forward(&(gate * up)?)?)
     }
 }

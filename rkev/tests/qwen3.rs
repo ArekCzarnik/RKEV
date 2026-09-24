@@ -24,8 +24,8 @@ use fixtures::{
     fresh_dir, tokenizer_json, vocab_size, write_head, write_safetensors, Noise, Tensors,
 };
 use rkev::{
-    pointer_head, Backend, Choice, Forward, LocalEngine, Noul, Pass, SystemOneRequest, DECIDE,
-    OPTION, OPTION_END, QUESTION, STATE,
+    pointer_head, Backend, Choice, Forward, LocalEngine, Noul, Pass, Quantisation,
+    SystemOneRequest, DECIDE, OPTION, OPTION_END, QUESTION, STATE,
 };
 
 const HIDDEN: usize = 32;
@@ -207,6 +207,106 @@ fn adapter_with_extra(dir: &Path, extra: &[&str]) {
         }
     }
     write_safetensors(&dir.join("adapter_model.safetensors"), &tensors);
+}
+
+/// Quantising happens after the LoRA merge, so the answers move a little and
+/// nothing else changes.
+///
+/// q8_0 keeps 8.5 bits per weight, which on any weights — these are noise — stays
+/// within a whisker of the dense pass. The point is not the exact difference but
+/// that the quantised path is the same arithmetic: same prompt, same readout, same
+/// shapes, one rounding step more.
+#[test]
+fn a_quantised_backbone_answers_close_to_the_dense_one() {
+    let fixture = checkpoint("quantised", true, false);
+    let adapter = fixture.dir.join("adapter");
+    let head = pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
+
+    let dense = LocalEngine::new(
+        Backend::open(&fixture.dir, Some(&adapter)).unwrap(),
+        head.clone(),
+    );
+    let quantised = LocalEngine::new(
+        Backend::open_with(
+            &fixture.dir,
+            Some(&adapter),
+            candle_core::Device::Cpu,
+            candle_core::DType::F32,
+            Some(Quantisation::Q8_0),
+        )
+        .unwrap(),
+        head,
+    );
+
+    let request = a_request(("calm", "angry"));
+    let exact = dense.system_one_blocking(&request).unwrap();
+    let rounded = quantised.system_one_blocking(&request).unwrap();
+
+    assert_close(
+        &probabilities(&exact, "team"),
+        &probabilities(&rounded, "team"),
+        0.05,
+        "q8_0 moved the answer further than rounding explains",
+    );
+    // And it is not the same tensor by accident: a quantised projection is a
+    // different object, so identical to five decimals would be suspicious.
+    assert_eq!(
+        exact.answers.len(),
+        rounded.answers.len(),
+        "the same questions have to come back"
+    );
+}
+
+/// The k-quants pack 256 weights to a super-block, so a row that does not divide
+/// by 256 cannot be packed at all — and the fixture's 32 hidden units are exactly
+/// such a row. candle says this in terms of block sizes; the engine has to say
+/// which projection and what else would fit.
+#[test]
+fn a_projection_too_narrow_for_the_block_size_is_refused() {
+    let fixture = checkpoint("narrow", false, false);
+
+    let refused = Backend::open_with(
+        &fixture.dir,
+        None,
+        candle_core::Device::Cpu,
+        candle_core::DType::F32,
+        Some(Quantisation::Q4K),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(refused.contains("q_proj"), "{refused}");
+    assert!(refused.contains("256"), "{refused}");
+    assert!(refused.contains("q8_0"), "{refused}");
+
+    // q8_0 packs 32, which those 32 units do divide by.
+    assert!(Backend::open_with(
+        &fixture.dir,
+        None,
+        candle_core::Device::Cpu,
+        candle_core::DType::F32,
+        Some(Quantisation::Q8_0),
+    )
+    .is_ok());
+}
+
+/// The ggml kernels take f32 activations; mixing a reduced activation precision
+/// into reduced weights would make the two losses impossible to tell apart.
+#[test]
+fn quantising_with_reduced_precision_activations_is_refused() {
+    let fixture = checkpoint("quantised-f16", false, false);
+
+    let refused = Backend::open_with(
+        &fixture.dir,
+        None,
+        candle_core::Device::Cpu,
+        candle_core::DType::F16,
+        Some(Quantisation::Q8_0),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(refused.contains("f32 activations"), "{refused}");
 }
 
 /// A LoRA pair the merge never applies is the quietest way to serve the wrong

@@ -8,6 +8,8 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use candle_core::Module;
 use candle_core::{DType, Device, Tensor};
 use serde::Deserialize;
 
@@ -25,6 +27,68 @@ pub(crate) fn unused_tensors_allowed() -> bool {
     std::env::var_os(ALLOW_UNUSED).is_some_and(|value| !value.is_empty())
 }
 
+/// How the projections are stored, for the checkpoints that are too big to serve
+/// dense.
+///
+/// Quantising happens **after** the LoRA merge, never before: the merge is exact
+/// in f32 (`Weights::merged`), and only the result is rounded down to blocks. A
+/// pre-quantised base model could not be merged into at all.
+///
+/// The four that are worth having on a model this small. Bits per weight are what
+/// they cost in bandwidth, which is what a CPU pass is bound by: f32 is 32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quantisation {
+    /// 4.5 bits. The usual choice, and the usual place to lose accuracy.
+    Q4K,
+    /// 5.5 bits.
+    Q5K,
+    /// 6.6 bits. Close to lossless on most weights.
+    Q6K,
+    /// 8.5 bits, block-wise scaled. The conservative one.
+    Q8_0,
+}
+
+impl Quantisation {
+    /// By name, as a caller would type it: `q4k`, `q5k`, `q6k`, `q8_0`.
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name.to_ascii_lowercase().replace('-', "_").as_str() {
+            "q4k" | "q4_k" => Ok(Self::Q4K),
+            "q5k" | "q5_k" => Ok(Self::Q5K),
+            "q6k" | "q6_k" => Ok(Self::Q6K),
+            "q8_0" | "q80" | "q8" => Ok(Self::Q8_0),
+            other => Err(Error::Engine(format!(
+                "unknown quantisation {other:?}; this crate offers q4k, q5k, q6k and q8_0"
+            ))),
+        }
+    }
+
+    fn ggml(self) -> GgmlDType {
+        match self {
+            Self::Q4K => GgmlDType::Q4K,
+            Self::Q5K => GgmlDType::Q5K,
+            Self::Q6K => GgmlDType::Q6K,
+            Self::Q8_0 => GgmlDType::Q8_0,
+        }
+    }
+}
+
+/// One projection of the backbone: a merged weight, dense or quantised.
+pub(crate) enum Projection {
+    Dense(Tensor),
+    Quantised(QMatMul),
+}
+
+impl Projection {
+    /// `xs @ weight^T`, the same arithmetic either way — the quantised form
+    /// dequantises a block at a time inside the kernel rather than up front.
+    pub(crate) fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(weight) => linear(xs, weight),
+            Self::Quantised(matmul) => matmul.forward(xs),
+        }
+    }
+}
+
 /// The checkpoint on disk: base weights, and the adapter folded into them as
 /// they are read.
 pub(crate) struct Weights {
@@ -38,6 +102,8 @@ pub(crate) struct Weights {
     /// The base tensors that were read, so an adapter delta for one of them
     /// cannot go unnoticed.
     loaded: RefCell<BTreeSet<String>>,
+    /// Set when the projections are to be quantised after merging.
+    quantise: Option<Quantisation>,
 }
 
 struct Adapter {
@@ -67,7 +133,26 @@ impl Weights {
         adapter: Option<&Path>,
         device: &Device,
         dtype: DType,
+        quantise: Option<Quantisation>,
     ) -> Result<Self> {
+        if quantise.is_some() {
+            // The ggml kernels take f32 or f16 activations; f32 is what the
+            // quantised path is worth measuring against, and mixing a reduced
+            // activation precision into a reduced weight precision would make the
+            // two losses impossible to tell apart.
+            if dtype != DType::F32 {
+                return Err(Error::Engine(format!(
+                    "quantised projections run with f32 activations, not {dtype:?}"
+                )));
+            }
+            // `QTensor::quantize` is a CPU routine, and a quantised matmul on
+            // another device is untried here.
+            if !device.is_cpu() {
+                return Err(Error::Engine(String::from(
+                    "quantisation is implemented for the CPU only",
+                )));
+            }
+        }
         let files = safetensors_in(base)?;
         // Safety: the files must not change while they are mapped, which is the
         // same contract every safetensors reader takes.
@@ -116,6 +201,7 @@ impl Weights {
             device: device.clone(),
             dtype,
             loaded: RefCell::new(BTreeSet::new()),
+            quantise,
         })
     }
 
@@ -146,15 +232,44 @@ impl Weights {
         Ok((weight + 1.0)?.to_dtype(self.dtype)?)
     }
 
-    /// A projection, with the adapter's `B @ A` delta merged in — in f32, before
-    /// the cast to the backbone's dtype, as `LoadOptions.merge` does it.
-    pub fn adapted(&self, path: &str) -> Result<Tensor> {
+    /// A projection as the backbone will use it: dense in its own dtype, or
+    /// quantised when the caller asked for that.
+    ///
+    /// The adapter's `B @ A` delta is merged in f32 first, before any cast and
+    /// before any quantisation, as `LoadOptions.merge` does it.
+    pub fn projection(&self, path: &str) -> Result<Projection> {
+        let merged = self.merged(path)?;
+        match self.quantise {
+            None => Ok(Projection::Dense(merged.to_dtype(self.dtype)?)),
+            Some(quantisation) => {
+                // The k-quants pack 256 weights to a super-block and q8_0 packs
+                // 32, and a row that does not divide evenly cannot be packed at
+                // all. candle says so in terms of block sizes and dimensions;
+                // this says which projection, and what else would fit.
+                let block = quantisation.ggml().block_size();
+                let row = *merged.dims().last().unwrap_or(&0);
+                if row % block != 0 {
+                    return Err(Error::Engine(format!(
+                        "{path} is {:?}, and {quantisation:?} packs {block} weights to a \
+                         block, which {row} does not divide by. q8_0 packs 32; below that \
+                         the projection has to stay dense.",
+                        merged.dims()
+                    )));
+                }
+                let quantised = QTensor::quantize(&merged, quantisation.ggml())?;
+                Ok(Projection::Quantised(QMatMul::from_qtensor(quantised)?))
+            }
+        }
+    }
+
+    /// The merged weight in f32, whatever the backbone runs in.
+    fn merged(&self, path: &str) -> Result<Tensor> {
         let weight = self.plain_f32(&format!("{path}.weight"))?;
         let Some(adapter) = &self.adapter else {
-            return Ok(weight.to_dtype(self.dtype)?);
+            return Ok(weight);
         };
         let Some((a, b)) = self.lora(adapter, path)? else {
-            return Ok(weight.to_dtype(self.dtype)?);
+            return Ok(weight);
         };
         let delta = (b.matmul(&a)? * adapter.scale)?;
         if delta.dims() != weight.dims() {
@@ -164,7 +279,7 @@ impl Weights {
                 weight.dims()
             )));
         }
-        Ok((weight + delta)?.to_dtype(self.dtype)?)
+        Ok((weight + delta)?)
     }
 
     /// Refuse a checkpoint whose adapter holds anything the merge passed over.

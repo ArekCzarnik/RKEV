@@ -20,7 +20,7 @@ use tokenizers::Tokenizer;
 use crate::error::{Error, Result};
 use crate::local::{Forward, OwnedPass, Pass};
 use crate::readout::{Linear, PointerHead};
-use crate::weights::attention_mask;
+use crate::weights::{attention_mask, Quantisation};
 use crate::{qwen3, qwen3_5};
 
 /// A loaded Kev checkpoint, ready to answer [`Forward`] calls.
@@ -159,6 +159,30 @@ impl Backend {
         device: Device,
         dtype: DType,
     ) -> Result<Self> {
+        Self::open_with(base, adapter, device, dtype, None)
+    }
+
+    /// As [`Backend::open_as`], with the projections quantised after the LoRA
+    /// merge.
+    ///
+    /// The merge itself stays exact in f32 and only its result is rounded into
+    /// blocks, which is the only order that works: a pre-quantised base model
+    /// cannot be merged into. What it buys is bandwidth — a CPU pass is bound by
+    /// how many bytes of weights it has to read, and q4k reads about a seventh of
+    /// f32 — and what it costs is accuracy, on a model whose output is a
+    /// calibrated probability. Measure both: `examples/measure` for the time,
+    /// `examples/eval` for what happened to the answers.
+    ///
+    /// The embeddings, the norms, the convolution, the per-head scalars and the
+    /// pointer head stay dense: they are small, and the head is where the
+    /// calibration lives.
+    pub fn open_with(
+        base: &Path,
+        adapter: Option<&Path>,
+        device: Device,
+        dtype: DType,
+        quantise: Option<Quantisation>,
+    ) -> Result<Self> {
         // candle's CPU backend has no bf16 matmul (f16, f32 and f64 only), so
         // this would otherwise fail on the first projection, several layers deep,
         // with nothing to say about what to do instead.
@@ -190,9 +214,13 @@ impl Backend {
             .as_ref()
             .is_some_and(|types| types.iter().any(|kind| kind == "linear_attention"));
         let model = if hybrid {
-            Model::Hybrid(qwen3_5::Backbone::load(base, adapter, &device, dtype)?)
+            Model::Hybrid(qwen3_5::Backbone::load(
+                base, adapter, &device, dtype, quantise,
+            )?)
         } else {
-            Model::Attention(qwen3::Backbone::load(base, adapter, &device, dtype)?)
+            Model::Attention(qwen3::Backbone::load(
+                base, adapter, &device, dtype, quantise,
+            )?)
         };
 
         Ok(Self {

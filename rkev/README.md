@@ -385,6 +385,40 @@ on a CPU, as `kev.serve` picks it. `decide`, `sanity`, `eval` and `measure` take
 `--device`; `parity` deliberately does not, since the comparison belongs on the f32
 path the recording was made against.
 
+## Quantised projections
+
+A CPU pass is bound by how many bytes of weights it reads, so packing them into
+blocks is the biggest lever there: q4k reads about a seventh of f32, q8_0 about a
+quarter.
+
+```bash
+cargo run --release --example measure -- \
+    --base <base> --checkpoint <kev> --quantise q8_0
+```
+
+`q4k`, `q5k`, `q6k` and `q8_0`, on `decide`, `sanity`, `eval` and `measure`.
+`Backend::open_with` is the same thing from the library.
+
+Quantising happens **after** the LoRA merge and never before: the merge stays exact
+in f32 and only its result is rounded into blocks — a pre-quantised base model
+could not be merged into at all. The embeddings, the norms, the convolution, the
+per-head scalars and the pointer head stay dense: they are small, and the head is
+where the calibration lives.
+
+What it costs has to be measured rather than assumed, because the output is a
+calibrated probability and rounding moves it. `measure --quantise` prints the time
+**and** the largest difference from f32 in the same run; `eval --quantise` prints
+what happened to the accuracy on your own records. Either number alone is half an
+answer.
+
+Three refusals rather than silent fallbacks: quantisation runs with **f32
+activations** only (the ggml kernels want f32, and reducing the activations as well
+would blend two losses that then cannot be separated), on the **CPU** only
+(`QTensor::quantize` is a CPU routine, and quantised matmuls on Metal are untried
+here), and a projection whose row does not divide by the block size is named in the
+error together with the alternative — the k-quants pack 256 weights to a
+super-block, `q8_0` packs 32.
+
 ## Measuring it on your own records
 
 Parity asks whether this engine agrees with the reference. `examples/eval.rs` asks

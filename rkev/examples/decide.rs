@@ -30,7 +30,7 @@ use std::time::Instant;
 use candle_core::{DType, Device};
 use rkev::{
     answers_json, device, option_isolation, pointer_head, Answer, Backend, Choice, IndexMap,
-    LocalEngine, Noul, Question, Score, SystemOneRequest, SystemOneResponse,
+    LocalEngine, Noul, Quantisation, Question, Score, SystemOneRequest, SystemOneResponse,
 };
 
 fn main() -> ExitCode {
@@ -62,9 +62,18 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     });
     let checkpoint = options.checkpoint.as_deref();
 
-    let mut backend = match options.dtype {
-        Some(dtype) => Backend::open_as(&options.base, checkpoint, options.device.clone(), dtype)?,
-        None => Backend::open_on(&options.base, checkpoint, options.device.clone())?,
+    let mut backend = match (options.dtype, options.quantise) {
+        (dtype, Some(quantise)) => Backend::open_with(
+            &options.base,
+            checkpoint,
+            options.device.clone(),
+            dtype.unwrap_or(DType::F32),
+            Some(quantise),
+        )?,
+        (Some(dtype), None) => {
+            Backend::open_as(&options.base, checkpoint, options.device.clone(), dtype)?
+        }
+        (None, None) => Backend::open_on(&options.base, checkpoint, options.device.clone())?,
     };
     // Every state a --lines run has seen stays available to the next one.
     if options.lines {
@@ -314,6 +323,8 @@ struct Options {
     dtype: Option<DType>,
     /// Where the backbone runs. The precision follows it unless --dtype says.
     device: Device,
+    /// Quantise the projections after merging the adapter, for the bandwidth.
+    quantise: Option<Quantisation>,
     model: Option<String>,
     requests: Vec<PathBuf>,
     state: Option<String>,
@@ -336,6 +347,8 @@ the model
   --head <file>          the pointer head, if not <checkpoint>/head.pt
   --dtype f32|f16|bf16   default: f32 on a CPU, bf16 on a GPU, as kev.serve picks it
   --device cpu|metal     where to run; metal needs --features metal (macOS)
+  --quantise q4k|q5k|q6k|q8_0
+                         quantise the projections after the merge; CPU and f32
   --model <name>         the name to report back in the answers
 
 what to answer
@@ -361,6 +374,7 @@ fn parse() -> Result<Options, String> {
         head: None,
         dtype: None,
         device: Device::Cpu,
+        quantise: None,
         model: None,
         requests: Vec::new(),
         state: None,
@@ -395,6 +409,10 @@ fn parse() -> Result<Options, String> {
                 })
             }
             "--device" => options.device = device(&value()?).map_err(|e| e.to_string())?,
+            "--quantise" | "--quantize" => {
+                options.quantise =
+                    Some(Quantisation::from_name(&value()?).map_err(|e| e.to_string())?)
+            }
             "--model" => options.model = Some(value()?),
             "--request" => options.requests.push(PathBuf::from(value()?)),
             "--state" => options.state = Some(value()?),

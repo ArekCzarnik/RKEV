@@ -25,8 +25,8 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::qwen3::{read_config, supported_rope, RopeParameters};
 use crate::weights::{
-    attention_mask, branch_batch_mask, linear, pad_rows, prefill_batch_mask, real_mask, repeat_kv,
-    rms_norm, rope, rotary_tables, Weights,
+    attention_mask, branch_batch_mask, pad_rows, prefill_batch_mask, real_mask, repeat_kv,
+    rms_norm, rope, rotary_tables, Projection, Quantisation, Weights,
 };
 
 /// Hugging Face's default when a Qwen3.5 config does not state one.
@@ -206,9 +206,9 @@ struct Layer {
     input_norm: Tensor,
     post_attention_norm: Tensor,
     mixer: Mixer,
-    gate_proj: Tensor,
-    up_proj: Tensor,
-    down_proj: Tensor,
+    gate_proj: Projection,
+    up_proj: Projection,
+    down_proj: Projection,
 }
 
 enum Mixer {
@@ -219,10 +219,10 @@ enum Mixer {
 struct Attention {
     /// Twice as wide as Qwen3's: the second half of every head is an output
     /// gate, not a query.
-    q_proj: Tensor,
-    k_proj: Tensor,
-    v_proj: Tensor,
-    o_proj: Tensor,
+    q_proj: Projection,
+    k_proj: Projection,
+    v_proj: Projection,
+    o_proj: Projection,
     q_norm: Tensor,
     k_norm: Tensor,
 }
@@ -235,11 +235,11 @@ struct DeltaNet {
     a_log: Tensor,
     /// The gated output norm, over one value head.
     norm: Tensor,
-    in_proj_qkv: Tensor,
-    in_proj_z: Tensor,
-    in_proj_b: Tensor,
-    in_proj_a: Tensor,
-    out_proj: Tensor,
+    in_proj_qkv: Projection,
+    in_proj_z: Projection,
+    in_proj_b: Projection,
+    in_proj_a: Projection,
+    out_proj: Projection,
 }
 
 impl Backbone {
@@ -249,9 +249,10 @@ impl Backbone {
         adapter: Option<&Path>,
         device: &Device,
         dtype: DType,
+        quantise: Option<Quantisation>,
     ) -> Result<Self> {
         let config = Config::read(base)?;
-        let weights = Weights::open(base, adapter, device, dtype)?;
+        let weights = Weights::open(base, adapter, device, dtype, quantise)?;
 
         let layers = (0..config.num_hidden_layers)
             .map(|index| {
@@ -266,18 +267,18 @@ impl Backbone {
                         // Ones-centred, unlike every other norm in this model.
                         norm: weights.plain_f32(&format!("{layer}.linear_attn.norm.weight"))?,
                         in_proj_qkv: weights
-                            .adapted(&format!("{layer}.linear_attn.in_proj_qkv"))?,
-                        in_proj_z: weights.adapted(&format!("{layer}.linear_attn.in_proj_z"))?,
-                        in_proj_b: weights.adapted(&format!("{layer}.linear_attn.in_proj_b"))?,
-                        in_proj_a: weights.adapted(&format!("{layer}.linear_attn.in_proj_a"))?,
-                        out_proj: weights.adapted(&format!("{layer}.linear_attn.out_proj"))?,
+                            .projection(&format!("{layer}.linear_attn.in_proj_qkv"))?,
+                        in_proj_z: weights.projection(&format!("{layer}.linear_attn.in_proj_z"))?,
+                        in_proj_b: weights.projection(&format!("{layer}.linear_attn.in_proj_b"))?,
+                        in_proj_a: weights.projection(&format!("{layer}.linear_attn.in_proj_a"))?,
+                        out_proj: weights.projection(&format!("{layer}.linear_attn.out_proj"))?,
                     })
                 } else {
                     Mixer::Attention(Attention {
-                        q_proj: weights.adapted(&format!("{layer}.self_attn.q_proj"))?,
-                        k_proj: weights.adapted(&format!("{layer}.self_attn.k_proj"))?,
-                        v_proj: weights.adapted(&format!("{layer}.self_attn.v_proj"))?,
-                        o_proj: weights.adapted(&format!("{layer}.self_attn.o_proj"))?,
+                        q_proj: weights.projection(&format!("{layer}.self_attn.q_proj"))?,
+                        k_proj: weights.projection(&format!("{layer}.self_attn.k_proj"))?,
+                        v_proj: weights.projection(&format!("{layer}.self_attn.v_proj"))?,
+                        o_proj: weights.projection(&format!("{layer}.self_attn.o_proj"))?,
                         q_norm: weights.zero_centred_norm(&format!("{layer}.self_attn.q_norm"))?,
                         k_norm: weights.zero_centred_norm(&format!("{layer}.self_attn.k_norm"))?,
                     })
@@ -287,9 +288,9 @@ impl Backbone {
                     post_attention_norm: weights
                         .zero_centred_norm(&format!("{layer}.post_attention_layernorm"))?,
                     mixer,
-                    gate_proj: weights.adapted(&format!("{layer}.mlp.gate_proj"))?,
-                    up_proj: weights.adapted(&format!("{layer}.mlp.up_proj"))?,
-                    down_proj: weights.adapted(&format!("{layer}.mlp.down_proj"))?,
+                    gate_proj: weights.projection(&format!("{layer}.mlp.gate_proj"))?,
+                    up_proj: weights.projection(&format!("{layer}.mlp.up_proj"))?,
+                    down_proj: weights.projection(&format!("{layer}.mlp.down_proj"))?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -595,14 +596,23 @@ impl Backbone {
         let dim = self.config.head_dim();
         let eps = self.config.rms_norm_eps;
 
-        let projected = linear(xs, &layer.q_proj)?.reshape((batch, len, heads, 2 * dim))?;
+        let projected = layer
+            .q_proj
+            .forward(xs)?
+            .reshape((batch, len, heads, 2 * dim))?;
         let q = projected.narrow(3, 0, dim)?;
         let gate = projected
             .narrow(3, dim, dim)?
             .reshape((batch, len, heads * dim))?;
 
-        let k = linear(xs, &layer.k_proj)?.reshape((batch, len, kv_heads, dim))?;
-        let v = linear(xs, &layer.v_proj)?.reshape((batch, len, kv_heads, dim))?;
+        let k = layer
+            .k_proj
+            .forward(xs)?
+            .reshape((batch, len, kv_heads, dim))?;
+        let v = layer
+            .v_proj
+            .forward(xs)?
+            .reshape((batch, len, kv_heads, dim))?;
 
         let q = rms_norm(&q, &layer.q_norm, eps)?;
         let k = rms_norm(&k, &layer.k_norm, eps)?;
@@ -639,7 +649,7 @@ impl Backbone {
             .transpose(1, 2)?
             .reshape((batch, len, heads * dim))?;
         let out = (out * candle_nn::ops::sigmoid(&gate)?)?;
-        Ok((linear(&out, &layer.o_proj)?, k, v))
+        Ok((layer.o_proj.forward(&out)?, k, v))
     }
 
     fn recurrence(
@@ -662,7 +672,9 @@ impl Backbone {
         // Queries, keys and values share one projection and one depthwise
         // convolution over time, which is what makes this a *short* convolution
         // in front of the recurrence rather than an attention.
-        let projected = linear(xs, &layer.in_proj_qkv)?
+        let projected = layer
+            .in_proj_qkv
+            .forward(xs)?
             .transpose(1, 2)?
             .contiguous()?;
         // The convolution reaches `kernel - 1` tokens back. At the start of a
@@ -700,14 +712,17 @@ impl Backbone {
         let v = mixed
             .narrow(2, 2 * keys, values)?
             .reshape((batch, len, value_heads, value_dim))?;
-        let z = linear(xs, &layer.in_proj_z)?.reshape((batch, len, value_heads, value_dim))?;
+        let z = layer
+            .in_proj_z
+            .forward(xs)?
+            .reshape((batch, len, value_heads, value_dim))?;
 
         // beta: how strongly this token overwrites the memory. g: how much of
         // the memory survives it, per head. Both in f32, and so is everything
         // downstream of them: the reference's delta rule casts to f32 first, and
         // a decay that is multiplied in hundreds of times is no place to round.
-        let beta = candle_nn::ops::sigmoid(&linear(xs, &layer.in_proj_b)?.to_dtype(DType::F32)?)?;
-        let a = linear(xs, &layer.in_proj_a)?.to_dtype(DType::F32)?;
+        let beta = candle_nn::ops::sigmoid(&layer.in_proj_b.forward(xs)?.to_dtype(DType::F32)?)?;
+        let a = layer.in_proj_a.forward(xs)?.to_dtype(DType::F32)?;
         let decay = (softplus(&a.broadcast_add(&layer.dt_bias)?)?
             .broadcast_mul(&layer.a_log.exp()?)?
             * -1.0)?;
@@ -771,13 +786,13 @@ impl Backbone {
         let out = (out * candle_nn::ops::silu(&z.to_dtype(DType::F32)?)?)?
             .reshape((batch, len, values))?
             .to_dtype(self.dtype)?;
-        Ok((linear(&out, &layer.out_proj)?, kept_window, state))
+        Ok((layer.out_proj.forward(&out)?, kept_window, state))
     }
 
     fn feed_forward(&self, layer: &Layer, xs: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&linear(xs, &layer.gate_proj)?)?;
-        let up = linear(xs, &layer.up_proj)?;
-        Ok(linear(&(gate * up)?, &layer.down_proj)?)
+        let gate = candle_nn::ops::silu(&layer.gate_proj.forward(xs)?)?;
+        let up = layer.up_proj.forward(xs)?;
+        Ok(layer.down_proj.forward(&(gate * up)?)?)
     }
 }
 

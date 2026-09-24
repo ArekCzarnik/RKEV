@@ -27,8 +27,8 @@ use std::time::Instant;
 
 use candle_core::{DType, Device};
 use rkev::{
-    device, pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Score, SystemOneRequest,
-    SystemOneResponse,
+    device, pointer_head, Answer, Backend, Choice, LocalEngine, Noul, Quantisation, Score,
+    SystemOneRequest, SystemOneResponse,
 };
 
 fn main() -> ExitCode {
@@ -58,6 +58,9 @@ struct Options {
     /// Where the backbone runs. Run it once per device to compare them; the rows
     /// themselves say nothing about which device they were measured on.
     device: Device,
+    /// Quantise the projections. Adds a row of its own, since what it buys in
+    /// bandwidth it costs in accuracy, and only both together are an answer.
+    quantise: Option<Quantisation>,
 }
 
 const USAGE: &str = "\
@@ -67,7 +70,8 @@ usage: measure --base <dir> [--checkpoint <dir>] [options]
   --repeat <n>      passes per row, median reported (default 3)
   --words <n>       length of the generated state, in words (default 400)
   --batch <n>       requests in the batched row (default 4)
-  --device <name>   cpu|metal; metal needs --features metal (macOS only)";
+  --device <name>   cpu|metal; metal needs --features metal (macOS only)
+  --quantise <name> q4k|q5k|q6k|q8_0; measured against f32 in the same run";
 
 fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = options.checkpoint.as_deref();
@@ -166,6 +170,35 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => println!("{:<44} {error}", "f16 is unavailable here"),
     }
 
+    // --- what quantising buys, and what it costs ---
+    if let Some(quantisation) = options.quantise {
+        let backend = Backend::open_with(
+            &options.base,
+            checkpoint,
+            options.device.clone(),
+            DType::F32,
+            Some(quantisation),
+        )?;
+        let quantised = LocalEngine::new(
+            backend
+                .with_prefix(true)
+                .with_prefix_min_tokens(0)
+                .with_prefix_cache(0),
+            pointer_head(&head_path)?,
+        );
+        measure(
+            &format!("{quantisation:?}, the state once, nothing kept"),
+            times(&requests[..options.repeat], |r| {
+                quantised.system_one_blocking(r)
+            })?,
+        );
+        println!(
+            "{:<44} {:.5}",
+            format!("{quantisation:?} against f32, largest difference"),
+            difference(&reference, &quantised.system_one_blocking(&requests[0])?)
+        );
+    }
+
     // --- the recurrence, where there is one ---
     if hybrid {
         let backend = Backend::open_as(
@@ -230,6 +263,11 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let (Some(exact), Some(half)) = (find("f32, the state once"), find("f16, the state once")) {
         println!("f16 rather than f32: {:.2}x", exact / half);
+    }
+    if let (Some(exact), Some(quantisation)) = (find("f32, the state once"), options.quantise) {
+        if let Some(packed) = find(&format!("{quantisation:?}, the state once")) {
+            println!("{quantisation:?} rather than f32: {:.2}x", exact / packed);
+        }
     }
     if let (Some(sequential), Some(chunked)) =
         (find("token by token"), find("nothing kept (control)"))
@@ -359,6 +397,7 @@ fn parse() -> Result<Options, String> {
     let mut words = 400usize;
     let mut batch = 4usize;
     let mut chosen = Device::Cpu;
+    let mut quantise = None;
 
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -375,6 +414,9 @@ fn parse() -> Result<Options, String> {
             "--words" => words = value()?.parse().map_err(|e| format!("--words: {e}"))?,
             "--batch" => batch = value()?.parse().map_err(|e| format!("--batch: {e}"))?,
             "--device" => chosen = device(&value()?).map_err(|e| e.to_string())?,
+            "--quantise" | "--quantize" => {
+                quantise = Some(Quantisation::from_name(&value()?).map_err(|e| e.to_string())?)
+            }
             "-h" | "--help" => return Err(String::from("measure")),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -390,5 +432,6 @@ fn parse() -> Result<Options, String> {
         words,
         batch,
         device: chosen,
+        quantise,
     })
 }

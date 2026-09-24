@@ -22,8 +22,8 @@ use std::process::ExitCode;
 
 use candle_core::Device;
 use rkev::{
-    device, option_isolation, pointer_head, Answer, Backend, IndexMap, LocalEngine, Question,
-    SystemOneRequest, SystemOneResponse,
+    device, option_isolation, pointer_head, Answer, Backend, IndexMap, LocalEngine, Quantisation,
+    Question, SystemOneRequest, SystemOneResponse,
 };
 use serde_json::Value;
 
@@ -60,6 +60,8 @@ struct Options {
     json: bool,
     /// Where the backbone runs; the precision follows it.
     device: Device,
+    /// Quantise the projections; what that costs shows up in the accuracy.
+    quantise: Option<Quantisation>,
     /// `--min-accuracy`: a bare value applies to every question, `id=value` to one.
     /// Given both, the named one wins.
     minimum: Vec<(Option<String>, f64)>,
@@ -114,7 +116,16 @@ fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
             .find(|path| path.exists())
             .unwrap_or_else(|| dir.join("head.pt"))
     });
-    let backend = Backend::open_on(&options.base, checkpoint, options.device.clone())?;
+    let backend = match options.quantise {
+        None => Backend::open_on(&options.base, checkpoint, options.device.clone())?,
+        Some(quantise) => Backend::open_with(
+            &options.base,
+            checkpoint,
+            options.device.clone(),
+            candle_core::DType::F32,
+            Some(quantise),
+        )?,
+    };
     let hybrid = backend.is_hybrid();
     let dtype = backend.dtype();
     let mut engine = LocalEngine::new(backend, pointer_head(&head)?);
@@ -654,6 +665,7 @@ usage: eval --base <dir> [--checkpoint <dir>] --records <file.jsonl>
                     a threshold and nothing labelled for it.
   --json            the tallies as JSON instead of a report
   --device          cpu|metal; metal needs --features metal (macOS only)
+  --quantise        q4k|q5k|q6k|q8_0; the accuracy is what it costs
 
 tests/eval/README.md has the record format and what the numbers mean.";
 
@@ -672,6 +684,7 @@ fn parse() -> Result<Options, String> {
         errors: 5,
         json: false,
         device: Device::Cpu,
+        quantise: None,
         minimum: Vec::new(),
     };
 
@@ -698,6 +711,10 @@ fn parse() -> Result<Options, String> {
             }
             "--json" => options.json = true,
             "--device" => options.device = device(&value()?).map_err(|e| e.to_string())?,
+            "--quantise" | "--quantize" => {
+                options.quantise =
+                    Some(Quantisation::from_name(&value()?).map_err(|e| e.to_string())?)
+            }
             "--min-accuracy" => {
                 let given = value()?;
                 let (id, number) = match given.split_once('=') {
