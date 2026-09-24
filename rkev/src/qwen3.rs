@@ -22,7 +22,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::weights::{
     attention_mask, branch_batch_mask, pad_rows, prefill_batch_mask, repeat_kv, rms_norm, rope,
-    rotary_tables, Projection, Quantisation, Weights,
+    rotary_tables, shared_matmul, Projection, Quantisation, Weights,
 };
 
 /// The parts of a Qwen3 `config.json` this backbone needs.
@@ -489,33 +489,54 @@ impl Backbone {
         let k = rope(&k.transpose(1, 2)?, cos, sin)?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        // The state's keys and values sit in front of this pass's, which is what
-        // makes a branch see the whole state and nothing of another branch.
-        let (keys, values) = match past {
-            None => (k.clone(), v.clone()),
-            Some((past_k, past_v)) => {
-                let widen = |t: &Tensor| -> Result<Tensor> {
-                    let (_, heads, state, dim) = t.dims4()?;
-                    Ok(t.expand((batch, heads, state, dim))?.contiguous()?)
-                };
-                (
-                    Tensor::cat(&[widen(past_k)?, k.clone()], 2)?.contiguous()?,
-                    Tensor::cat(&[widen(past_v)?, v.clone()], 2)?.contiguous()?,
-                )
-            }
-        };
-
         let repeats = heads / kv_heads;
         let scale = 1.0 / (dim as f64).sqrt();
-        let scores = (q.matmul(&repeat_kv(&keys, repeats)?.transpose(2, 3)?)? * scale)?;
+
+        // The state's keys sit in front of this pass's, which is what makes a branch
+        // see the whole state and nothing of another branch. Scored in two pieces
+        // rather than concatenated: the state is one tensor shared by every row of
+        // the batch, and materialising it per row is what used to cost a branch pass
+        // most of its time.
+        let branch_keys = repeat_kv(&k, repeats)?;
+        let scores = match past {
+            None => q.matmul(&branch_keys.transpose(2, 3)?)?,
+            Some((past_k, _)) => {
+                let state = repeat_kv(past_k, repeats)?.transpose(2, 3)?.contiguous()?;
+                Tensor::cat(
+                    &[
+                        shared_matmul(&q, &state)?,
+                        q.matmul(&branch_keys.transpose(2, 3)?)?,
+                    ],
+                    3,
+                )?
+            }
+        };
+        let scores = (scores * scale)?;
         // The mask is what keeps one question from reading another.
         let scores = scores.broadcast_add(mask)?;
         // The reference takes the softmax in f32 whatever the backbone runs in.
         let weights = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
             .to_dtype(self.dtype)?;
 
-        let out = weights
-            .matmul(&repeat_kv(&values, repeats)?)?
+        // And the same split on the way out: a matmul distributes over the
+        // concatenation, so the state's values are read where they lie.
+        let branch_values = repeat_kv(&v, repeats)?;
+        let attended = match past {
+            None => weights.matmul(&branch_values)?,
+            Some((_, past_v)) => {
+                let state = repeat_kv(past_v, repeats)?;
+                let tokens = state.dim(2)?;
+                let from_state =
+                    shared_matmul(&weights.narrow(3, 0, tokens)?.contiguous()?, &state)?;
+                let from_branch = weights
+                    .narrow(3, tokens, len)?
+                    .contiguous()?
+                    .matmul(&branch_values)?;
+                (from_state + from_branch)?
+            }
+        };
+
+        let out = attended
             .transpose(1, 2)?
             .reshape((batch, len, heads * dim))?;
         Ok((layer.o_proj.forward(&out)?, k, v))

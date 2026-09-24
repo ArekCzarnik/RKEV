@@ -416,6 +416,40 @@ pub(crate) fn rms_norm(xs: &Tensor, weight: &Tensor, eps: f64) -> candle_core::R
     candle_nn::ops::rms_norm(&xs.contiguous()?, weight, eps as f32)
 }
 
+/// `lhs @ rhs` where every row of the batch shares the same `rhs`:
+/// `[batch, heads, rows, inner]` against `[1, heads, inner, cols]`.
+///
+/// The obvious spellings both copy the shared side once per row.
+/// `broadcast_matmul` concretises the broadcast (candle says so in a TODO), and
+/// expanding it by hand before `cat` does the same — which for a state's keys and
+/// values is what a branch pass spends its time on: at 571 state tokens and 28
+/// layers that is hundreds of megabytes of memcpy per request, five times over for
+/// five questions.
+///
+/// Folding the batch into the row dimension instead copies only the small side: the
+/// matmul becomes `[heads, batch * rows, inner] @ [heads, inner, cols]`, and the
+/// state is read in place.
+pub(crate) fn shared_matmul(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+    let (batch, heads, rows, inner) = lhs.dims4()?;
+    let (shared, rhs_heads, rhs_inner, cols) = rhs.dims4()?;
+    if shared != 1 || rhs_heads != heads || rhs_inner != inner {
+        return Err(Error::Engine(format!(
+            "a shared matmul wants [1, {heads}, {inner}, cols] on the right, got {:?}",
+            rhs.dims()
+        )));
+    }
+    let folded = lhs
+        .transpose(0, 1)?
+        .contiguous()?
+        .reshape((heads, batch * rows, inner))?;
+    let shared = rhs.reshape((heads, inner, cols))?;
+    Ok(folded
+        .matmul(&shared)?
+        .reshape((heads, batch, rows, cols))?
+        .transpose(0, 1)?
+        .contiguous()?)
+}
+
 /// Grouped-query attention: every key/value head serves `n` query heads.
 pub(crate) fn repeat_kv(xs: &Tensor, n: usize) -> candle_core::Result<Tensor> {
     if n == 1 {
