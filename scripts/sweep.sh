@@ -75,6 +75,49 @@ command -v cargo >/dev/null 2>&1 || {
     exit 127
 }
 
+# What is in those directories, checked before anything is compiled. Ten runs that
+# all die on the same missing file are ten wasted builds and a summary that reads
+# like a finding.
+lacks() {
+    echo "error: $1" >&2
+    shift
+    while [ $# -gt 0 ]; do
+        echo "       $1" >&2
+        shift
+    done
+    exit 1
+}
+contents() {
+    local listing
+    listing="$(ls -1 "$1" 2>/dev/null | head -6 | tr '\n' ' ')"
+    echo "it holds: ${listing:-<nothing>}"
+}
+
+[ -f "$base/config.json" ] || lacks \
+    "no config.json in $base" \
+    "--base is the base model: config.json and its safetensors." \
+    "$(contents "$base")"
+ls "$base"/*.safetensors >/dev/null 2>&1 || lacks \
+    "no safetensors in $base" \
+    "A sharded base model has model-00001-of-*.safetensors and an index." \
+    "$(contents "$base")"
+
+if [ -n "$checkpoint" ]; then
+    [ -f "$checkpoint/adapter_config.json" ] || lacks \
+        "no adapter_config.json in $checkpoint" \
+        "--checkpoint is the Kev checkpoint: adapter_config.json," \
+        "adapter_model.safetensors, head.pt, and usually a tokenizer." \
+        "$(contents "$checkpoint")" \
+        "" \
+        "If the weights are already merged into --base, leave --checkpoint out." \
+        "If it was never downloaded: scripts/local.sh --fetch jaredpalmer/kev-0.6b"
+    [ -f "$checkpoint/head.pt" ] || [ -f "$checkpoint/head.safetensors" ] || lacks \
+        "no head.pt in $checkpoint" \
+        "A Kev checkpoint is an adapter plus a pointer head, and the answers" \
+        "come out of the head." \
+        "$(contents "$checkpoint")"
+fi
+
 model=(--base "$base")
 [ -n "$checkpoint" ] && model+=(--checkpoint "$checkpoint")
 
@@ -97,6 +140,7 @@ run() {
     fi
     failed="${failed}${failed:+ | }${label}"
     echo "!!!!!!!!!! $label did not finish" | tee -a "$out"
+    return 1
 }
 
 # The same, for a step whose non-zero exit is a verdict rather than a fault:
@@ -140,13 +184,58 @@ run_verdict() {
 } | tee -a "$out"
 
 # ---------------------------------------------------------------------------
+# What to read, and what to send on
+# ---------------------------------------------------------------------------
+
+summarise() {
+{
+    echo ""
+    echo "########## the lines worth quoting"
+    grep -E "^(#########|attention-only base|hybrid base|.*rather than f32|.*against f32, largest difference|the cache saves|running the state once|the delta rule in chunks|[0-9]+ of [0-9]+ obvious cases|[0-9]+ of [0-9]+ with the head)" "$out" \
+        | sed 's/^##########/--/'
+    echo ""
+    if [ -n "$failed" ]; then
+        echo "did not finish: $failed"
+        case "$failed" in
+            *q4k*|*q5k*|*q6k*|*q8_0*)
+                echo "For a quantised run, the refusal is often the answer: a projection whose"
+                echo "row does not divide by the block size says so by name, and q8_0 packs 32"
+                echo "where the k-quants pack 256."
+                ;;
+        esac
+    else
+        echo "every run finished."
+    fi
+    if [ -n "$said_no" ]; then
+        echo ""
+        echo "not convinced: $said_no"
+        echo "Those runs finished and said no: the checkpoint missed more than one of the"
+        echo "obvious cases. On made-up weights that is expected; on a real checkpoint it"
+        echo "is the finding, and reading it beats reading the timings above it."
+    fi
+    echo ""
+    echo "the whole log: $out"
+} | tee -a "$out.summary"
+
+cat "$out.summary" >> "$out"
+rm -f "$out.summary"
+}
+# ---------------------------------------------------------------------------
 # CPU
 # ---------------------------------------------------------------------------
 
 if [ "$skip_cpu" -eq 0 ]; then
-    run "cpu, dense" \
+    # If the baseline cannot run, nothing below it can either, and repeating the
+    # same failure nine times buries the one line that matters.
+    if ! run "cpu, dense" \
         cargo run --release --example measure -- \
-        "${model[@]}" --repeat "$repeat" --words "$words"
+        "${model[@]}" --repeat "$repeat" --words "$words"; then
+        echo "" | tee -a "$out"
+        echo "stopping: the plain CPU run did not get through, so the rest would fail" \
+            "the same way. The line above it says why." | tee -a "$out"
+        summarise
+        exit 1
+    fi
 
     for stage in $stages; do
         run "cpu, $stage" \
@@ -189,35 +278,6 @@ if [ "$skip_metal" -eq 0 ]; then
     fi
 fi
 
-# ---------------------------------------------------------------------------
-# What to read, and what to send on
-# ---------------------------------------------------------------------------
 
-{
-    echo ""
-    echo "########## the lines worth quoting"
-    grep -E "^(#########|attention-only base|hybrid base|.*rather than f32|.*against f32, largest difference|the cache saves|running the state once|the delta rule in chunks|[0-9]+ of [0-9]+ obvious cases|[0-9]+ of [0-9]+ with the head)" "$out" \
-        | sed 's/^##########/--/'
-    echo ""
-    if [ -n "$failed" ]; then
-        echo "did not finish: $failed"
-        echo "A refusal here is usually the answer rather than a fault: quantisation is"
-        echo "f32-and-CPU only, and a projection whose row does not divide by the block"
-        echo "size says so by name."
-    else
-        echo "every run finished."
-    fi
-    if [ -n "$said_no" ]; then
-        echo ""
-        echo "not convinced: $said_no"
-        echo "Those runs finished and said no: the checkpoint missed more than one of the"
-        echo "obvious cases. On made-up weights that is expected; on a real checkpoint it"
-        echo "is the finding, and reading it beats reading the timings above it."
-    fi
-    echo ""
-    echo "the whole log: $out"
-} | tee -a "$out.summary"
-
-cat "$out.summary" >> "$out"
-rm -f "$out.summary"
+summarise
 [ -z "$failed" ]
