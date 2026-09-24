@@ -1,10 +1,10 @@
 # 2026-09-24 — Bugfixes und Optimierungen
 
 Aus einer Durchsicht der Hot-Path-Module (`qwen3.rs`, `qwen3_5.rs`,
-`weights.rs`, `backend.rs`). Die Gewinne unten sind **geschätzt, nicht
-gemessen** — jede Optimierung gilt erst, wenn `scripts/sweep.sh` bzw.
-`examples/measure` sie auf einem echten Checkpoint zeigt und die Antworten
-gleich bleiben.
+`weights.rs`, `backend.rs`). Die Zahlen unten sind **isoliert oder an Fixtures
+in einem geteilten Linux-Container gemessen** — jede Optimierung gilt erst,
+wenn `scripts/sweep.sh` bzw. `examples/measure` sie auf einem echten Checkpoint
+zeigt und die Antworten gleich bleiben (siehe „Auf dem Mac zu messen“).
 
 ## Fortschritt
 
@@ -14,10 +14,10 @@ gleich bleiben.
 - ✅ Task 4: GQA ohne `repeat_kv`, State-Keys vortransponiert
 - ✅ Task 5: Prefill ohne verworfene Arbeit im letzten Layer
 - ✅ Task 6: Letzter Layer nur an den Readout-Positionen
-- ⬜ Task 7: Projektionen beim Laden zusammenlegen
+- 🔄 Task 7: Projektionen beim Laden zusammenlegen (Branch `perf/fused-projections`, Messung auf dem Mac offen)
 - ✅ Task 8: q statt Scores skalieren
 - ✅ Task 9: Maske nur auf den Branch-Teil der Scores
-- ⬜ Task 10: Qwen3-Prefix-Messung misst den Packed-Pass
+- ✅ Task 10: Qwen3-Prefix-Messung misst den Packed-Pass
 
 ## Bugs
 
@@ -137,6 +137,11 @@ baut die Fixture mit getauschten Layern.
 Quantisierung zu je einer Projektion zusammenfügen. Weniger Kernel-Aufrufe,
 `xs` wird einmal gelesen. Auf der CPU klein, auf Metal vermutlich mehr.
 
+**Umgesetzt auf `perf/fused-projections`, nicht gemergt** — der Stand und die
+Messungen stehen dort in dieser Datei. Kurz: `gate+up` und `k+v` fusioniert,
+exakt und getestet, aber in diesem Container kein Gewinn vom Rauschen zu
+trennen. Der Test-Adapter für `v_proj`/`up_proj` ist schon auf `main`.
+
 ### Task 8: q statt Scores skalieren
 
 `scores * scale` skaliert `[batch, heads, len, state+len]`; q vor dem Matmul zu
@@ -181,6 +186,27 @@ Ohne Maske, oder ohne Kausalität in der Maske, schlagen die Tests fehl.
 unter der Schwelle von 384, ohne `with_prefix_min_tokens(0)` — die Zeilen
 „cache hit“ und „new state, prefilled“ messen beide den Packed-Pass. Genau die
 Falle, vor der `examples/measure.rs` sich schützt.
+
+**Erledigt.** Beide Prefix-Zeilen setzen `with_prefix_min_tokens(0)`. Vorher
+9,3 / 9,7 / 10,0 ms (Hit / neuer State / Packed — dreimal der Packed-Pass),
+nachher 4,6–5,3 / 11,5–12,9 / 9,9–10,0 ms: ein Miss kostet, ein Hit spart etwa
+die Hälfte, dasselbe Bild wie auf dem echten Checkpoint.
+
+## Auf dem Mac zu messen
+
+Alles oben ist in einem geteilten Linux-Container gemessen (aarch64, Last von
+außen), und nur isoliert oder an Fixtures. Offen, in dieser Reihenfolge:
+
+1. **Der Stand von `main` auf `kev-0.6b`**, gegen die Zahlen vom 2026-09-24 in
+   CLAUDE.md (CPU packed 2952 ms, Miss 3681, Hit 1394; Metal 605/529):
+   `scripts/local.sh --checkpoint ~/models/kev-0.6b --measure` (läuft auch
+   `sanity`, das die Pfade gegeneinander prüft). Tasks 4, 5, 6, 8, 9 sind
+   einzeln exakt bzw. auf 1e-5 geprüft, aber zusammen nie auf echten Gewichten
+   gelaufen.
+2. **Task 7:** `perf/fused-projections` gegen `main`, beide mit
+   `examples/measure`, und
+   `cargo test --release --lib what_fusing_the_projections_is_worth -- --ignored --nocapture`.
+3. **Task 3:** Accelerate als Feature einbauen und genauso messen.
 
 ## Bewusst nicht angefasst
 
