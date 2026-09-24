@@ -1,4 +1,4 @@
-# kevexample — Kev in Rust
+# RKEV 1.0p -> Kev in Rust
 
 Eine vollständige lokale Inferenz-Engine für
 [Kev](https://github.com/jaredpalmer/kev), die kleinen Entscheidungsmodelle, die
@@ -13,8 +13,8 @@ ausführliche, englische Dokumentation des Crates steht in
 
 ## Was Kev macht
 
-Du schickst einen **State** — ein Ticket, ein Dokument, beliebigen Text oder JSON
-— und dazu eine Menge **Fragen**. Zurück kommen Wahrscheinlichkeiten statt eines
+Du schickst einen **State** , ein Ticket, ein Dokument, beliebigen Text oder JSON
+, und dazu eine Menge **Fragen**. Zurück kommen Wahrscheinlichkeiten statt eines
 einzelnen Labels. Die Fragen teilen sich den State, können einander aber nicht
 lesen.
 
@@ -29,20 +29,20 @@ Drei Fragetypen:
 Kev **generiert nichts**. Ein Checkpoint ist ein LoRA-Adapter über einer
 Qwen-Basis plus ein kleiner *Pointer-Head*: die Antwort entsteht daraus, dass die
 Hidden States der Options-Enden gegen den `<decide>`-Token bewertet werden. Genau
-deshalb kann keine Text-Generierungs-Engine diese Modelle bedienen — gebraucht
+deshalb kann keine Text-Generierungs-Engine diese Modelle bedienen , gebraucht
 werden Hidden States, nicht Logits.
 
 ## Vom Ticket zur Antwort: der Weg von Kev nach Qwen
 
 Vier Schritte, vier Module. Jeder Schritt ist im Code an einer Stelle, und die
-Reihenfolge ist immer dieselbe — es gibt keine Schleife und keine Generierung.
+Reihenfolge ist immer dieselbe , es gibt keine Schleife und keine Generierung.
 
 ### 1. Anfrage → Text (`kev-client/src/prompt.rs`)
 
 Der State wird zu Text. Ein String bleibt, wie er ist; ein JSON-Objekt wird zu
 `schlüssel: wert` pro Zeile, eine Liste zu `- eintrag`, verschachteltes eingerückt.
 Bei Skalaren zählt die Schreibweise: `True` und `False` statt `true`/`false`, und
-`null` wird zu **nichts** — also `schlüssel: ` mit leerem Wert. Das ist kein
+`null` wird zu **nichts** , also `schlüssel: ` mit leerem Wert. Das ist kein
 Geschmack, sondern Bedingung: die Referenz-Implementierung (siehe *Herkunft*) baut
 genau diesen Text, und ein anderer Text ist eine andere Antwort.
 `tests/upstream_unit.rs` hält sechs dieser Ausgaben an deren eigenen Testfällen
@@ -54,14 +54,14 @@ Optionen sind:
 
 | Typ | Optionen im Prompt | Schlüssel in der Antwort |
 |---|---|---|
-| `noul` | zwei, `no` und `yes` (plus deren Beschreibungen) | `false`, `true` — die Antwort ist die Wahrscheinlichkeit der zweiten |
+| `noul` | zwei, `no` und `yes` (plus deren Beschreibungen) | `false`, `true` , die Antwort ist die Wahrscheinlichkeit der zweiten |
 | `choice` | deine Optionen, in deiner Reihenfolge | die Optionsnamen |
 | `score` | die Stufenbeschreibungen, niedrigste zuerst | die Stufenindizes `0`, `1`, … |
 
 ### 2. Text → Tokens (`kev-client/src/encode.rs`)
 
 Fünf selten benutzte Qwen-Spezialtokens dienen als Trennzeichen, damit keine
-Embedding-Zeilen dazukommen müssen — der LoRA-Adapter gibt ihnen ihre Bedeutung:
+Embedding-Zeilen dazukommen müssen , der LoRA-Adapter gibt ihnen ihre Bedeutung:
 
 | Rolle | Token |
 |---|---|
@@ -83,7 +83,7 @@ Drei Dinge entstehen hier mit:
 
 - **Die Maske.** Ein Token darf den State und seine eigene Frage lesen, sonst
   nichts. Deshalb braucht ein Backend `Pass::attends` und keine gewöhnliche
-  kausale Maske — nur so können die Fragen einander nicht lesen.
+  kausale Maske , nur so können die Fragen einander nicht lesen.
 - **Die Positionen.** Jeder Zweig fängt direkt hinter dem State wieder an. Der
   State wird also einmal verarbeitet, egal wie viele Fragen mitkommen.
 - **Die Ableseplätze.** Pro Frage der Index ihres `<decide>` und die Indizes
@@ -101,7 +101,7 @@ Hier fängt Qwen an. `Backend` setzt drei Dinge zusammen:
 1. den **Tokenizer** des Checkpoints (Truncation und Padding ausdrücklich aus,
    wie es transformers bei jedem Aufruf macht),
 2. die **Basisgewichte** aus den safetensors, mit dem **LoRA-Adapter des
-   Checkpoints hineingerechnet** — in f32, *bevor* in die Rechengenauigkeit
+   Checkpoints hineingerechnet** , in f32, *bevor* in die Rechengenauigkeit
    gecastet wird (`src/weights.rs`),
 3. das **Backbone**, das aus der `config.json` der Basis folgt: `qwen3.rs` für
    die reinen Attention-Modelle, `qwen3_5.rs` für die hybriden mit Gated
@@ -116,16 +116,16 @@ Wie er läuft, hängt von der Basis ab:
 - **Attention-only:** ein einziger Pass über das ganze Layout, mit der Maske aus
   Schritt 2 als additiver Maske und den Positionen als `position_ids`.
 - **Hybrid (Qwen3.5):** welche Layer eine Rekurrenz sind, sagt `layer_types` in
-  der `config.json` — bei den veröffentlichten Basen sind es drei von vier. Und
+  der `config.json` , bei den veröffentlichten Basen sind es drei von vier. Und
   eine Rekurrenz kann man nicht bitten, die Tokens einer anderen Frage zu
   überspringen: sie läuft die Tokens ab. Deshalb wird pro Frage eine eigene
-  kausale Zeile gerechnet — State, dann ihr Zweig. Das ist exakt statt maskiert
+  kausale Zeile gerechnet , State, dann ihr Zweig. Das ist exakt statt maskiert
   und genau das, was die Referenz dort auch tut.
 
 Im Layout steht der State ohnehin nur einmal. Als **eigener** Pass, von dem die
 Fragen dann fortsetzen, läuft er, wenn es sich lohnt: auf einer rekurrenten Basis
 immer (sonst würde jede Frage den ganzen State erneut ablaufen), auf einer
-attention-only ab 384 State-Tokens — darunter spart es nichts, weil der gepackte
+attention-only ab 384 State-Tokens , darunter spart es nichts, weil der gepackte
 Pass den State schon einmal rechnet. Fortgesetzt wird bei Attention über die
 gespeicherten Keys und Values, bei der Rekurrenz über Zustandsmatrix und
 Faltungsfenster. Die letzten vier Zustände bleiben über Anfragen hinweg im Cache,
@@ -146,13 +146,13 @@ p      = softmax(logits)                        (in f32)
 `d` ist die Pointer-Dimension, `T` die Temperatur, die im `head.pt` mitgespeichert
 ist. Aus der Verteilung wird die Antwort:
 
-- `noul`: `p(yes)`, und keine Confidence — die Wahrscheinlichkeit *ist* die
+- `noul`: `p(yes)`, und keine Confidence , die Wahrscheinlichkeit *ist* die
   Antwort.
 - `choice`: die wahrscheinlichste Option, Confidence `(p_max − 1/K)/(1 − 1/K)`.
 - `score`: der mittlere Stufenindex, Confidence `1 − E|Stufe − Modus|/(L−1)`.
 
 Alles auf vier Dezimalen gerundet, wie in der Referenz. Die Confidence ist ein Maß
-für die *Form* der Verteilung, keine gemessene Trefferquote — TypeSafes
+für die *Form* der Verteilung, keine gemessene Trefferquote , TypeSafes
 API-Dokumentation definiert sie nicht, diese Formeln sind die der Referenz, und
 `tests/upstream_unit.rs` hält sie an deren eigenen Testfällen fest.
 
@@ -183,7 +183,7 @@ SystemOneResponse
 | `pointer_head(&kopf)` | `head.pt` lesen: die zwei Projektionen **und** die Temperatur (Schritt 4) |
 | `option_isolation(&kopf)` | fragt den Checkpoint, für welches Layout er trainiert wurde; das falsche zu servieren wäre ein leise anderer Prompt |
 | `LocalEngine::new(…)` | verbindet beide Hälften; `Clone` ist billig, das Modell wird nicht zweimal geladen |
-| `SystemOneRequest::new(text)` | der State — hier ein deutscher String, also geht er unverändert in Schritt 1 |
+| `SystemOneRequest::new(text)` | der State , hier ein deutscher String, also geht er unverändert in Schritt 1 |
 | `.ask("abteilung", Choice::new(…).option("versand", …))` | wird zu `<q> Anweisungen <opt> versand: Lieferstatus… </opt> … <decide>` |
 | `.ask("eskalation", Noul::new(…))` | wird zu zwei Optionen, `no` und `yes` |
 | `.ask("verärgerung", Score::new(…).level("ruhig"))` | wird zu einer Option pro Stufe, niedrigste zuerst |
@@ -199,16 +199,16 @@ Zwei Dinge sind deshalb im Beispiel deutsch und nicht nur der Ticket-Text:
   messen, das so niemand ausliefert.
 
 Und weil die Namen mit der Sprache wechseln, prüft das Beispiel die **Position**
-der Option (`probabilities.get_index`), nicht ihren Namen — nur so lässt sich
+der Option (`probabilities.get_index`), nicht ihren Namen , nur so lässt sich
 dieselbe Erwartung an beide Sprachen stellen.
 
 Was es *nicht* benutzt, damit der Weg sichtbar bleibt: kein async, kein Batching,
 keine Permutation, keine Cache-Einstellungen. Nur die Genauigkeit kommt
-vom Gerät — auf einer CPU f32, wie es `kev.serve` dort auch tut.
+vom Gerät , auf einer CPU f32, wie es `kev.serve` dort auch tut.
 
 ## Schnellstart
 
-Ein Skript holt einen Checkpoint (mit `curl` — das `hf`-CLI ist selbst Python) und
+Ein Skript holt einen Checkpoint (mit `curl` , das `hf`-CLI ist selbst Python) und
 prüft danach alles, woran ein Checkpoint allein gemessen werden kann:
 
 ```bash
@@ -244,7 +244,7 @@ Das Ticket nennt absichtlich drei Abteilungen gleichzeitig; bei eindeutigen
 Tickets sitzt dieses Modell auf 1.00.
 
 Ob die Checkpoints auf **deutschen** Texten genauso zuverlässig sind, ist nicht
-vorhergesagt, sondern messbar — die Checkpoints sind auf englischen Daten
+vorhergesagt, sondern messbar , die Checkpoints sind auf englischen Daten
 veröffentlicht, die Qwen-Basis ist mehrsprachig:
 
 ```bash
@@ -253,7 +253,7 @@ cargo run --release --example deutsch -- \
 ```
 
 Ein deutsches Ticket mit allen drei Fragetypen, danach sieben Fälle, deren
-Antwort nicht in Frage steht — und mit `--vergleich` dieselben Inhalte auf
+Antwort nicht in Frage steht , und mit `--vergleich` dieselben Inhalte auf
 englisch in der Spalte daneben. Verglichen wird über die Position der Option,
 nicht über ihren Namen: Optionsnamen stehen im Prompt (`name: beschreibung`) und
 sind damit Teil der Sprache. Die Zufallslinie steht unter der Tabelle, damit eine
@@ -295,14 +295,14 @@ let request = SystemOneRequest::new("Schuhe zwei Wochen zu spät und in der fals
 let response = engine.system_one_blocking(&request)?;   // oder .system_one(..).await
 ```
 
-Ein asynchroner Aufrufer nimmt `engine.system_one(&request).await` — das schiebt
+Ein asynchroner Aufrufer nimmt `engine.system_one(&request).await` , das schiebt
 den Pass vom Runtime-Thread weg, weil ein Forward-Pass CPU-gebunden ist.
 `LocalEngine` ist billig zu klonen, und Klone teilen das eine geladene Modell.
 
 ## Auf deinen eigenen Tickets messen
 
-Parität fragt, ob diese Engine der Referenz gleicht. Die andere Frage — und die,
-die entscheidet, ob ein Checkpoint dir etwas nützt — ist: wie oft hat er auf
+Parität fragt, ob diese Engine der Referenz gleicht. Die andere Frage , und die,
+die entscheidet, ob ein Checkpoint dir etwas nützt , ist: wie oft hat er auf
 *deinen* Tickets recht, und zwar so, dass du darauf routen kannst?
 
 ```bash
@@ -323,12 +323,12 @@ Zeile:
 `state` ist Text oder beliebiges JSON, wie in einer Anfrage. `labels` hält, was du
 für richtig hältst: bei `choice` den Optionsnamen, bei `noul` `true`/`false`, bei
 `score` den Stufenindex oder die Stufenbeschreibung. Eine Frage, die du wegläßt,
-wird für den Record nicht gewertet — ein teilweise beschrifteter Satz ist also
+wird für den Record nicht gewertet , ein teilweise beschrifteter Satz ist also
 brauchbar. Ein Label für eine Frage, die es nicht gibt, ist dagegen ein Fehler und
 keine stille Null: ein Tippfehler in einer Frage-Id sähe sonst wie eine perfekte
 Trefferquote auf nichts aus.
 
-Berichtet wird pro Frage das Maß, das zum Typ passt — Trefferquote bei `choice`
+Berichtet wird pro Frage das Maß, das zum Typ passt , Trefferquote bei `choice`
 samt Verwechslungen zwischen den Optionen, Trefferquote bei 0.5 plus die Trennung
 beider Klassen und die AUC bei `noul`, nächstliegende Stufe plus mittlerer
 absoluter Fehler bei `score`:
@@ -343,7 +343,12 @@ verärgerung      score        96     62.5%  mean absolute error 0.44 levels
 Und dann der Teil, für den ein Entscheidungsmodell überhaupt da ist: **Trefferquote
 nach Sicherheit.** Daraus kommt die Schwelle, über der du automatisch routen und
 unter der du an einen Menschen geben kannst. `--errors <n>` zeigt die sichersten
-Fehlgriffe — dort steckt meist die Formulierung einer Frage, nicht das Modell.
+Fehlgriffe , dort steckt meist die Formulierung einer Frage, nicht das Modell.
+
+`scripts/local.sh --records tickets.jsonl --questions q.json` hängt denselben
+Schritt an alles andere an, nach den Prüfungen und vor den Zeitmessungen — eine
+niedrige Trefferquote ist dort **kein** Fehlschlag, nur ein Satz, der sich nicht
+lesen ließ.
 
 Die Zahlen oben sind eine Formatillustration, kein gemessener Lauf. Sechs
 Beispiel-Records und die passende Fragendatei liegen in `kev-client/tests/eval/`,
@@ -357,10 +362,10 @@ Auswertung maschinenlesbar aus, und die Batch-Größe ändert die Zahlen nicht (
 |---|---|---|
 | `candle` (Standard) | das Modell selbst: beide Qwen-Generationen | candle 0.9, tokenizers, zip |
 | `local` | Prompt, Token-Layout, Pointer-Head, `LocalEngine`; `Forward` bleibt dir | tokio (nur `spawn_blocking`) |
-| — | die Wire-Format-Typen, die Fehler, die `SystemOne`-Naht | nichts |
+| , | die Wire-Format-Typen, die Fehler, die `SystemOne`-Naht | nichts |
 
 Ohne jedes Feature (`--no-default-features`) bleibt also genau das, was ein
-Aufrufer braucht, um mit etwas anderem zu reden — oder um eine Aufzeichnung zu
+Aufrufer braucht, um mit etwas anderem zu reden , oder um eine Aufzeichnung zu
 halten. MSRV ist 1.75 ohne `candle`, mit `candle` dessen eigener Wert.
 
 ## Beispiele
@@ -369,9 +374,9 @@ Alle in `kev-client/examples/`:
 
 | Beispiel | Wofür | Braucht |
 |---|---|---|
-| `decide` | Anfragen beantworten — der Server-Job im eigenen Prozess | Checkpoint |
+| `decide` | Anfragen beantworten , der Server-Job im eigenen Prozess | Checkpoint |
 | `sanity` | prüft die Engine gegen sich selbst und gegen eindeutige Fälle | Checkpoint |
-| `measure` | f16 gegen f32, Prefix-Cache, Chunking, Batching — mit Kontrollzeilen | Checkpoint |
+| `measure` | f16 gegen f32, Prefix-Cache, Chunking, Batching , mit Kontrollzeilen | Checkpoint |
 | `parity` | vergleicht jede Wahrscheinlichkeit mit einer aufgezeichneten Server-Antwort | Aufzeichnung |
 | `deutsch` | ein deutsches Ticket mit allen drei Fragetypen, und mit `--vergleich` dieselben Inhalte auf englisch daneben | Checkpoint |
 | `eval` | Trefferquote und Kalibrierung auf deinen eigenen beschrifteten Tickets | Checkpoint + Records |
@@ -383,6 +388,8 @@ scripts/test.sh                                 # fmt, clippy, Tests, Feature-Ma
 scripts/local.sh                                # die Offline-Suite allein
 scripts/local.sh --fetch jaredpalmer/kev-0.6b   # Checkpoint holen, dann alles prüfen
 scripts/local.sh --checkpoint <dir> --measure   # dazu die Zeitmessungen
+scripts/local.sh --checkpoint <dir> \
+    --questions q.json --records tickets.jsonl  # dazu deine eigenen Tickets
 scripts/parity.sh --base <dir> --checkpoint <dir>    # gegen einen Server aufzeichnen
 scripts/parity.sh --check-only --base <dir> --checkpoint <dir>   # und offline nachprüfen
 ```
@@ -419,7 +426,7 @@ Was geprüft ist:
   `option_isolation`, und die verschiedenen Pfade stimmen auf fünf Dezimalen
   überein.
 - Geschwindigkeit: State-Prefix mit Cache, gebatchte Zweige, gebatchte Prefills,
-  Delta-Rule in Chunks von 64 Tokens. Alles exakt — die Tests verlangen
+  Delta-Rule in Chunks von 64 Tokens. Alles exakt , die Tests verlangen
   identische Antworten.
 
 Was offen ist:
@@ -434,24 +441,24 @@ Was offen ist:
   Meldung abgelehnt statt tief in einer Projektion zu scheitern; f16 ist die
   reduzierte Präzision, die eine CPU kann.
 - Vom hybriden Qwen3.5-Pfad ist die Arithmetik geprüft, aber noch **kein echter
-  hybrider Checkpoint geladen** — der echte Lauf war ein attention-only Modell.
+  hybrider Checkpoint geladen** , der echte Lauf war ein attention-only Modell.
 - Nichts ist quantisiert, und außer der CPU ist kein Gerät gelaufen.
 
 
 ### Wie Fehler laut werden
 
-Ein falsch geladener Checkpoint rechnet weiter und antwortet plausibel — das ist
+Ein falsch geladener Checkpoint rechnet weiter und antwortet plausibel , das ist
 die gefährliche Sorte Fehler. Die Stellen, an denen das möglich war, weigern sich
 inzwischen:
 
 - **Ein Adapter-Tensor, den der Merge nie anfasst, verhindert das Laden.** Das war
   die leiseste Art, ein falsches Modell zu servieren: `weights.rs` sucht die
   LoRA-Gewichte unter pefts Namensschema `base_model.model.<pfad>`, und was es
-  dort nicht findet, wurde einfach nicht gemergt — das Modell lief weiter, jede
+  dort nicht findet, wurde einfach nicht gemergt , das Modell lief weiter, jede
   Antwort sah vernünftig aus, die Zahlen waren die eines anderen Modells. Jetzt
   muss **jeder** Tensor der Adapterdatei verbraucht sein. Betrifft er ein Gewicht,
   das das Backbone liest, ist es ein Fehler mit Namen; betrifft er ein Modul, das
-  hier gar nicht läuft (einen Vokabular-Head etwa — Kevs Antworten gehen durch
+  hier gar nicht läuft (einen Vokabular-Head etwa , Kevs Antworten gehen durch
   keinen), eine Warnung. `KEV_ALLOW_UNUSED=1` hebt die Weigerung auf, wenn du die
   Namen gelesen und entschieden hast.
 - **Truncation und Padding des Tokenizers** sind ausdrücklich abgeschaltet, wie es
@@ -467,18 +474,18 @@ inzwischen:
 
 - **Die Orientierung des Pointer-Heads ist empirisch abgesichert.** Welche
   Projektion `<decide>` liest und welche jedes `</opt>`, steht nur in den Namen `q`
-  und `k` — vertauscht ergibt der Head eine andere, genauso plausible Verteilung,
+  und `k` , vertauscht ergibt der Head eine andere, genauso plausible Verteilung,
   und keine Form- oder Konsistenzprüfung kann das unterscheiden, weil beide Seiten
   jedes Vergleichs gleich vertauscht wären. Ein *trainierter* Head kann es:
   `examples/sanity.rs` beantwortet die eindeutigen Fälle zusätzlich mit
   `PointerHead::swapped()` und stellt beide Trefferzahlen nebeneinander. Kostet das
   Vertauschen nichts, sagt es das ausdrücklich, statt ein Ergebnis vorzutäuschen.
   Dazu wird eine `head.pt` mit mehr als zwei Projektionen abgelehnt, und ebenso
-  eine mit zwei Kandidaten für denselben Namen — sonst entschiede die Reihenfolge
+  eine mit zwei Kandidaten für denselben Namen , sonst entschiede die Reihenfolge
   in der Datei, welche Projektion welchen Zustand liest.
 
 Was dann noch übrig bleibt und **nur** eine Aufzeichnung fangen kann: eine
-numerische Abweichung ohne jedes lokale Symptom — etwa ob die Referenz an einer
+numerische Abweichung ohne jedes lokale Symptom , etwa ob die Referenz an einer
 Stelle rundet, wo dieser Code es nicht tut, oder ein Konfigurationsfeld anders
 auslegt. Das ist ein Lesefehler in einem Port, und dagegen hilft nur, die Zahlen
 einmal nebeneinanderzulegen.
@@ -491,6 +498,6 @@ Kev selbst ist ein eigenes Projekt: <https://github.com/jaredpalmer/kev>
 (Apache-2.0), geschrieben in Python. Es ist hier die **Referenz**: die Regeln, die
 Prompt und Readout umsetzen, sind aus `kev/api.py` und `kev/model.py` übernommen
 und nicht erfunden, und Änderungen daran folgen der Referenz statt der eigenen
-Meinung. Gebraucht wird sie nur an zwei Stellen — beim Nachlesen und für die
+Meinung. Gebraucht wird sie nur an zwei Stellen , beim Nachlesen und für die
 Paritätsaufzeichnung. Dieser Code selbst hat mit Python nichts zu tun: keine
 Abhängigkeit, kein Build-Skript, kein Unterprozess.

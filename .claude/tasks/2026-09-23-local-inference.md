@@ -908,6 +908,30 @@ Verified on both synthetic fixtures: on noise weights the three-way choice sits 
 paths: the label typo (refused, exit 1), a record with no labels at all, `--limit`,
 `--errors`, `--request` as the question source, and the hybrid backbone.
 
+## Done: the eval runner in scripts/local.sh
+
+Commit "Run the eval set from scripts/local.sh". `--records <file.jsonl>` plus
+`--questions <file.json>` (or `--request`) adds `examples/eval` to the sequence,
+after the checks that ask whether the engine is right and before the timings that
+ask how fast it is.
+
+- **`--records` without `--questions`/`--request` is refused**, and says why: a
+  questions map from somewhere else would score the records against questions
+  nobody asked. `--questions` without `--records` is refused too, rather than
+  silently doing nothing. Both are checked before anything is downloaded or built,
+  which is where a mistake is cheapest.
+- **A low accuracy is not a failure.** The script cannot know what is acceptable;
+  only a set it could not read fails the step. Said in `--help` as well.
+- Without `--records` the closing summary now says what has *not* been measured,
+  with the flags to measure it.
+
+One bug found by running it: the script `cd`s into the crate before the steps, so a
+relative `--records kev-client/tests/eval/tickets.jsonl` resolved against the wrong
+directory and the example died with "No such file or directory". Every caller-given
+path is now made absolute first — `base`, `checkpoint`, `records`, `questions`,
+`request` and `MODEL_DIR`, since `--base ./models/...` had the same flaw and nobody
+had tried it. Verified from `/tmp` with a relative `--checkpoint`.
+
 ## Left to do
 
 1. **Parity — one server session away.** Everything around it is done: the

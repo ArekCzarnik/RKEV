@@ -420,7 +420,11 @@ head and the tokenizer, then the base named in `adapter_config.json`, sharded
 weights included (the index names the shards). It then runs `scripts/test.sh`,
 the sanity example, the suite again with `KEV_TOKENIZER` pointed at the real
 vocabulary, one request through `decide`, and with `--measure` the `#[ignore]`d
-timings. No feature flags: the model is the crate's default.
+timings. No feature flags: the model is the crate's default. With `--records` and
+`--questions`/`--request` it also runs `examples/eval` — after the checks, before
+the timings, and a low accuracy there is not a failure: only a set it could not
+read is. Every path the caller gives is made absolute before the script `cd`s into
+the crate, which is where a relative `--records` used to break.
 
 `KEV_HF` points the downloads at a mirror — or at a `file://` tree, which is how
 the fetch path was tested here without reaching the hub.

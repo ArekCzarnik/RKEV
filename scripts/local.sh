@@ -9,14 +9,22 @@
 #                                               # download it first, with curl
 #   scripts/local.sh --checkpoint <dir> --measure   # also the timing measurements
 #   scripts/local.sh --checkpoint <dir> --skip-suite  # only the checkpoint checks
+#   scripts/local.sh --checkpoint <dir> \
+#       --questions q.json --records tickets.jsonl  # ... and how often it is right
 #
 #   --base <dir>      the base model, if it is not beside the checkpoint
 #   --dir <dir>       where --fetch puts models (default ~/models)
 #   --force           re-download files (also the fix for an interrupted one)
 #   --release         build the suite optimised too (sanity always is)
+#   --records <file>  labelled records, JSONL; needs --questions or --request
+#   --questions <f>   the questions map they are labelled against
+#   --request <file>  take the questions out of a whole request instead
 #
-# Nothing here starts a server, imports Python, or needs the network unless
-# --fetch is given. HF_TOKEN is used for --fetch if it is set.
+# A low accuracy on your records is not a failure here - only a set this could not
+# read is. kev-client/tests/eval/README.md has the record format.
+#
+# Nothing here starts a server, or needs the network unless --fetch is given.
+# HF_TOKEN is used for --fetch if it is set.
 
 set -euo pipefail
 
@@ -28,6 +36,9 @@ MODEL_DIR="${KEV_MODEL_DIR:-$HOME/models}"
 HF="${KEV_HF:-https://huggingface.co}"
 
 base=""
+records=""
+questions=""
+request=""
 checkpoint=""
 fetch=""
 measure=0
@@ -41,14 +52,51 @@ while [ $# -gt 0 ]; do
         --base)       base="${2:-}"; shift 2 ;;
         --fetch)      fetch="${2:-}"; shift 2 ;;
         --dir)        MODEL_DIR="${2:-}"; shift 2 ;;
+        --records)    records="${2:-}"; shift 2 ;;
+        --questions)  questions="${2:-}"; shift 2 ;;
+        --request)    request="${2:-}"; shift 2 ;;
         --measure)    measure=1; shift ;;
         --skip-suite) skip_suite=1; shift ;;
         --force)      force=1; shift ;;
         --release)    release="--release"; shift ;;
-        -h|--help)    sed -n '3,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '3,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            echo "error: unknown argument $1 (try --help)" >&2; exit 1 ;;
     esac
 done
+
+# Every path the caller gave is made absolute before anything else: the checks below
+# run from inside the crate directory, where a relative path means something else.
+absolute() {
+    case "${1:-}" in
+        "") printf '' ;;
+        /*) printf '%s' "$1" ;;
+        *)  printf '%s/%s' "$PWD" "$1" ;;
+    esac
+}
+base="$(absolute "$base")"
+checkpoint="$(absolute "$checkpoint")"
+records="$(absolute "$records")"
+questions="$(absolute "$questions")"
+request="$(absolute "$request")"
+MODEL_DIR="$(absolute "$MODEL_DIR")"
+
+# Checked here rather than after a download and a release build: a half-given eval
+# is the cheapest thing in this script to get wrong.
+if [ -n "$records" ]; then
+    [ -r "$records" ] || { echo "error: cannot read $records" >&2; exit 1; }
+    if [ -z "$questions" ] && [ -z "$request" ]; then
+        echo "error: --records needs --questions <file> (or --request <file>) to say" >&2
+        echo "       what the labels mean. A questions map from somewhere else would" >&2
+        echo "       score your records against questions you did not ask." >&2
+        exit 1
+    fi
+    for file in "$questions" "$request"; do
+        [ -z "$file" ] || [ -r "$file" ] || { echo "error: cannot read $file" >&2; exit 1; }
+    done
+elif [ -n "$questions" ] || [ -n "$request" ]; then
+    echo "error: --questions/--request only do something with --records" >&2
+    exit 1
+fi
 
 # rustup installs into ~/.cargo but only a login shell picks that up.
 if ! command -v cargo >/dev/null 2>&1 && [ -f "${CARGO_HOME:-$HOME/.cargo}/env" ]; then
@@ -289,6 +337,17 @@ step "one request end to end (example decide)" \
     "${model[@]}" \
     --state "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card."
 
+# Whether it is any use on your own tickets, which is a different question from
+# whether it is implemented correctly. Failure here means the set could not be
+# read; what the accuracy should be is yours to decide.
+if [ -n "$records" ]; then
+    asked=(--questions "$questions")
+    [ -n "$request" ] && asked=(--request "$request")
+    step "how often it is right on your records (example eval)" \
+        cargo run --release --example eval -- \
+        "${model[@]}" "${asked[@]}" --records "$records"
+fi
+
 if [ "$measure" -eq 1 ]; then
     # On the real checkpoint: what f16 buys, and what the prefix cache buys, with
     # the controls that keep a cache hit from being read as a precision win.
@@ -309,5 +368,9 @@ fi
 
 echo ""
 echo "==> everything a checkpoint alone can be held to passed."
+if [ -z "$records" ]; then
+    echo "    Whether it decides *your* tickets correctly is a different question:"
+    echo "    pass --records <file.jsonl> --questions <file.json> to measure that."
+fi
 echo "    What is left needs one: whether these numbers match the Python's."
 echo "    That is scripts/test.sh's parity example, with a recorded response."
