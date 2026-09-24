@@ -5,19 +5,10 @@
 
 RKev führt Kevs Entscheidungsmodelle direkt in Rust im eigenen Prozess aus: ohne zusätzlichen Server, ohne API-Gateway und ohne laufende API-Kosten. Alles läuft vollständig     
 lokal.
-
 Das Prinzip ist einfach: Text (oder JSON) + Fragestellung rein → Wahrscheinlichkeiten raus. Unterstützt werden Ja/Nein-Entscheidungen, die Auswahl aus mehreren Optionen sowie Bewertungen auf einer Skala.
+Dabei werden keine Antwort-Tokens generiert. Die Entscheidung erfolgt über einen Pointer-Head auf den Hidden States der Qwen-Basis, in die der LoRA-Adapter des Checkpoints eingerechnet ist.
 
-Dabei werden keine Antwort-Tokens generiert. Die Entscheidung erfolgt über einen Pointer-Head auf den Hidden States der Qwen-Basis, in die der LoRA-Adapter des Checkpoints      
-eingerechnet ist.
-
-RKev unterstützt Qwen3 ebenso wie das hybride Qwen3.5 mit Gated DeltaNet. Dazu kommen ein CLI für direkte Anfragen und ein Eval-Runner, mit dem sich eigene gelabelte Tickets    
-auswerten lassen — mit Trefferquote pro Sicherheitsband, aus dem eine Schwelle fürs automatische Routing folgt.    
---
-Das einzige Crate liegt in [`rkev/`](rkev/); das Wurzelverzeichnis ist
-kein Cargo-Workspace, `cargo`-Befehle laufen also aus `rkev/`. Die
-ausführliche, englische Dokumentation des Crates steht in
-[`rkev/README.md`](rkev/README.md).
+RKev unterstützt Qwen3 ebenso wie das hybride Qwen3.5 mit Gated DeltaNet. Dazu kommen ein CLI für direkte Anfragen und ein Eval-Runner, mit dem sich eigene gelabelte Tickets auswerten lassen — mit Trefferquote pro Sicherheitsband, aus dem eine Schwelle fürs automatische Routing folgt.
 
 ## Was RKev macht
 
