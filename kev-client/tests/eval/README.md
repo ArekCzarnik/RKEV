@@ -46,3 +46,9 @@ calibrated model is one you can route on automatically above some confidence and
 send to a person below it, and that table is where that threshold comes from.
 `--errors <n>` prints the confident mistakes, which is where a question's wording
 usually turns out to be the problem.
+
+`--min-accuracy 0.8` makes the run fail below that, and `--min-accuracy
+verärgerung=0.6` sets one question's own bar — a scale sits below a three-way
+choice, so one number rarely fits both. A question with a threshold and nothing
+labelled for it fails too: a threshold nothing was measured against would otherwise
+read as a pass.

@@ -392,6 +392,13 @@ mean absolute error for a score), and then **accuracy by confidence**, which is
 where a routing threshold comes from and the reason to run a model that answers
 with a distribution. `--errors <n>` lists the confident mistakes, which is usually
 where a question's wording is wrong rather than the model.
+For CI there is a threshold: `--min-accuracy 0.8` applies to every question and
+`--min-accuracy score_question=0.6` overrides one, since an ordinal scale sits
+below a three-way choice and a single number for both would be either slack or
+unreachable. A question below its threshold exits non-zero, and so does a question
+that has a threshold and nothing labelled for it — a guarantee with no evidence
+behind it is not one. `scripts/local.sh` passes the flag through.
+
 `tests/eval/README.md` has the format, with a six-record sample beside it.
 
 ## Tests

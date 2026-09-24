@@ -19,9 +19,12 @@
 #   --records <file>  labelled records, JSONL; needs --questions or --request
 #   --questions <f>   the questions map they are labelled against
 #   --request <file>  take the questions out of a whole request instead
+#   --min-accuracy    0.8 for every question, or id=0.8 for one; repeatable
 #
-# A low accuracy on your records is not a failure here - only a set this could not
-# read is. kev-client/tests/eval/README.md has the record format.
+# A low accuracy on your records fails the run only if you say what low means, with
+# --min-accuracy; otherwise it is reported and that is all. A question with a
+# threshold and nothing labelled for it counts as below it.
+# kev-client/tests/eval/README.md has the record format.
 #
 # Nothing here starts a server, or needs the network unless --fetch is given.
 # HF_TOKEN is used for --fetch if it is set.
@@ -39,6 +42,7 @@ base=""
 records=""
 questions=""
 request=""
+minimum=()
 checkpoint=""
 fetch=""
 measure=0
@@ -53,13 +57,14 @@ while [ $# -gt 0 ]; do
         --fetch)      fetch="${2:-}"; shift 2 ;;
         --dir)        MODEL_DIR="${2:-}"; shift 2 ;;
         --records)    records="${2:-}"; shift 2 ;;
+        --min-accuracy) minimum+=(--min-accuracy "${2:-}"); shift 2 ;;
         --questions)  questions="${2:-}"; shift 2 ;;
         --request)    request="${2:-}"; shift 2 ;;
         --measure)    measure=1; shift ;;
         --skip-suite) skip_suite=1; shift ;;
         --force)      force=1; shift ;;
         --release)    release="--release"; shift ;;
-        -h|--help)    sed -n '3,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            echo "error: unknown argument $1 (try --help)" >&2; exit 1 ;;
     esac
 done
@@ -93,8 +98,9 @@ if [ -n "$records" ]; then
     for file in "$questions" "$request"; do
         [ -z "$file" ] || [ -r "$file" ] || { echo "error: cannot read $file" >&2; exit 1; }
     done
-elif [ -n "$questions" ] || [ -n "$request" ]; then
-    echo "error: --questions/--request only do something with --records" >&2
+elif [ -n "$questions" ] || [ -n "$request" ] || [ ${#minimum[@]} -gt 0 ]; then
+    echo "error: --questions, --request and --min-accuracy only do something with" >&2
+    echo "       --records; there is nothing to measure without a labelled set." >&2
     exit 1
 fi
 
@@ -345,7 +351,8 @@ if [ -n "$records" ]; then
     [ -n "$request" ] && asked=(--request "$request")
     step "how often it is right on your records (example eval)" \
         cargo run --release --example eval -- \
-        "${model[@]}" "${asked[@]}" --records "$records"
+        "${model[@]}" "${asked[@]}" --records "$records" \
+        ${minimum[@]+"${minimum[@]}"}
 fi
 
 if [ "$measure" -eq 1 ]; then

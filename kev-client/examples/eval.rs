@@ -35,7 +35,10 @@ fn main() -> ExitCode {
         }
     };
     match run(&options) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::SUCCESS,
+        // A question below its threshold, or one with a threshold and nothing to
+        // measure it on.
+        Ok(false) => ExitCode::FAILURE,
         Err(error) => {
             eprintln!("{error}");
             ExitCode::FAILURE
@@ -54,6 +57,9 @@ struct Options {
     limit: Option<usize>,
     errors: usize,
     json: bool,
+    /// `--min-accuracy`: a bare value applies to every question, `id=value` to one.
+    /// Given both, the named one wins.
+    minimum: Vec<(Option<String>, f64)>,
 }
 
 /// One labelled record: the state to answer, and what you consider right.
@@ -83,7 +89,7 @@ struct Tally {
     misses: Vec<(f64, usize, String, String)>,
 }
 
-fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
+fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
     // --- the questions, and the records they are asked of ---
     let questions: IndexMap<String, Question> = match (&options.questions, &options.request) {
         (Some(path), _) => serde_json::from_str(&read(path)?)?,
@@ -94,6 +100,7 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     if records.is_empty() {
         return Err(format!("{} holds no records", options.records.display()).into());
     }
+    let thresholds = thresholds(&options.minimum, &questions)?;
 
     // --- the engine ---
     let checkpoint = options.checkpoint.as_deref();
@@ -148,12 +155,92 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // A threshold on a question nothing was labelled for is a failure, not a pass:
+    // asking for a guarantee and accepting no evidence is the whole trap.
+    let mut passed = true;
+    let verdicts: Vec<(String, f64, f64, bool)> = thresholds
+        .iter()
+        .map(|(id, minimum)| {
+            let tally = tallies.get(id);
+            let scored = tally.map_or(0, |tally| tally.scored);
+            let accuracy = match tally {
+                Some(tally) if scored > 0 => tally.hits as f64 / scored as f64,
+                _ => f64::NAN,
+            };
+            let ok = accuracy >= *minimum;
+            passed &= ok;
+            (id.clone(), accuracy, *minimum, ok)
+        })
+        .collect();
+
     if options.json {
-        println!("{}", as_json(&tallies, records.len()));
-        return Ok(());
+        println!("{}", as_json(&tallies, records.len(), &verdicts, passed));
+        return Ok(passed);
     }
     report(&tallies, records.len(), options.errors);
-    Ok(())
+    if !verdicts.is_empty() {
+        println!("\n{:<16} {:>9} {:>12}", "question", "accuracy", "minimum");
+        for (id, accuracy, minimum, ok) in &verdicts {
+            println!(
+                "{id:<16} {:>9} {:>11.1}%  {}",
+                if accuracy.is_nan() {
+                    String::from("—")
+                } else {
+                    format!("{:.1}%", accuracy * 100.0)
+                },
+                minimum * 100.0,
+                if *ok {
+                    "ok"
+                } else if accuracy.is_nan() {
+                    "NOTHING LABELLED"
+                } else {
+                    "BELOW"
+                }
+            );
+        }
+        println!(
+            "\n{}",
+            if passed {
+                "every question is at or above its minimum."
+            } else {
+                "at least one question is below its minimum."
+            }
+        );
+    }
+    Ok(passed)
+}
+
+/// `--min-accuracy` resolved per question: the bare value for every question, an
+/// `id=value` for that one. An id nothing asks about is a mistake worth stopping
+/// for, the same as a label for a question that does not exist.
+fn thresholds(
+    given: &[(Option<String>, f64)],
+    questions: &IndexMap<String, Question>,
+) -> Result<IndexMap<String, f64>, Box<dyn std::error::Error>> {
+    let mut resolved = IndexMap::new();
+    for (id, value) in given {
+        if !(0.0..=1.0).contains(value) {
+            return Err(format!("--min-accuracy takes 0 to 1, got {value}").into());
+        }
+        match id {
+            None => {
+                for id in questions.keys() {
+                    resolved.insert(id.clone(), *value);
+                }
+            }
+            Some(id) if questions.contains_key(id) => {
+                resolved.insert(id.clone(), *value);
+            }
+            Some(id) => {
+                return Err(format!(
+                    "--min-accuracy {id}=… names no question ({})",
+                    questions.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+                .into())
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// Compare one response with one record's labels.
@@ -359,7 +446,12 @@ fn report(tallies: &IndexMap<String, Tally>, records: usize, errors: usize) {
     }
 }
 
-fn as_json(tallies: &IndexMap<String, Tally>, records: usize) -> String {
+fn as_json(
+    tallies: &IndexMap<String, Tally>,
+    records: usize,
+    verdicts: &[(String, f64, f64, bool)],
+    passed: bool,
+) -> String {
     let mut out = format!("{{\"records\": {records}, \"questions\": {{");
     for (index, (id, tally)) in tallies.iter().enumerate() {
         if index > 0 {
@@ -389,7 +481,23 @@ fn as_json(tallies: &IndexMap<String, Tally>, records: usize) -> String {
         }
         out.push('}');
     }
-    out.push_str("}}");
+    out.push('}');
+    if !verdicts.is_empty() {
+        out.push_str(", \"thresholds\": {");
+        for (index, (id, accuracy, minimum, ok)) in verdicts.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!(
+                "{}: {{\"accuracy\": {}, \"minimum\": {minimum:.4}, \"ok\": {ok}}}",
+                serde_json::to_string(id).unwrap_or_default(),
+                json_number(*accuracy),
+            ));
+        }
+        out.push('}');
+        out.push_str(&format!(", \"passed\": {passed}"));
+    }
+    out.push('}');
     out
 }
 
@@ -538,6 +646,9 @@ usage: eval --base <dir> [--checkpoint <dir>] --records <file.jsonl>
   --batch <n>       records answered in one prefill pass (default 1)
   --limit <n>       stop after n records
   --errors <n>      print the n most confident mistakes per question (default 5)
+  --min-accuracy    0.8 for every question, or id=0.8 for one; repeatable.
+                    Exits non-zero below it, and below it counts a question with
+                    a threshold and nothing labelled for it.
   --json            the tallies as JSON instead of a report
 
 tests/eval/README.md has the record format and what the numbers mean.";
@@ -556,6 +667,7 @@ fn parse() -> Result<Options, String> {
         limit: None,
         errors: 5,
         json: false,
+        minimum: Vec::new(),
     };
 
     let mut arguments = std::env::args().skip(1);
@@ -580,6 +692,17 @@ fn parse() -> Result<Options, String> {
                 options.errors = value()?.parse().map_err(|e| format!("--errors: {e}"))?
             }
             "--json" => options.json = true,
+            "--min-accuracy" => {
+                let given = value()?;
+                let (id, number) = match given.split_once('=') {
+                    Some((id, number)) => (Some(id.to_string()), number),
+                    None => (None, given.as_str()),
+                };
+                let parsed = number
+                    .parse()
+                    .map_err(|e| format!("--min-accuracy {given}: {e}"))?;
+                options.minimum.push((id, parsed));
+            }
             "-h" | "--help" => return Err(String::from("eval")),
             other => return Err(format!("unknown argument {other}")),
         }

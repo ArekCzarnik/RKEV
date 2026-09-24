@@ -346,9 +346,22 @@ unter der du an einen Menschen geben kannst. `--errors <n>` zeigt die sichersten
 Fehlgriffe , dort steckt meist die Formulierung einer Frage, nicht das Modell.
 
 `scripts/local.sh --records tickets.jsonl --questions q.json` hängt denselben
-Schritt an alles andere an, nach den Prüfungen und vor den Zeitmessungen — eine
-niedrige Trefferquote ist dort **kein** Fehlschlag, nur ein Satz, der sich nicht
-lesen ließ.
+Schritt an alles andere an, nach den Prüfungen und vor den Zeitmessungen.
+
+Für CI gibt es eine Schwelle — eine niedrige Trefferquote ist nur dann ein
+Fehlschlag, wenn du sagst, was niedrig heißt:
+
+```bash
+cargo run --release --example eval -- … \
+    --min-accuracy 0.8 --min-accuracy verärgerung=0.6
+```
+
+`--min-accuracy 0.8` gilt für jede Frage, `id=0.6` überschreibt sie für eine — eine
+Skala liegt naturgemäß unter einer dreifachen Wahl, und eine einzige Zahl für alles
+wäre entweder zu lasch oder zu streng. Unterschreitet eine Frage ihre Schwelle,
+endet der Lauf mit einem Fehlercode; und eine Frage **mit** Schwelle, für die nichts
+beschriftet ist, gilt als unterschritten — eine Garantie ohne Belege ist keine.
+`scripts/local.sh` leitet das Flag weiter.
 
 Die Zahlen oben sind eine Formatillustration, kein gemessener Lauf. Sechs
 Beispiel-Records und die passende Fragendatei liegen in `kev-client/tests/eval/`,
@@ -492,12 +505,3 @@ einmal nebeneinanderzulegen.
 
 Deshalb bleibt `scripts/parity.sh`, und deshalb nur einmal: danach sind die
 Aufzeichnungen Dateien.
-## Herkunft
-
-Kev selbst ist ein eigenes Projekt: <https://github.com/jaredpalmer/kev>
-(Apache-2.0), geschrieben in Python. Es ist hier die **Referenz**: die Regeln, die
-Prompt und Readout umsetzen, sind aus `kev/api.py` und `kev/model.py` übernommen
-und nicht erfunden, und Änderungen daran folgen der Referenz statt der eigenen
-Meinung. Gebraucht wird sie nur an zwei Stellen , beim Nachlesen und für die
-Paritätsaufzeichnung. Dieser Code selbst hat mit Python nichts zu tun: keine
-Abhängigkeit, kein Build-Skript, kein Unterprozess.
