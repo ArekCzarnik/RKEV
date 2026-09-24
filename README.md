@@ -3,8 +3,8 @@
 ### RKev 1.0p Kevs Entscheidungsmodelle in Rust
 -> Prompt, Forward-Pass und Readout laufen in Rust im eigenen Prozess <-
 
-RKev führt Kevs Entscheidungsmodelle direkt in Rust im eigenen Prozess aus: ohne zusätzlichen Server, ohne API-Gateway und ohne laufende API-Kosten. Alles läuft vollständig     
-lokal.
+RKev führt Kevs Entscheidungsmodelle direkt in Rust im eigenen Prozess aus: ohne zusätzlichen Server, ohne API-Gateway und ohne laufende API-Kosten. Alles läuft vollständig lokal.
+
 Das Prinzip ist einfach: Text (oder JSON) + Fragestellung rein → Wahrscheinlichkeiten raus. Unterstützt werden Ja/Nein-Entscheidungen, die Auswahl aus mehreren Optionen sowie Bewertungen auf einer Skala.
 Dabei werden keine Antwort-Tokens generiert. Die Entscheidung erfolgt über einen Pointer-Head auf den Hidden States der Qwen-Basis, in die der LoRA-Adapter des Checkpoints eingerechnet ist.
 
