@@ -428,3 +428,13 @@ status section. Keep it an entry point rather than a translation — detail belo
 in the crate's README — and keep it German when editing it. Every number and every
 sample output in it is a measured one; if a run is not to hand, say what the shape
 is rather than inventing a plausible table.
+
+It also carries the one end-to-end walkthrough of the pipeline
+(*Vom Ticket zur Antwort*): the four steps with the module for each, the delimiter
+table, the layout, the pointer-head formulas, and how `examples/deutsch.rs` maps
+onto them. That section states behaviour, not intent, so anything that changes
+`prompt.rs`, `encode.rs`, the readout formulas, the prefix threshold (384) or the
+cache size (4) has to change it too. It was written by reading the code, not from
+memory, and one claim in the first draft (`null` renders as `None`) was wrong until
+`tests/upstream_unit.rs` said otherwise — check against the tests, not against what
+sounds right.
