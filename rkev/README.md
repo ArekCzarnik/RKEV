@@ -182,7 +182,15 @@ is exact rather than masked, and it is what the reference does there too.
 
 The state is run once per request and every question continues from it, and the
 last few states are kept across requests, keyed by their tokens — a repeated
-document then costs only its questions:
+document then costs only its questions.
+
+On an attention-only base, **measured, that costs rather than saves**: the packed
+masked pass already runs the state once *and* every branch in one go, while the
+prefix path pays for a pass per question. `kev-0.6b` over a 571-token state: 4325 ms
+packed against 12416 ms prefixed and 9112 ms with a cache hit. The prefix is kept
+because a recurrent base has no masked pass to fall back on, and the threshold below
+which it is skipped comes from the reference — but on this model and this machine the
+packed pass won every configuration measured:
 
 ```rust
 let backend = Backend::open(base, Some(checkpoint))?
@@ -192,10 +200,11 @@ let (hits, misses) = backend.prefix_hits();
 ```
 
 The questions' branches then run as one padded batch, and on a recurrent base the
-delta rule runs in chunks of 64 tokens rather than token by token. Both are exact;
-between them and the prefix, a five-question request over a 500-token state went
-from about two seconds to under half of one here — on a model with the released
-checkpoints' widths, but made-up weights, so take it as a ratio.
+delta rule runs in chunks of 64 tokens rather than token by token. Both are exact.
+On the fixtures, at the released checkpoints' widths but with made-up weights, the
+chunked delta rule was worth 2.05x and the prefix 2.2x on a recurrent base — those
+are ratios from a fixture, and the one real checkpoint measured so far is
+attention-only, where the prefix behaves as above.
 
 Several requests at once share the pass that runs their states:
 

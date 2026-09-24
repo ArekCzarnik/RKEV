@@ -208,10 +208,11 @@ summarise() {
     fi
     if [ -n "$said_no" ]; then
         echo ""
-        echo "not convinced: $said_no"
-        echo "Those runs finished and said no: the checkpoint missed more than one of the"
-        echo "obvious cases. On made-up weights that is expected; on a real checkpoint it"
-        echo "is the finding, and reading it beats reading the timings above it."
+        echo "said no: $said_no"
+        echo "Those runs finished and exited non-zero. sanity does that for two different"
+        echo "reasons - the obvious cases were missed, or the paths disagreed by more than"
+        echo "its tolerance - so read the run's own tally and its two difference lines"
+        echo "above rather than guessing from here."
     fi
     echo ""
     echo "the whole log: $out"
@@ -249,8 +250,12 @@ if [ "$skip_cpu" -eq 0 ]; then
         cargo run --release --example sanity -- "${model[@]}"
 
     for stage in $stages; do
+        # A looser bar on purpose: the quantised kernels reorder the arithmetic, so
+        # the packed and the separate path differ by thousandths that are not a fault.
+        # The exact bar belongs to the dense f32 run above.
         run_verdict "cpu, $stage: the obvious cases" \
-            cargo run --release --example sanity -- "${model[@]}" --quantise "$stage"
+            cargo run --release --example sanity -- \
+            "${model[@]}" --quantise "$stage" --tolerance 0.01
     done
 fi
 
@@ -272,7 +277,7 @@ if [ "$skip_metal" -eq 0 ]; then
             "${model[@]}" --repeat "$repeat" --words "$words" --device metal
         run_verdict "metal, dense: the obvious cases" \
             cargo run --release --features metal --example sanity -- \
-            "${model[@]}" --device metal
+            "${model[@]}" --device metal --tolerance 0.01
         # Quantisation is a CPU path here, so there is deliberately no metal row
         # for it - asking would be refused, and the refusal is the documentation.
     fi

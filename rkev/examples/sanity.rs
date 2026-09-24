@@ -356,7 +356,11 @@ fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
             "the paths agree. What this cannot tell you is whether they agree with the \
              server - for that, examples/parity.rs."
         } else {
-            "the paths disagree, which is a bug here rather than a question of weights."
+            "the paths disagree. In f32 on a CPU they are exact and a difference is a \
+             bug in the layout, the mask or the recurrence. Quantised, or on a GPU, the \
+             kernels reorder the arithmetic and a few thousandths are float \
+             associativity rather than a fault - run it again dense on the CPU to tell \
+             the two apart."
         }
     );
     Ok(consistent && hits + 1 >= cases.len())

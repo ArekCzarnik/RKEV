@@ -333,6 +333,45 @@ hier nicht erprobt). Und die k-Quants packen 256 Gewichte pro Superblock: eine
 Projektion, deren Zeile nicht durch 256 teilbar ist, wird namentlich abgelehnt mit
 dem Hinweis auf q8_0, das 32 packt.
 
+### Gemessen: kev-0.6b auf einem Apple M-Chip
+
+Fünf Fragen über 571 State-Tokens, Median aus fünf Pässen, `kev-0.6b` über
+`Qwen/Qwen3-0.6B-Base` (2026-09-24, macOS arm64, cargo 1.97):
+
+| | f32 gepackt | f32 State einmal | f32 State im Cache | f16 State einmal |
+|---|---|---|---|---|
+| CPU | **4325 ms** | 12416 ms | 9112 ms | 9484 ms |
+| Metal | **874 ms** | 3403 ms | 2632 ms | 3315 ms |
+
+Drei Befunde, zwei davon gegen die Erwartung:
+
+- **Metal ist fünfmal schneller** als die CPU (874 gegen 4325 ms) und damit der
+  einzige große Hebel. Auf der GPU bringt f16 dann nichts mehr (1.03×), auf der CPU
+  1.31×.
+- **Der State-Prefix kostet hier, statt zu sparen.** Der gepackte Pass rechnet State
+  und alle Zweige in einem maskierten Durchgang; der Prefix-Pfad rechnet einen
+  State-Pass und dann einen Pass pro Frage — bei 571 Tokens ist das 2.9× langsamer,
+  **auch mit Cache-Treffer** (9112 gegen 4325 ms). Die Schwelle von 384 State-Tokens
+  ist aus der Python-Seite übernommen; für diese Engine ist sie auf diesem Modell
+  falsch. Bei einer rekurrenten Basis bleibt der Prefix nötig, dort gibt es keinen
+  maskierten Pass.
+- **Quantisierung zahlt sich nicht aus.** q8_0 ist neutral (1.05×), q6k und q4k sind
+  *langsamer* (0.64× und 0.76×) — candles k-Quant-Kerne schlagen auf Apple-Silizium
+  den dichten f32-Pfad nicht. Dazu die Kosten an den Antworten: q8_0 0.077, q6k
+  0.046, q4k **0.311** größte Abweichung von f32. Ein um 0.31 verschobener Wert ist
+  für eine kalibrierte Wahrscheinlichkeit unbrauchbar.
+
+Was durchgehend hielt: **7 von 7 eindeutigen Fällen**, in jeder Präzision und jeder
+Quantisierungsstufe — der Argmax überlebt, die Kalibrierung nicht. Und die
+Orientierung des Pointer-Heads ist damit empirisch belegt: **0 von 7 mit
+vertauschten Projektionen.**
+
+Die Zahl für f16 in der Präzisions-Sektion unten stammt von den Fixtures (0.01); auf
+echten Gewichten sind es **0.03** auf der CPU und 0.0037 auf Metal. Der dichte
+f32-Pfad auf der CPU ist der exakte: dort stimmen gepackter und getrennter Pass auf
+0.00000 überein. Quantisiert und auf Metal weichen sie um 0.003 ab — Assoziativität
+der Fließkommaaddition, nicht ein Fehler im Layout.
+
 ### Alles auf einmal messen
 
 `scripts/sweep.sh` fährt einen Checkpoint durch jeden Pfad, den er hat, und legt
