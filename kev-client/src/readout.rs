@@ -107,6 +107,28 @@ impl PointerHead {
         Ok(self)
     }
 
+    /// The same head with its two projections exchanged — deliberately the wrong
+    /// way round.
+    ///
+    /// Which projection reads `<decide>` and which reads `</opt>` comes from the
+    /// reference's own naming (`q` and `k` in `head.pt`), and swapping them yields
+    /// a different but perfectly plausible distribution: no shape check and no
+    /// self-consistency test can tell the two apart, because both sides of every
+    /// comparison would be swapped alike.
+    ///
+    /// What *can* tell them apart is a trained checkpoint. A head only scores the
+    /// right option highly in the orientation it was trained in, so answering
+    /// questions whose answer is not in doubt with this head and with the ordinary
+    /// one separates them — that is what `examples/sanity.rs` does with it, and it
+    /// needs no reference numbers to do it.
+    pub fn swapped(self) -> Self {
+        Self {
+            query: self.key,
+            key: self.query,
+            ..self
+        }
+    }
+
     /// The hidden size this head expects from the backbone.
     pub fn hidden_size(&self) -> usize {
         self.query.inputs

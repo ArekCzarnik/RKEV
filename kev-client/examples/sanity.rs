@@ -225,6 +225,47 @@ fn run(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
     }
     println!("\n{hits} of {} obvious cases", cases.len());
 
+    // --- is the pointer head the right way round ---
+    //
+    // Which projection reads `<decide>` and which reads each `</opt>` comes from
+    // head.pt's own naming, and swapping them gives a different distribution that
+    // is just as plausible: no shape and no self-consistency check can separate
+    // them, because both sides would be swapped alike. A *trained* head can. Only
+    // worth the passes if the ordinary orientation answered these cases at all.
+    if hits + 1 >= cases.len() {
+        let swapped = || -> Result<LocalEngine, kev_client::Error> {
+            Ok(LocalEngine::new(open()?, pointer_head(&head)?.swapped()))
+        };
+        let mut wrong_way = 0;
+        for case in &cases {
+            let response = swapped()?.system_one_blocking(&(case.question)())?;
+            let answer = response
+                .answers
+                .values()
+                .next()
+                .ok_or("the engine answered nothing")?;
+            wrong_way += usize::from(judge(answer, &case.expected).1);
+        }
+        println!(
+            "{wrong_way} of {} with the head's two projections swapped",
+            cases.len()
+        );
+        if wrong_way < hits {
+            println!(
+                "  so the projections are the right way round: exchanging them costs \
+                 {} case(s).",
+                hits - wrong_way
+            );
+        } else {
+            println!(
+                "  WARNING: swapping them costs nothing here, so these cases do not \
+                 pin the orientation. Either the head is untrained, or the two \
+                 projections are near enough alike that only a recorded server \
+                 response can settle it."
+            );
+        }
+    }
+
     // --- does it hang together ---
     println!();
     let mut consistent = true;

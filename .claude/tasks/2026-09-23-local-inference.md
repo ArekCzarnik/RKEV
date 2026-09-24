@@ -785,7 +785,7 @@ is for. Now every tensor in `adapter_model.safetensors` has to be consumed:
   the hidden states) → warning, since it cannot reach an answer;
 - leftover that is not a LoRA pair, or sits under a prefix nothing here knows →
   error, because we cannot reason about it;
-- `KEV_ALLOW_UNMERGED=1` downgrades the refusals, for a checkpoint whose extra
+- `KEV_ALLOW_UNUSED=1` downgrades the refusals, for a checkpoint whose extra
   tensors have been read and judged harmless.
 
 Implementation: `Adapter` keeps the file's tensor names and a `RefCell` of the ones
@@ -816,6 +816,48 @@ takes and this port does not. That is a reading error in a port, and only the
 numbers side by side find it.
 
 86 tests, all four feature combinations green.
+
+## Done: the q/k orientation, locally
+
+Commit "Pin the pointer head's orientation without a server". The last thing the
+README named as parity-only: whether `head.pt`'s `q` belongs on `<decide>` and `k`
+on each `</opt>`. Swapped, the head produces a different and entirely plausible
+distribution, and **no** shape check or self-consistency test can separate them —
+both sides of every comparison here would be swapped alike.
+
+What can separate them is a trained checkpoint, so the check is empirical:
+
+- `PointerHead::swapped()` — the head with its projections exchanged, deliberately
+  the wrong way round.
+- `examples/sanity.rs` answers the seven unambiguous cases with it too and prints
+  both tallies. Only when the ordinary orientation scored at least 6 of 7, since
+  otherwise the comparison says nothing and the passes are wasted. If swapping
+  costs nothing it says so outright — that is the honest outcome on an untrained
+  head, and the noise fixtures print exactly that (2 of 7 either way).
+- `tests/local_engine.rs` pins that the swap is a real difference **and** an
+  involution, with hand-computed logits: q identity, k adding the second unit, so
+  straight gives `[1, 3]/√2` and swapped `[3, 2]/√2` — a different winner, and
+  swapping twice is the head itself. Without the involution the check would be
+  meaningless.
+
+And two refusals in `pointer_head`, the same discipline as the adapter's:
+
+- a `head.pt` holding tensors the readout does not use (a third projection is
+  structure that would be silently dropped) — `KEV_ALLOW_UNUSED=1` overrides;
+- **two candidates for one name** (`q.weight` and `pointer.q.weight`): the old
+  `find` took the first match, so file order would have decided which projection
+  reads which hidden state.
+
+`KEV_ALLOW_UNMERGED` became `KEV_ALLOW_UNUSED` and now covers both the adapter and
+the head: one lever for "load anyway despite tensors this crate does not use",
+rather than two names for one idea.
+
+clippy caught `drop(projection)` on a closure that implements no `Drop`; the
+closure is scoped in a block instead, which is what actually ends the borrow.
+
+88 tests, all four feature combinations green. What is left for a recording is now
+only a numeric divergence with no local symptom at all — a rounding step the
+reference takes and this port does not, or a config field read differently.
 
 ## Left to do
 

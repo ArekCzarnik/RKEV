@@ -399,7 +399,7 @@ statt dass man sie an abweichenden Zahlen erkennen müsste.
   muss **jeder** Tensor der Adapterdatei verbraucht sein. Betrifft er ein Gewicht,
   das das Backbone liest, ist es ein Fehler mit Namen; betrifft er ein Modul, das
   hier gar nicht läuft (einen Vokabular-Head etwa — Kevs Antworten gehen durch
-  keinen), eine Warnung. `KEV_ALLOW_UNMERGED=1` hebt die Weigerung auf, wenn du die
+  keinen), eine Warnung. `KEV_ALLOW_UNUSED=1` hebt die Weigerung auf, wenn du die
   Namen gelesen und entschieden hast.
 - **Truncation und Padding des Tokenizers** sind ausdrücklich abgeschaltet, wie es
   transformers bei jedem Aufruf tut, und ein Test hält das fest (mit
@@ -412,13 +412,23 @@ statt dass man sie an abweichenden Zahlen erkennen müsste.
   portierte Testfälle, die Forward-Pässe gegen Transkriptionen von Hugging Faces
   `modeling_qwen3.py` und `modeling_qwen3_5.py`.
 
+- **Die Orientierung des Pointer-Heads ist empirisch abgesichert.** Welche
+  Projektion `<decide>` liest und welche jedes `</opt>`, steht nur in den Namen `q`
+  und `k` — vertauscht ergibt der Head eine andere, genauso plausible Verteilung,
+  und keine Form- oder Konsistenzprüfung kann das unterscheiden, weil beide Seiten
+  jedes Vergleichs gleich vertauscht wären. Ein *trainierter* Head kann es:
+  `examples/sanity.rs` beantwortet die eindeutigen Fälle zusätzlich mit
+  `PointerHead::swapped()` und stellt beide Trefferzahlen nebeneinander. Kostet das
+  Vertauschen nichts, sagt es das ausdrücklich, statt ein Ergebnis vorzutäuschen.
+  Dazu wird eine `head.pt` mit mehr als zwei Projektionen abgelehnt, und ebenso
+  eine mit zwei Kandidaten für denselben Namen — sonst entschiede die Reihenfolge
+  in der Datei, welche Projektion welchen Zustand liest.
+
 Was dann noch übrig bleibt und **nur** eine Aufzeichnung fangen kann: eine
-beliebige numerische Abweichung, für die es hier gar keine Symptome gibt — etwa ob
-`head.pt`s Query-Projektion wirklich auf `<decide>` und die Key-Projektion auf
-`</opt>` gehört (vertauscht ergibt eine andere, aber völlig plausible Verteilung),
-oder ob die Referenz an einer Stelle rundet, wo dieser Code es nicht tut. Das ist
-ein Lesefehler in einem Port, und dagegen hilft nur, die Zahlen einmal
-nebeneinanderzulegen.
+numerische Abweichung ohne jedes lokale Symptom — etwa ob die Referenz an einer
+Stelle rundet, wo dieser Code es nicht tut, oder ein Konfigurationsfeld anders
+auslegt. Das ist ein Lesefehler in einem Port, und dagegen hilft nur, die Zahlen
+einmal nebeneinanderzulegen.
 
 Deshalb bleibt `scripts/parity.sh`, und deshalb nur einmal: danach sind die
 Aufzeichnungen Dateien.

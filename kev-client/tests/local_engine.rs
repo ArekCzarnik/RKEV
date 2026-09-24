@@ -16,7 +16,42 @@ mod fixtures;
 use std::sync::atomic::Ordering;
 
 use fixtures::{engine, identity_head, Stub, DECIDE_ID, OPTION_END_ID};
-use kev_client::{Choice, Limits, LocalEngine, Noul, Result, Score, SystemOne, SystemOneRequest};
+use kev_client::{
+    Choice, Limits, Linear, LocalEngine, Noul, PointerHead, Result, Score, SystemOne,
+    SystemOneRequest,
+};
+
+/// Which projection reads `<decide>` and which reads each `</opt>` is decided by
+/// `head.pt`'s names, and nothing about the shapes says so — swapped, the head
+/// scores just as plausibly. So the swap has to be a real difference (something an
+/// obvious case can then separate on a trained checkpoint) and it has to be an
+/// involution, or the check built on it means nothing.
+#[test]
+fn swapping_the_pointer_heads_projections_changes_the_scores_and_reverses() {
+    // q is the identity, k adds the second unit to the first: asymmetric, so the
+    // swap cannot be hidden by symmetry.
+    let q = Linear::new(vec![1.0, 0.0, 0.0, 1.0], vec![0.0, 0.0], 2).unwrap();
+    let k = Linear::new(vec![1.0, 1.0, 0.0, 1.0], vec![0.0, 0.0], 2).unwrap();
+    let head = PointerHead::new(q, k).unwrap();
+    let decide = [1.0, 2.0];
+    let options = [vec![1.0, 0.0], vec![0.0, 1.0]];
+
+    let straight = head.clone().logits(&decide, &options).unwrap();
+    let swapped = head.clone().swapped().logits(&decide, &options).unwrap();
+    let twice = head
+        .clone()
+        .swapped()
+        .swapped()
+        .logits(&decide, &options)
+        .unwrap();
+
+    let scale = 1.0 / 2.0f32.sqrt();
+    // q(decide) = [1, 2]; k(o1) = [1, 0], k(o2) = [1, 1].
+    assert_eq!(straight, vec![1.0 * scale, 3.0 * scale]);
+    // k(decide) = [3, 2]; q(o1) = [1, 0], q(o2) = [0, 1]. A different winner, too.
+    assert_eq!(swapped, vec![3.0 * scale, 2.0 * scale]);
+    assert_eq!(twice, straight, "swapping twice has to be the head itself");
+}
 
 /// The support ticket from the Kev README, and the distributions it reports.
 fn readme_request() -> SystemOneRequest {

@@ -575,28 +575,77 @@ pub fn pointer_head(path: &Path) -> Result<PointerHead> {
         }
     };
 
-    let find = |suffix: &str| -> Result<Tensor> {
-        tensors
+    // Which projection reads `<decide>` and which reads `</opt>` is decided by
+    // these names, so an ambiguous match is not a detail: taking the first of two
+    // candidates would pick the orientation by file order.
+    let find = |suffix: &str| -> Result<(String, Tensor)> {
+        let dotted = format!(".{suffix}");
+        let mut found = tensors
             .iter()
-            .find(|(name, _)| name == suffix || name.ends_with(&format!(".{suffix}")))
-            .map(|(_, tensor)| tensor.clone())
-            .ok_or_else(|| {
-                Error::Engine(format!(
-                    "{} has no {suffix}; it holds {:?}",
-                    path.display(),
-                    tensors.iter().map(|(name, _)| name).collect::<Vec<_>>()
-                ))
-            })
+            .filter(|(name, _)| name == suffix || name.ends_with(&dotted));
+        let (name, tensor) = found.next().ok_or_else(|| {
+            Error::Engine(format!(
+                "{} has no {suffix}; it holds {:?}",
+                path.display(),
+                tensors.iter().map(|(name, _)| name).collect::<Vec<_>>()
+            ))
+        })?;
+        if let Some((other, _)) = found.next() {
+            return Err(Error::Engine(format!(
+                "{} holds two candidates for {suffix}, {name:?} and {other:?}, so which \
+                 projection reads which hidden state would come down to file order",
+                path.display()
+            )));
+        }
+        Ok((name.clone(), tensor.clone()))
     };
 
-    let projection = |name: &str| -> Result<Linear> {
-        let weight = find(&format!("{name}.weight"))?.to_dtype(candle_core::DType::F32)?;
-        let bias = find(&format!("{name}.bias"))?.to_dtype(candle_core::DType::F32)?;
-        let (_, inputs) = weight.dims2()?;
-        Linear::new(weight.flatten_all()?.to_vec1()?, bias.to_vec1()?, inputs)
+    // `q` reads `<decide>` and `k` reads each `</opt>`, which is the reference's
+    // own naming; `PointerHead::swapped` exists to check that empirically on a
+    // trained checkpoint, since no shape says so.
+    //
+    // Scoped so the closure's borrow of `consumed` ends before the leftovers are
+    // counted.
+    let mut consumed: Vec<String> = Vec::new();
+    let (query, key) = {
+        let mut projection = |name: &str| -> Result<Linear> {
+            let (weight_name, weight) = find(&format!("{name}.weight"))?;
+            let (bias_name, bias) = find(&format!("{name}.bias"))?;
+            let weight = weight.to_dtype(candle_core::DType::F32)?;
+            let bias = bias.to_dtype(candle_core::DType::F32)?;
+            let (_, inputs) = weight.dims2()?;
+            consumed.push(weight_name);
+            consumed.push(bias_name);
+            Linear::new(weight.flatten_all()?.to_vec1()?, bias.to_vec1()?, inputs)
+        };
+        (projection("q")?, projection("k")?)
     };
 
-    let head = PointerHead::new(projection("q")?, projection("k")?)?;
+    // A tensor this readout did not use is either a head with more structure than
+    // two projections, or a naming this crate reads wrongly. Both would answer
+    // plausibly and answer wrong, so neither loads quietly.
+    let leftover: Vec<&String> = tensors
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| !consumed.contains(name))
+        .collect();
+    if !leftover.is_empty() {
+        let message = format!(
+            "{} holds {} tensor(s) this readout does not use: {leftover:?}. A Kev \
+             pointer head is two projections, `q` on the <decide> state and `k` on \
+             each </opt>; anything more is structure that would be silently dropped. \
+             Set {}=1 to load anyway.",
+            path.display(),
+            leftover.len(),
+            crate::weights::ALLOW_UNUSED,
+        );
+        if !crate::weights::unused_tensors_allowed() {
+            return Err(Error::Engine(message));
+        }
+        eprintln!("warning: {message}");
+    }
+
+    let head = PointerHead::new(query, key)?;
     match temperature(path)? {
         Some(temperature) => head.with_temperature(temperature),
         // `Meta.temperature` defaults to 1.0 for checkpoints that never had one
@@ -874,6 +923,69 @@ mod tests {
             }
         }
         archive.finish().unwrap();
+    }
+
+    /// A head with more in it than two projections, or with two candidates for
+    /// one of them, is refused rather than read half.
+    ///
+    /// Which projection reads `<decide>` and which reads each `</opt>` is decided
+    /// by these names alone — swapped, the head still scores plausibly, and no
+    /// shape or self-consistency check here can tell. So a name this loader has to
+    /// guess at, and structure it would drop, both have to be loud.
+    #[test]
+    fn a_head_with_tensors_this_readout_does_not_use_is_refused() {
+        let (hidden, pointer) = (4usize, 3usize);
+        let weight: Vec<f32> = (0..pointer * hidden).map(|i| i as f32 / 8.0).collect();
+        let bias: Vec<f32> = (0..pointer).map(|i| i as f32 / 10.0).collect();
+        let four = |extra: Vec<(&'static str, Vec<f32>, usize, usize)>| {
+            let mut all: Vec<(&str, Vec<f32>, usize, usize)> = vec![
+                ("q.weight", weight.clone(), pointer, hidden),
+                ("q.bias", bias.clone(), pointer, 0),
+                ("k.weight", weight.clone(), pointer, hidden),
+                ("k.bias", bias.clone(), pointer, 0),
+            ];
+            all.extend(extra);
+            all
+        };
+
+        // A third projection: structure that would be silently dropped.
+        let path = std::env::temp_dir().join("kev-head-extra.pt");
+        write_head_pt(
+            &path,
+            1.0,
+            &four(vec![
+                ("out.weight", weight.clone(), pointer, hidden),
+                ("out.bias", bias.clone(), pointer, 0),
+            ]),
+        );
+        let refused = pointer_head(&path).unwrap_err().to_string();
+        assert!(
+            refused.contains("out.weight") && refused.contains("does not use"),
+            "{refused}"
+        );
+
+        // And the same file loads once the caller has said it may.
+        std::env::set_var(crate::weights::ALLOW_UNUSED, "1");
+        let allowed = pointer_head(&path);
+        std::env::remove_var(crate::weights::ALLOW_UNUSED);
+        assert!(allowed.is_ok(), "{:?}", allowed.err());
+
+        // Two candidates for `q.weight`: picking the first would decide the
+        // orientation by the order the file happens to list them in.
+        let ambiguous = std::env::temp_dir().join("kev-head-ambiguous.pt");
+        write_head_pt(
+            &ambiguous,
+            1.0,
+            &four(vec![("pointer.q.weight", weight.clone(), pointer, hidden)]),
+        );
+        let refused = pointer_head(&ambiguous).unwrap_err().to_string();
+        assert!(
+            refused.contains("two candidates") && refused.contains("file order"),
+            "{refused}"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&ambiguous).ok();
     }
 
     #[test]

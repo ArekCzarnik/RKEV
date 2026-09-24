@@ -236,9 +236,9 @@ fn an_adapter_tensor_the_merge_would_pass_over_is_refused() {
 
     // And the escape hatch, for a checkpoint whose extra tensors have been read
     // and judged harmless. Set and cleared here, since the tests share a process.
-    std::env::set_var("KEV_ALLOW_UNMERGED", "1");
+    std::env::set_var("KEV_ALLOW_UNUSED", "1");
     let loaded = Backend::open(&fixture.dir, Some(&adapter));
-    std::env::remove_var("KEV_ALLOW_UNMERGED");
+    std::env::remove_var("KEV_ALLOW_UNUSED");
     assert!(loaded.is_ok(), "{:?}", loaded.err());
 }
 

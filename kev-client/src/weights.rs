@@ -13,11 +13,17 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 
-/// Set to any non-empty value to turn [`Weights::adapter_fully_merged`]'s
-/// refusals into warnings. For a checkpoint that carries something this crate
-/// does not implement but that provably cannot reach the answers — you have read
-/// the names it printed and decided they cannot.
-const OVERRIDE: &str = "KEV_ALLOW_UNMERGED";
+/// Set to any non-empty value to turn a refusal about tensors this crate does not
+/// use into a warning — in the adapter ([`Weights::adapter_fully_merged`]) and in
+/// `head.pt` alike. For a checkpoint that carries something this crate does not
+/// implement, once you have read the names it printed and decided they cannot
+/// reach an answer.
+pub(crate) const ALLOW_UNUSED: &str = "KEV_ALLOW_UNUSED";
+
+/// Whether [`ALLOW_UNUSED`] is set to something.
+pub(crate) fn unused_tensors_allowed() -> bool {
+    std::env::var_os(ALLOW_UNUSED).is_some_and(|value| !value.is_empty())
+}
 
 /// The checkpoint on disk: base weights, and the adapter folded into them as
 /// they are read.
@@ -210,15 +216,12 @@ impl Weights {
                  serve a different model than the checkpoint describes: {}. Either \
                  this crate does not implement what the adapter does, or it names its \
                  modules differently than peft's `base_model.model.<path>`. Set \
-                 {OVERRIDE}=1 to load anyway, once you are satisfied those tensors \
-                 cannot change an answer.",
+                 {ALLOW_UNUSED}=1 to load anyway, once you are satisfied those \
+                 tensors cannot change an answer.",
                 ignored.len(),
                 shorten(&ignored)
             );
-            // `is_none_or` would read better and is stable since 1.82; the crate
-            // says 1.75.
-            let allowed = std::env::var_os(OVERRIDE).is_some_and(|value| !value.is_empty());
-            if !allowed {
+            if !unused_tensors_allowed() {
                 return Err(Error::Engine(message));
             }
             eprintln!("warning: {message}");

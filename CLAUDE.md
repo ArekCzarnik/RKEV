@@ -183,11 +183,22 @@ never uninhabited, which a feature-less build would otherwise trip over in
   the model loads, the answers look reasonable, the numbers are another model's.
   A leftover whose target is a tensor the backbone *reads* is an error naming it; a
   leftover for a module it never runs is a warning, since Kev's answers come from
-  the hidden states and cannot pass through one. `KEV_ALLOW_UNMERGED=1` downgrades
+  the hidden states and cannot pass through one. `KEV_ALLOW_UNUSED=1` downgrades
   the refusal for a checkpoint whose extra tensors have been read and judged
   harmless. Do not weaken this into a warning: it exists because it catches
   locally what previously only a parity recording would have shown, and then only
   as a difference in the decimals.
+- **The pointer head's orientation is pinned empirically, not by shape.** Which
+  projection reads `<decide>` and which reads each `</opt>` comes from `head.pt`'s
+  names (`q`, `k`) and nothing else: swapped, the head scores just as plausibly,
+  and no shape check or self-consistency test can separate the two, because both
+  sides of every comparison would be swapped alike. `PointerHead::swapped()` exists
+  for the one check that can — `examples/sanity.rs` answers the unambiguous cases
+  with it as well and prints both tallies, and says outright when swapping costs
+  nothing rather than implying a result. `pointer_head` also refuses a `head.pt`
+  with tensors it does not use, and refuses two candidates for one name, since file
+  order would otherwise decide the orientation. Keep `swapped()` an involution: the
+  test in `tests/local_engine.rs` pins that, and the check is worthless without it.
 - **Delimiters are unforgeable, and that is load-bearing.** Caller text has
   `<|name|>` rewritten to `<¦name¦>` before tokenising, because a tokenizer
   matches its own special tokens inside ordinary text (`encode_special_tokens`
