@@ -973,12 +973,13 @@ fn running_the_state_once_gives_the_same_answers_as_running_it_per_question() {
     }
 }
 
-/// On an attention-only base the packed pass wins, so nothing is prefilled unless
-/// the caller asks: measured on `kev-0.6b` over a 571-token state, 4325 ms packed
-/// against 12416 ms prefixed and 9112 ms with a cache hit. The threshold is still
-/// there, and `kev.serve`'s 384 still means what it meant.
+/// The threshold cuts both ways, and both sides are the default.
+///
+/// `kev.serve`'s 384 tokens, measured on `kev-0.6b` over a 571-token state: 2952 ms
+/// for the packed pass, 3681 ms for a prefix miss, 1394 ms for a hit. A short state
+/// is not worth the bet and is left to the packed pass; a long one is.
 #[test]
-fn an_attention_only_base_does_not_prefill_by_default() {
+fn the_prefix_threshold_decides_which_states_are_prefilled() {
     let fixture = checkpoint("default-prefix", false, false);
     // Long enough that the old 384-token threshold would have prefilled it.
     // This tokenizer knows 22 tokens: 1 opens the state, 2..5 are the other four
@@ -992,26 +993,44 @@ fn an_attention_only_base_does_not_prefill_by_default() {
     let readout: Vec<usize> = vec![ids.len() - 1, ids.len() - 2];
     let pass = Pass::new(&ids, &positions, &segments, &readout);
 
-    let mut default = Backend::open(&fixture.dir, None).unwrap();
-    let packed = default.hidden(&pass).unwrap();
-    default.hidden(&pass).unwrap();
+    // Past the threshold: prefilled, and found again the second time.
+    let mut long = Backend::open(&fixture.dir, None).unwrap();
+    let prefixed = long.hidden(&pass).unwrap();
+    long.hidden(&pass).unwrap();
     assert_eq!(
-        default.prefix_hits(),
-        (0, 0),
-        "nothing should have been prefilled, so there is nothing to hit or miss"
+        long.prefix_hits(),
+        (1, 1),
+        "a 500-token state is past the 384 threshold, so the second pass is a hit"
     );
 
-    // The knob still works, and the answers do not depend on which path ran.
-    let mut asked = Backend::open(&fixture.dir, None)
-        .unwrap()
-        .with_prefix_min_tokens(384);
-    let prefixed = asked.hidden(&pass).unwrap();
-    asked.hidden(&pass).unwrap();
-    assert_eq!(
-        asked.prefix_hits(),
-        (1, 1),
-        "with the threshold lowered the second pass has to be a hit"
+    // Below it, nothing is prefilled: the packed pass runs the state once anyway,
+    // and a miss would cost more than the bet is worth.
+    let short_ids = vec![1, 6, 6, 2, 3, 4, 5];
+    let short_segments = vec![0, 0, 0, 1, 1, 1, 1];
+    let short_positions: Vec<u32> = (0..short_ids.len() as u32).collect();
+    let short_readout = vec![short_ids.len() - 1, short_ids.len() - 2];
+    let short = Pass::new(
+        &short_ids,
+        &short_positions,
+        &short_segments,
+        &short_readout,
     );
+    let mut brief = Backend::open(&fixture.dir, None).unwrap();
+    let packed = brief.hidden(&short).unwrap();
+    brief.hidden(&short).unwrap();
+    assert_eq!(
+        brief.prefix_hits(),
+        (0, 0),
+        "a short state is left to the packed pass, so there is nothing to hit"
+    );
+    assert!(!packed.is_empty());
+
+    // And the two paths answer the same, which is what makes the threshold a
+    // question of time only.
+    let mut forced = Backend::open(&fixture.dir, None)
+        .unwrap()
+        .with_prefix(false);
+    let packed = forced.hidden(&pass).unwrap();
 
     for (packed, prefixed) in packed.iter().flatten().zip(prefixed.iter().flatten()) {
         assert!(

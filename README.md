@@ -340,14 +340,15 @@ Fünf Fragen über 571 State-Tokens, Median aus fünf Pässen, `kev-0.6b` über
 
 | | f32 gepackt | f32 State einmal | f32 State im Cache | f16 State einmal |
 |---|---|---|---|---|
-| CPU | **4325 ms** | 12416 ms | 9112 ms | 9484 ms |
-| Metal | **874 ms** | 3403 ms | 2632 ms | 3315 ms |
+| CPU | 2952 ms | 3681 ms | **1394 ms** | 2752 ms |
+| CPU, vor dem Fix unten | 4325 ms | 12416 ms | 9112 ms | 9484 ms |
+| Metal, vor dem Fix unten | 874 ms | 3403 ms | 2632 ms | 3315 ms |
 
 Vier Befunde, drei davon gegen die Erwartung:
 
-- **Metal ist fünfmal schneller** als die CPU (874 gegen 4325 ms) und damit der
-  einzige große Hebel. Auf der GPU bringt f16 dann nichts mehr (1.03×), auf der CPU
-  1.31×.
+- **Metal war fünfmal schneller** als die CPU (874 gegen 4325 ms) — gemessen aber
+  *vor* dem Fix unten, der die CPU auf 2952 ms brachte. Der Abstand ist also kleiner
+  geworden und neu zu messen. Auf der GPU bringt f16 nichts (1.03×), auf der CPU 1.34×.
 - **Ein gebatchter Pass rechnete jede Projektion pro Zeile neu.** candles
   `broadcast_matmul` verteilt nicht die Eingabe, sondern **materialisiert die
   Gewichtsmatrix für jede Batch-Zeile** — bei fünf Fragen also fünf Kopien von 8 MB
@@ -355,16 +356,17 @@ Vier Befunde, drei davon gegen die Erwartung:
   Projektion über 5×45 Zeilen): **93.8 ms gegen 17.8 ms**, Faktor 5.3. `linear`
   faltet die Batch-Dimension jetzt in die Zeilen, so wie der quantisierte Kern es
   von sich aus tut. Betroffen war alles, was Zeilen batcht: die Zweige hinter einem
-  Prefix, `system_one_batch_blocking`, und auf einer hybriden Basis **jeder** Pass.
-- **Der State-Prefix kostete deshalb, statt zu sparen.** Der gepackte Pass rechnet
-  State und alle Zweige in einem maskierten Durchgang — eine Zeile, also kein
-  Aufschlag; der Prefix-Pfad rechnet einen State-Pass und dann einen gebatchten Pass
-  über alle Fragen, und genau der zahlte fünffach. Bei 571 Tokens war er 2.9×
-  langsamer, **auch mit Cache-Treffer** (9112 gegen 4325 ms). Deshalb ist er auf einer
-  attention-only Basis jetzt **standardmäßig aus**; `with_prefix_min_tokens(384)`
-  stellt die Schwelle der Python-Seite wieder her, `0` prefillt alles. Bei einer
-  rekurrenten Basis bleibt er an: dort gibt es keinen maskierten Pass, und jede Frage
-  würde sonst den ganzen State erneut rechnen.
+  Prefix, `system_one_batch_blocking` (jetzt 1.22× statt 0.96×), und auf einer
+  hybriden Basis **jeder** Pass. Auch der gepackte Pfad zahlte einmal pro Projektion,
+  weil ein rangzwei-Gewicht für einen dreirangigen Eingang ohnehin gebroadcastet
+  wurde — daher fielen auch seine 4325 ms auf 2952 ms.
+- **Der State-Prefix zahlt sich aus, sobald ein State wiederkommt** — und genau das
+  hatte der Fehler oben verdeckt. Vorher kostete er das 2.9-Fache, was mich kurzzeitig
+  die Voreinstellung abschalten ließ; mit einem gemm statt fünf steht es so: 2952 ms
+  gepackt, 3681 ms bei einem Fehlschlag, **1394 ms bei einem Treffer**. Ein neuer
+  State kostet also ein Viertel mehr, ein wiederkehrender die Hälfte weniger — die
+  Wette lohnt ab etwa einem Drittel wiederkehrender States. Deshalb steht die
+  Schwelle wieder auf den 384 Tokens der Python-Seite; `0` prefillt alles.
 - **Quantisierung zahlt sich nicht aus.** q8_0 ist neutral (1.05×), q6k und q4k sind
   *langsamer* (0.64× und 0.76×) — candles k-Quant-Kerne schlagen auf Apple-Silizium
   den dichten f32-Pfad nicht. Dazu die Kosten an den Antworten: q8_0 0.077, q6k

@@ -184,12 +184,13 @@ The state is run once per request and every question continues from it, and the
 last few states are kept across requests, keyed by their tokens — a repeated
 document then costs only its questions.
 
-On an attention-only base, **measured, that costs rather than saves**, so it is off
-by default there: the packed masked pass already runs the state once *and* every
-branch in one go, while the prefix path pays for a pass per question. `kev-0.6b` over
-a 571-token state: 4325 ms packed against 12416 ms prefixed and 9112 ms with a cache
-hit. `with_prefix_min_tokens(384)` asks for what the reference does, `0` prefills
-everything. On a recurrent base it stays on, since there is no masked pass to fall
+On an attention-only base it is a bet, and 384 tokens is where the reference places
+it. Measured on `kev-0.6b` over a 571-token state: 2952 ms for the packed pass,
+3681 ms for a prefix miss, **1394 ms for a hit** — a quarter more when the state is
+new, half as much when it comes back, so it pays from about a third of requests
+repeating one. (An earlier measurement said the opposite; it was measuring the
+`broadcast_matmul` fault described in the root README, not the prefix.) `0` prefills
+everything. On a recurrent base it is always on, since there is no masked pass to fall
 back on:
 
 ```rust

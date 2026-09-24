@@ -231,13 +231,13 @@ impl Backend {
             // A recurrent base has to run the whole state per question otherwise,
             // so the reuse always pays there and every state is prefilled.
             //
-            // An attention-only base is the opposite, measured: the packed pass
-            // already runs the state once *and* every branch with it, while the
-            // prefix path pays a pass per question. On kev-0.6b over a 571-token
-            // state: 4325 ms packed against 12416 ms prefixed and 9112 ms with a
-            // cache hit. So it is off here unless a caller lowers the threshold,
-            // which is what `kev.serve`'s 384 would do.
-            prefix_min: if hybrid { 0 } else { usize::MAX },
+            // On an attention-only base it is a bet, and the 384 is `kev.serve`'s.
+            // Measured on kev-0.6b over a 571-token state: 2952 ms for the packed
+            // pass, 3681 ms for a prefix miss, 1394 ms for a hit. So a miss costs a
+            // quarter and a hit saves half - worth it from about a third of requests
+            // repeating a state, which is what a document being asked several
+            // questions looks like.
+            prefix_min: if hybrid { 0 } else { 384 },
             cache: PrefixCache {
                 keep: 4,
                 floor: 0,
@@ -261,15 +261,15 @@ impl Backend {
     }
 
     /// The shortest state worth prefilling instead of running the packed pass:
-    /// `0` on a recurrent base, and off on an attention-only one.
+    /// `0` on a recurrent base, 384 tokens on an attention-only one.
     ///
     /// On a recurrent base the prefix is the difference between running the state
     /// once and running it per question, so every state is worth it. On an
-    /// attention-only base the packed pass already runs the state once and every
-    /// branch with it, and measurement says the prefix costs rather than saves —
-    /// `kev-0.6b` over a 571-token state: 4325 ms packed, 12416 ms prefixed, 9112 ms
-    /// with a cache hit. Pass `384` for what `kev.serve` does, or `0` to prefill
-    /// everything, but measure your own shape before believing either.
+    /// attention-only base it is a bet: measured on `kev-0.6b` over a 571-token
+    /// state, 2952 ms packed against 3681 ms for a miss and 1394 ms for a hit — a
+    /// quarter more when the state is new, half as much when it comes back. `0`
+    /// prefills everything; a very large value turns the prefix off for the states
+    /// it would have caught.
     pub fn with_prefix_min_tokens(mut self, tokens: usize) -> Self {
         self.prefix_min = tokens;
         self
