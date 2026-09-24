@@ -11,11 +11,13 @@ gleich bleiben.
 - ✅ Task 1: `with_chunk_size` wirkt nicht (Bug)
 - ✅ Task 2: Fehlertext bei bf16 auf der CPU (Bug)
 - ⬜ Task 3: Accelerate / MKL als optionales Feature
-- ⬜ Task 4: GQA ohne `repeat_kv`, State-Keys vortransponiert
+- ✅ Task 4: GQA ohne `repeat_kv`, State-Keys vortransponiert
 - ⬜ Task 5: Prefill ohne verworfene Arbeit im letzten Layer
 - ⬜ Task 6: Letzter Layer nur an den Readout-Positionen
 - ⬜ Task 7: Projektionen beim Laden zusammenlegen
 - ⬜ Task 8: q statt Scores skalieren
+- ⬜ Task 9: Maske nur auf den Branch-Teil der Scores
+- ⬜ Task 10: Qwen3-Prefix-Messung misst den Packed-Pass
 
 ## Bugs
 
@@ -64,6 +66,22 @@ unwiederholte K/V multiplizieren; die Keys im `Prefix` beim Prefill schon
 transponiert und contiguous ablegen. Die Transkriptionstests in
 `tests/qwen3.rs`/`tests/qwen3_5.rs` müssen unverändert grün bleiben.
 
+**Erledigt.** `weights::grouped_attention` ersetzt die Attention-Rümpfe beider
+Backbones; `repeat_kv` ist weg, `state_keys` transponiert die Keys einmal beim
+Prefill. Gemessen isoliert, eine Attention-Schicht in kev-0.6b-Shapes (16 über
+8 Heads, 128 breit, 571 State-Tokens, 5×45 Branch-Zeilen), Linux-Container
+aarch64, dreimal: 80–90 ms → 65–69 ms, **~1,25x, bitgleich**
+(`what_reading_the_state_unrepeated_is_worth`). Auf einem echten Checkpoint
+noch nicht gemessen. Zwei absichtliche Brüche (falsche Head-Zuordnung, Keys
+nicht transponiert) lassen die Transkriptions- bzw. Prefix-Tests beider
+Backbones fehlschlagen.
+
+Aufteilung danach, pro Schicht: q·State-Keys 16 ms, Gewichte·State-Values
+20 ms, Maske + Skalierung 11 ms, Softmax 5 ms, q·Branch-Keys 4 ms, Transponieren
+der State-Keys 1,3 ms. Der Gewinn kam also aus den Wiederholungen, nicht aus
+dem Transponieren — und Maske + Skalierung sind der nächste sichtbare Posten
+(Task 8, Task 9).
+
 ### Task 5: Prefill ohne verworfene Arbeit im letzten Layer
 
 Ein Prefill behält nur K/V pro Layer, `run` rechnet für die State-Tokens aber
@@ -86,6 +104,26 @@ Quantisierung zu je einer Projektion zusammenfügen. Weniger Kernel-Aufrufe,
 
 `scores * scale` skaliert `[batch, heads, len, state+len]`; q vor dem Matmul zu
 skalieren ist dieselbe Rechnung auf dem kleineren Tensor. Klein, aber trivial.
+
+Nicht bitgleich, sobald `1/sqrt(dim)` keine Zweierpotenz ist (128: nein, 64:
+ja) — also gegen die Toleranzen der Transkriptionstests prüfen, nicht auf
+Gleichheit.
+
+### Task 9: Maske nur auf den Branch-Teil der Scores
+
+In einem Branch-Pass ist die Maske über den ganzen State-Teil null
+(`branch_batch_mask`: jeder Branch darf den ganzen State lesen). Trotzdem wird
+sie per Broadcast über `[batch, heads, len, state+len]` addiert — gemessen
+zusammen mit der Skalierung 11 ms pro Schicht bei 571 State-Tokens. Nur auf den
+`[.., len, len]`-Branch-Teil angewendet, vor dem `cat`, ist es exakt dasselbe
+und etwa ein Dreizehntel der Elemente.
+
+### Task 10: Qwen3-Prefix-Messung misst den Packed-Pass
+
+`how_much_the_prefix_saves` in `tests/qwen3.rs` fragt mit 241 State-Tokens,
+unter der Schwelle von 384, ohne `with_prefix_min_tokens(0)` — die Zeilen
+„cache hit“ und „new state, prefilled“ messen beide den Packed-Pass. Genau die
+Falle, vor der `examples/measure.rs` sich schützt.
 
 ## Bewusst nicht angefasst
 

@@ -21,8 +21,8 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::weights::{
-    attention_mask, branch_batch_mask, pad_rows, prefill_batch_mask, repeat_kv, rms_norm, rope,
-    rotary_tables, shared_matmul, Projection, Quantisation, Weights,
+    attention_mask, branch_batch_mask, grouped_attention, pad_rows, prefill_batch_mask, rms_norm,
+    rope, rotary_tables, state_keys, Projection, Quantisation, Weights,
 };
 
 /// The parts of a Qwen3 `config.json` this backbone needs.
@@ -157,7 +157,8 @@ impl Config {
 /// A prefilled state: what every question of a request continues from.
 ///
 /// Holds one layer's worth of keys and values per layer, for the state tokens
-/// only. Cheap to share — the tensors are read, never written.
+/// only, the keys already transposed ([`state_keys`]) so that no pass has to do
+/// it again. Cheap to share — the tensors are read, never written.
 pub struct Prefix {
     tokens: Vec<u32>,
     layers: Vec<(Tensor, Tensor)>,
@@ -287,7 +288,10 @@ impl Backbone {
         let (_, layers) = self.run(&[(ids, positions)], &mask, None)?;
         Ok(Prefix {
             tokens: ids.to_vec(),
-            layers,
+            layers: layers
+                .iter()
+                .map(|(keys, values)| Ok((state_keys(keys)?, values.clone())))
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 
@@ -319,9 +323,7 @@ impl Backbone {
                     .iter()
                     .map(|(keys, values)| {
                         Ok((
-                            keys.narrow(0, row, 1)?
-                                .narrow(2, 0, *length)?
-                                .contiguous()?,
+                            state_keys(&keys.narrow(0, row, 1)?.narrow(2, 0, *length)?)?,
                             values
                                 .narrow(0, row, 1)?
                                 .narrow(2, 0, *length)?
@@ -489,52 +491,10 @@ impl Backbone {
         let k = rope(&k.transpose(1, 2)?, cos, sin)?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let repeats = heads / kv_heads;
-        let scale = 1.0 / (dim as f64).sqrt();
-
         // The state's keys sit in front of this pass's, which is what makes a branch
-        // see the whole state and nothing of another branch. Scored in two pieces
-        // rather than concatenated: the state is one tensor shared by every row of
-        // the batch, and materialising it per row is what used to cost a branch pass
-        // most of its time.
-        let branch_keys = repeat_kv(&k, repeats)?;
-        let scores = match past {
-            None => q.matmul(&branch_keys.transpose(2, 3)?)?,
-            Some((past_k, _)) => {
-                let state = repeat_kv(past_k, repeats)?.transpose(2, 3)?.contiguous()?;
-                Tensor::cat(
-                    &[
-                        shared_matmul(&q, &state)?,
-                        q.matmul(&branch_keys.transpose(2, 3)?)?,
-                    ],
-                    3,
-                )?
-            }
-        };
-        let scores = (scores * scale)?;
-        // The mask is what keeps one question from reading another.
-        let scores = scores.broadcast_add(mask)?;
-        // The reference takes the softmax in f32 whatever the backbone runs in.
-        let weights = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
-            .to_dtype(self.dtype)?;
-
-        // And the same split on the way out: a matmul distributes over the
-        // concatenation, so the state's values are read where they lie.
-        let branch_values = repeat_kv(&v, repeats)?;
-        let attended = match past {
-            None => weights.matmul(&branch_values)?,
-            Some((_, past_v)) => {
-                let state = repeat_kv(past_v, repeats)?;
-                let tokens = state.dim(2)?;
-                let from_state =
-                    shared_matmul(&weights.narrow(3, 0, tokens)?.contiguous()?, &state)?;
-                let from_branch = weights
-                    .narrow(3, tokens, len)?
-                    .contiguous()?
-                    .matmul(&branch_values)?;
-                (from_state + from_branch)?
-            }
-        };
+        // see the whole state and nothing of another branch.
+        let scale = 1.0 / (dim as f64).sqrt();
+        let attended = grouped_attention(&q, &k, &v, past, mask, scale)?;
 
         let out = attended
             .transpose(1, 2)?

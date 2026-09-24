@@ -470,15 +470,77 @@ pub(crate) fn shared_matmul(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
         .contiguous()?)
 }
 
-/// Grouped-query attention: every key/value head serves `n` query heads.
-pub(crate) fn repeat_kv(xs: &Tensor, n: usize) -> candle_core::Result<Tensor> {
-    if n == 1 {
-        return Ok(xs.clone());
-    }
-    let (batch, heads, len, dim) = xs.dims4()?;
-    xs.unsqueeze(2)?
-        .expand((batch, heads, n, len, dim))?
-        .reshape((batch, heads * n, len, dim))
+/// Softmax attention over a batch of rows, grouped-query, optionally continuing
+/// from a prefilled state: `[batch, heads, len, dim]` out.
+///
+/// `q` is `[batch, heads, len, dim]`, `k` and `v` are `[batch, kv_heads, len,
+/// dim]`, and `mask` is additive over `[.., len, state + len]`. A state comes as
+/// `(keys, values)` from [`state_keys`] and the prefill: `[1, kv_heads, dim,
+/// state]` and `[1, kv_heads, state, dim]`.
+///
+/// Query head `h` reads key/value head `h / group`, so the `group` query heads
+/// that share one are stacked along the rows and multiplied against it once. The
+/// obvious spelling repeats every key/value head `group` times instead, which
+/// copies them — and for a state that is shared by every row and every request
+/// that hits the cache, it copied the whole state per layer per pass.
+///
+/// The state is scored separately from the branch rather than concatenated in
+/// front of it, for the same reason: it is one tensor every row shares, and
+/// [`shared_matmul`] reads it where it lies. A matmul distributes over the
+/// concatenation, so this is the same arithmetic.
+pub(crate) fn grouped_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    past: Option<(&Tensor, &Tensor)>,
+    mask: &Tensor,
+    scale: f64,
+) -> Result<Tensor> {
+    let (batch, heads, len, dim) = q.dims4()?;
+    let kv_heads = k.dim(1)?;
+    let group = heads / kv_heads;
+    // `[batch, heads, len, cols]` <-> `[batch, kv_heads, group * len, cols]`: the
+    // same memory, since the heads of one group are adjacent.
+    let grouped = |x: &Tensor| -> Result<Tensor> {
+        let cols = x.dim(3)?;
+        Ok(x.contiguous()?
+            .reshape((batch, kv_heads, group * len, cols))?)
+    };
+    let ungrouped = |x: Tensor| -> Result<Tensor> {
+        let cols = x.dim(3)?;
+        Ok(x.reshape((batch, heads, len, cols))?)
+    };
+
+    let queries = grouped(q)?;
+    let branch = ungrouped(queries.matmul(&k.transpose(2, 3)?)?)?;
+    let scores = match past {
+        None => branch,
+        Some((keys, _)) => Tensor::cat(&[ungrouped(shared_matmul(&queries, keys)?)?, branch], 3)?,
+    };
+    let scores = (scores * scale)?;
+    // The mask is what keeps one question from reading another.
+    let scores = scores.broadcast_add(mask)?;
+    // The reference takes the softmax in f32 whatever the backbone runs in.
+    let weights =
+        candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
+
+    let attended = match past {
+        None => grouped(&weights)?.matmul(v)?,
+        Some((_, values)) => {
+            let tokens = values.dim(2)?;
+            let from_state = shared_matmul(&grouped(&weights.narrow(3, 0, tokens)?)?, values)?;
+            let from_branch = grouped(&weights.narrow(3, tokens, len)?)?.matmul(v)?;
+            (from_state + from_branch)?
+        }
+    };
+    Ok(attended.reshape((batch, heads, len, dim))?)
+}
+
+/// A state's keys as [`grouped_attention`] reads them: `[.., kv_heads, dim,
+/// tokens]`, transposed once at prefill rather than on every pass that
+/// continues from it.
+pub(crate) fn state_keys(keys: &Tensor) -> Result<Tensor> {
+    Ok(keys.transpose(2, 3)?.contiguous()?)
 }
 
 /// Cosine and sine tables for exactly the positions asked for, rather than for
@@ -648,4 +710,166 @@ fn shorten(names: &[String]) -> String {
         shown.join(", "),
         names.len() - shown.len()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Grouped-query attention the way it was spelled before [`grouped_attention`]:
+    /// every key/value head repeated for the query heads that read it, the state's
+    /// keys included — once per layer, per pass. Kept as the reference the grouped
+    /// form is held to, and as the baseline it is measured against.
+    fn repeated_attention(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        past: Option<(&Tensor, &Tensor)>,
+        mask: &Tensor,
+        scale: f64,
+    ) -> Result<Tensor> {
+        let repeat = |xs: &Tensor| -> Result<Tensor> {
+            let (batch, kv_heads, len, dim) = xs.dims4()?;
+            let n = q.dim(1)? / kv_heads;
+            Ok(xs
+                .unsqueeze(2)?
+                .expand((batch, kv_heads, n, len, dim))?
+                .reshape((batch, kv_heads * n, len, dim))?)
+        };
+        let len = q.dim(2)?;
+        let branch_keys = repeat(k)?;
+        let scores = match past {
+            None => q.matmul(&branch_keys.transpose(2, 3)?)?,
+            Some((keys, _)) => {
+                let state = repeat(keys)?.transpose(2, 3)?.contiguous()?;
+                Tensor::cat(
+                    &[
+                        shared_matmul(q, &state)?,
+                        q.matmul(&branch_keys.transpose(2, 3)?)?,
+                    ],
+                    3,
+                )?
+            }
+        };
+        let scores = (scores * scale)?.broadcast_add(mask)?;
+        let weights = candle_nn::ops::softmax_last_dim(&scores)?;
+        let branch_values = repeat(v)?;
+        Ok(match past {
+            None => weights.matmul(&branch_values)?,
+            Some((_, values)) => {
+                let state = repeat(values)?;
+                let tokens = state.dim(2)?;
+                let from_state =
+                    shared_matmul(&weights.narrow(3, 0, tokens)?.contiguous()?, &state)?;
+                let from_branch = weights
+                    .narrow(3, tokens, len)?
+                    .contiguous()?
+                    .matmul(&branch_values)?;
+                (from_state + from_branch)?
+            }
+        })
+    }
+
+    /// Branches of `len` tokens continuing from a state of `state` tokens: the
+    /// queries, the branch's keys and values, the state as a prefill keeps it
+    /// (keys untransposed, for the repeated form to transpose), and the mask.
+    struct Case {
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        keys: Tensor,
+        values: Tensor,
+        mask: Tensor,
+    }
+
+    impl Case {
+        fn new(
+            batch: usize,
+            heads: usize,
+            kv_heads: usize,
+            len: usize,
+            state: usize,
+            dim: usize,
+        ) -> Self {
+            let device = Device::Cpu;
+            let noise = |shape: (usize, usize, usize, usize)| {
+                Tensor::randn(0f32, 1f32, shape, &device).unwrap()
+            };
+            Self {
+                q: noise((batch, heads, len, dim)),
+                k: noise((batch, kv_heads, len, dim)),
+                v: noise((batch, kv_heads, len, dim)),
+                keys: noise((1, kv_heads, state, dim)),
+                values: noise((1, kv_heads, state, dim)),
+                mask: branch_batch_mask(state, &vec![len; batch], len, &device, DType::F32)
+                    .unwrap(),
+            }
+        }
+
+        fn grouped(&self) -> Tensor {
+            let keys = state_keys(&self.keys).unwrap();
+            let past = Some((&keys, &self.values));
+            grouped_attention(&self.q, &self.k, &self.v, past, &self.mask, 0.125).unwrap()
+        }
+
+        fn repeated(&self) -> Tensor {
+            let past = Some((&self.keys, &self.values));
+            repeated_attention(&self.q, &self.k, &self.v, past, &self.mask, 0.125).unwrap()
+        }
+    }
+
+    fn largest_difference(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn grouping_the_query_heads_is_the_same_attention_as_repeating_the_keys() {
+        // Four query heads per key/value head, so a head read by the wrong group
+        // cannot line up by accident; three rows, so the batch folding is in play.
+        let case = Case::new(3, 8, 2, 5, 7, 4);
+
+        let difference = largest_difference(&case.grouped(), &case.repeated());
+
+        assert!(difference < 1e-5, "differs by {difference}");
+    }
+
+    /// What repeating the state's keys and values cost per layer, at kev-0.6b's
+    /// shapes: sixteen query heads over eight key/value heads, 128 wide, a
+    /// 571-token state and five branches of forty-five tokens.
+    #[test]
+    #[ignore = "a measurement, not an assertion: cargo test --release -- --ignored --nocapture"]
+    fn what_reading_the_state_unrepeated_is_worth() {
+        use std::time::Instant;
+
+        let case = Case::new(5, 16, 8, 45, 571, 128);
+        let rounds = 20;
+        let time = |attend: &dyn Fn() -> Tensor| {
+            attend(); // warm up
+            let started = Instant::now();
+            for _ in 0..rounds {
+                attend();
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / rounds as f64
+        };
+
+        let repeated = time(&|| case.repeated());
+        // The grouped form transposes the state's keys once, at prefill; timed
+        // here per pass anyway, so the comparison does not flatter it.
+        let grouped = time(&|| case.grouped());
+        let difference = largest_difference(&case.grouped(), &case.repeated());
+
+        println!(
+            "one attention layer, 5x45 branch rows over a 571-token state:\n  \
+             repeated {repeated:>8.2} ms\n  grouped  {grouped:>8.2} ms ({:.1}x, largest \
+             difference {difference:.1e})",
+            repeated / grouped
+        );
+    }
 }
