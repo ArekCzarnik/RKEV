@@ -15,7 +15,7 @@ gleich bleiben.
 - ✅ Task 5: Prefill ohne verworfene Arbeit im letzten Layer
 - ✅ Task 6: Letzter Layer nur an den Readout-Positionen
 - ⬜ Task 7: Projektionen beim Laden zusammenlegen
-- ⬜ Task 8: q statt Scores skalieren
+- ✅ Task 8: q statt Scores skalieren
 - ⬜ Task 9: Maske nur auf den Branch-Teil der Scores
 - ⬜ Task 10: Qwen3-Prefix-Messung misst den Packed-Pass
 
@@ -145,6 +145,15 @@ skalieren ist dieselbe Rechnung auf dem kleineren Tensor. Klein, aber trivial.
 Nicht bitgleich, sobald `1/sqrt(dim)` keine Zweierpotenz ist (128: nein, 64:
 ja) — also gegen die Toleranzen der Transkriptionstests prüfen, nicht auf
 Gleichheit.
+
+**Erledigt.** `grouped_attention` skaliert q vor dem Produkt. Im selben Prozess
+gegeneinander gemessen, in 0.6B-Branch-Shapes (5×16×45 Zeilen, 616 gegen 128
+Spalten): 2,84–2,89 ms → 0,60–0,64 ms pro Schicht, bei 28 Layern etwa 60 ms pro
+Request in diesem Container. Die ganze Attention-Schicht
+(`what_reading_the_state_unrepeated_is_worth`) 67–81 → 62–68 ms, im Rauschen.
+Die Tests halten: Transkription auf 1e-5; der Äquivalenztest bleibt bitgleich,
+weil seine Skala 0,125 eine Zweierpotenz ist. Ohne Skalierung schlagen Tests in
+allen drei Dateien fehl.
 
 ### Task 9: Maske nur auf den Branch-Teil der Scores
 
