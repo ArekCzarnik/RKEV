@@ -1145,15 +1145,21 @@ fn how_much_the_prefix_saves() {
     }
     let head = || pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
 
+    // 241 state tokens is below the 384 an attention-only base waits for before
+    // it prefills, so without lowering the threshold both prefix rows measure the
+    // packed pass — which they did, all three rows within a millisecond.
     for (label, backend) in [
         (
             "repeated state (cache hit)",
-            Backend::open(&fixture.dir, None).unwrap(),
+            Backend::open(&fixture.dir, None)
+                .unwrap()
+                .with_prefix_min_tokens(0),
         ),
         (
             "new state, prefilled      ",
             Backend::open(&fixture.dir, None)
                 .unwrap()
+                .with_prefix_min_tokens(0)
                 .with_prefix_cache(0),
         ),
         (
