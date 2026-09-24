@@ -184,13 +184,13 @@ The state is run once per request and every question continues from it, and the
 last few states are kept across requests, keyed by their tokens — a repeated
 document then costs only its questions.
 
-On an attention-only base, **measured, that costs rather than saves**: the packed
-masked pass already runs the state once *and* every branch in one go, while the
-prefix path pays for a pass per question. `kev-0.6b` over a 571-token state: 4325 ms
-packed against 12416 ms prefixed and 9112 ms with a cache hit. The prefix is kept
-because a recurrent base has no masked pass to fall back on, and the threshold below
-which it is skipped comes from the reference — but on this model and this machine the
-packed pass won every configuration measured:
+On an attention-only base, **measured, that costs rather than saves**, so it is off
+by default there: the packed masked pass already runs the state once *and* every
+branch in one go, while the prefix path pays for a pass per question. `kev-0.6b` over
+a 571-token state: 4325 ms packed against 12416 ms prefixed and 9112 ms with a cache
+hit. `with_prefix_min_tokens(384)` asks for what the reference does, `0` prefills
+everything. On a recurrent base it stays on, since there is no masked pass to fall
+back on:
 
 ```rust
 let backend = Backend::open(base, Some(checkpoint))?

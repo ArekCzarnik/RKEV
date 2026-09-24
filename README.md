@@ -348,13 +348,14 @@ Drei Befunde, zwei davon gegen die Erwartung:
 - **Metal ist fünfmal schneller** als die CPU (874 gegen 4325 ms) und damit der
   einzige große Hebel. Auf der GPU bringt f16 dann nichts mehr (1.03×), auf der CPU
   1.31×.
-- **Der State-Prefix kostet hier, statt zu sparen.** Der gepackte Pass rechnet State
-  und alle Zweige in einem maskierten Durchgang; der Prefix-Pfad rechnet einen
-  State-Pass und dann einen Pass pro Frage — bei 571 Tokens ist das 2.9× langsamer,
-  **auch mit Cache-Treffer** (9112 gegen 4325 ms). Die Schwelle von 384 State-Tokens
-  ist aus der Python-Seite übernommen; für diese Engine ist sie auf diesem Modell
-  falsch. Bei einer rekurrenten Basis bleibt der Prefix nötig, dort gibt es keinen
-  maskierten Pass.
+- **Der State-Prefix kostet hier, statt zu sparen** — deshalb ist er auf einer
+  attention-only Basis inzwischen **standardmäßig aus**. Der gepackte Pass rechnet
+  State und alle Zweige in einem maskierten Durchgang; der Prefix-Pfad rechnet einen
+  State-Pass und dann einen pro Frage — bei 571 Tokens 2.9× langsamer, **auch mit
+  Cache-Treffer** (9112 gegen 4325 ms). Die Schwelle von 384 Tokens stammt aus der
+  Python-Seite; `with_prefix_min_tokens(384)` stellt sie wieder her, `0` prefillt
+  alles. Bei einer rekurrenten Basis bleibt der Prefix an: dort gibt es keinen
+  maskierten Pass, und jede Frage würde sonst den ganzen State erneut rechnen.
 - **Quantisierung zahlt sich nicht aus.** q8_0 ist neutral (1.05×), q6k und q4k sind
   *langsamer* (0.64× und 0.76×) — candles k-Quant-Kerne schlagen auf Apple-Silizium
   den dichten f32-Pfad nicht. Dazu die Kosten an den Antworten: q8_0 0.077, q6k

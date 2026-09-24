@@ -973,6 +973,54 @@ fn running_the_state_once_gives_the_same_answers_as_running_it_per_question() {
     }
 }
 
+/// On an attention-only base the packed pass wins, so nothing is prefilled unless
+/// the caller asks: measured on `kev-0.6b` over a 571-token state, 4325 ms packed
+/// against 12416 ms prefixed and 9112 ms with a cache hit. The threshold is still
+/// there, and `kev.serve`'s 384 still means what it meant.
+#[test]
+fn an_attention_only_base_does_not_prefill_by_default() {
+    let fixture = checkpoint("default-prefix", false, false);
+    // Long enough that the old 384-token threshold would have prefilled it.
+    // This tokenizer knows 22 tokens: 1 opens the state, 2..5 are the other four
+    // delimiters, and 6 is a word.
+    let mut ids: Vec<u32> = vec![1];
+    ids.extend(std::iter::repeat(6).take(500));
+    let mut segments: Vec<u32> = vec![0; ids.len()];
+    ids.extend([2, 3, 4, 5]);
+    segments.extend([1, 1, 1, 1]);
+    let positions: Vec<u32> = (0..ids.len() as u32).collect();
+    let readout: Vec<usize> = vec![ids.len() - 1, ids.len() - 2];
+    let pass = Pass::new(&ids, &positions, &segments, &readout);
+
+    let mut default = Backend::open(&fixture.dir, None).unwrap();
+    let packed = default.hidden(&pass).unwrap();
+    default.hidden(&pass).unwrap();
+    assert_eq!(
+        default.prefix_hits(),
+        (0, 0),
+        "nothing should have been prefilled, so there is nothing to hit or miss"
+    );
+
+    // The knob still works, and the answers do not depend on which path ran.
+    let mut asked = Backend::open(&fixture.dir, None)
+        .unwrap()
+        .with_prefix_min_tokens(384);
+    let prefixed = asked.hidden(&pass).unwrap();
+    asked.hidden(&pass).unwrap();
+    assert_eq!(
+        asked.prefix_hits(),
+        (1, 1),
+        "with the threshold lowered the second pass has to be a hit"
+    );
+
+    for (packed, prefixed) in packed.iter().flatten().zip(prefixed.iter().flatten()) {
+        assert!(
+            (packed - prefixed).abs() < 1e-4,
+            "the two paths answered differently: {packed} against {prefixed}"
+        );
+    }
+}
+
 #[test]
 fn a_repeated_state_is_prefilled_once_and_then_found() {
     let fixture = checkpoint("cache", false, false);
