@@ -12,7 +12,7 @@ gleich bleiben.
 - ✅ Task 2: Fehlertext bei bf16 auf der CPU (Bug)
 - ⬜ Task 3: Accelerate / MKL als optionales Feature
 - ✅ Task 4: GQA ohne `repeat_kv`, State-Keys vortransponiert
-- ⬜ Task 5: Prefill ohne verworfene Arbeit im letzten Layer
+- ✅ Task 5: Prefill ohne verworfene Arbeit im letzten Layer
 - ⬜ Task 6: Letzter Layer nur an den Readout-Positionen
 - ⬜ Task 7: Projektionen beim Laden zusammenlegen
 - ⬜ Task 8: q statt Scores skalieren
@@ -87,6 +87,21 @@ dem Transponieren — und Maske + Skalierung sind der nächste sichtbare Posten
 Ein Prefill behält nur K/V pro Layer, `run` rechnet für die State-Tokens aber
 auch im letzten Layer Attention-Ausgabe, `o_proj`, MLP und die finale Norm.
 Etwa 1/28 des Prefills, exakt einzusparen.
+
+**Erledigt.** `run` ist in `stack` (die Layer) und die finale Norm geteilt;
+Prefills rufen `cache`, das im letzten Layer nach den Keys und Values (bzw.
+dem rekurrenten State) aufhört. Ein rekurrenter letzter Layer läuft voll, nur
+sein MLP fällt weg. Gemessen mit `what_a_prefill_costs` (breite Hybrid-Fixture,
+511 Tokens, **2 Layer**), je dreimal: 630–700 ms → 525–610 ms. Bei zwei Layern
+ist das eine halbe Schicht von zweien — auf 28 Layern bleiben davon
+erwartungsgemäß nur ein paar Prozent, gemessen ist das nicht.
+
+Dabei fiel auf: alle Hybrid-Fixtures enden auf `full_attention`, ein
+rekurrenter letzter Layer lief in keinem Test.
+`a_prefix_ending_in_a_recurrent_layer_changes_no_answer_either` tauscht die
+beiden Layer und ist der einzige Test, der einen Fehler in diesem Zweig findet
+(geprüft durch absichtliches Brechen); der Pfad über `keys_values` wird in
+beiden Backbones von den Prefix-Tests gefangen.
 
 ### Task 6: Letzter Layer nur an den Readout-Positionen
 

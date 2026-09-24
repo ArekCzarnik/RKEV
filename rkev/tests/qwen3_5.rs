@@ -13,7 +13,7 @@
 mod fixtures;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fixtures::{
     fresh_dir, tokenizer_json, vocab_size, write_head, write_safetensors, Noise, Tensors,
@@ -746,19 +746,58 @@ fn running_the_state_once_gives_the_same_answers_as_running_it_per_question() {
     // the convolution window after the state do not depend on the questions, so
     // the answers must not change.
     let fixture = checkpoint("prefix", false, false);
-    let head = || pointer_head(&fixture.dir.join("head.safetensors")).unwrap();
 
-    let with = LocalEngine::new(Backend::open(&fixture.dir, None).unwrap(), head())
+    assert_the_prefix_changes_no_answer(&fixture.dir);
+}
+
+#[test]
+fn a_prefix_ending_in_a_recurrent_layer_changes_no_answer_either() {
+    // A prefill stops each checkpoint's last layer as soon as it has what that
+    // layer hands on. The fixture above ends in attention, as the released
+    // checkpoints do; this is the same model with its two layers the other way
+    // round, so the last one is the recurrence.
+    let fixture = checkpoint("prefix-reversed-source", false, false);
+    let dir = fresh_dir("qwen3_5-prefix-reversed");
+    let config = fs::read_to_string(fixture.dir.join("config.json"))
+        .unwrap()
+        .replace(
+            &format!(r#"["{}","{}"]"#, LAYER_TYPES[0], LAYER_TYPES[1]),
+            &format!(r#"["{}","{}"]"#, LAYER_TYPES[1], LAYER_TYPES[0]),
+        );
+    assert!(config.contains(&format!(r#"["{}","{}"]"#, LAYER_TYPES[1], LAYER_TYPES[0])));
+    fs::write(dir.join("config.json"), config).unwrap();
+    for file in ["tokenizer.json", "head.safetensors"] {
+        fs::copy(fixture.dir.join(file), dir.join(file)).unwrap();
+    }
+    let swapped: Tensors = fixture
+        .tensors
+        .iter()
+        .map(|(name, tensor)| {
+            let name = if let Some(rest) = name.strip_prefix("model.layers.0.") {
+                format!("model.layers.1.{rest}")
+            } else if let Some(rest) = name.strip_prefix("model.layers.1.") {
+                format!("model.layers.0.{rest}")
+            } else {
+                name.clone()
+            };
+            (name, tensor.clone())
+        })
+        .collect();
+    write_safetensors(&dir.join("model.safetensors"), &swapped);
+
+    assert_the_prefix_changes_no_answer(&dir);
+}
+
+/// The same request with the state prefilled and with it run per question.
+fn assert_the_prefix_changes_no_answer(dir: &Path) {
+    let head = || pointer_head(&dir.join("head.safetensors")).unwrap();
+
+    let with = LocalEngine::new(Backend::open(dir, None).unwrap(), head())
         .system_one_blocking(&a_request())
         .unwrap();
-    let without = LocalEngine::new(
-        Backend::open(&fixture.dir, None)
-            .unwrap()
-            .with_prefix(false),
-        head(),
-    )
-    .system_one_blocking(&a_request())
-    .unwrap();
+    let without = LocalEngine::new(Backend::open(dir, None).unwrap().with_prefix(false), head())
+        .system_one_blocking(&a_request())
+        .unwrap();
 
     for id in ["money", "late"] {
         assert!(
@@ -1004,6 +1043,40 @@ fn how_much_chunking_saves() {
             state.split_whitespace().count() + 1
         );
     }
+}
+
+/// What one prefill costs on its own, at the released checkpoints' widths.
+///
+/// A prefill keeps each layer's keys and values, or its recurrent state, and
+/// nothing else, so the last layer's attention output and feed-forward are work
+/// no answer reads. This fixture has two layers, so skipping them shows up far
+/// larger here than on a real checkpoint, where it is one layer in twenty-eight.
+#[test]
+#[ignore = "a measurement, not an assertion: cargo test --release -- --ignored --nocapture"]
+fn what_a_prefill_costs() {
+    use candle_core::{DType, Device};
+    use std::time::Instant;
+
+    let dir = wide_checkpoint("prefill-cost");
+    let backbone = rkev::qwen3_5::Backbone::load(&dir, None, &Device::Cpu, DType::F32, None)
+        .unwrap()
+        .with_chunked_recurrence(true);
+    let ids: Vec<u32> = (0..511)
+        .map(|index| 6 + (index % (vocab_size() - 6)) as u32)
+        .collect();
+    let positions: Vec<u32> = (0..ids.len() as u32).collect();
+
+    backbone.prefill(&ids, &positions).unwrap(); // warm up
+    let runs = 10;
+    let started = Instant::now();
+    for _ in 0..runs {
+        backbone.prefill(&ids, &positions).unwrap();
+    }
+    println!(
+        "one prefill: {:>7.1} ms  ({} state tokens, 2 layers, 128-wide heads)",
+        started.elapsed().as_secs_f64() * 1000.0 / runs as f64,
+        ids.len()
+    );
 }
 
 #[test]
